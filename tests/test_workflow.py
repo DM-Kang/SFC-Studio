@@ -285,6 +285,49 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(res, '{"ok": true}')
         self.assertGreaterEqual(req.call_args.kwargs["body"]["options"]["num_ctx"], 16384)
 
+    def test_review_plan_normalizes_nested_and_string_responses_and_runtime_job_overlay(self) -> None:
+        """@brief Unwrap local-model review wrappers and preserve active worker status in API reads."""
+        from shortform_studio.planning import review_plan
+        from shortform_studio.workflow import overlay_runtime_job_state
+
+        with patch(
+            "shortform_studio.planning.generate_json",
+            return_value=(
+                {
+                    "review": {
+                        "passed": "true",
+                        "summary": "Looks accurate and safe.",
+                        "issues": "Verify ambient sound license",
+                    }
+                },
+                "ollama:qwen2.5:7b",
+            ),
+        ):
+            review = review_plan({"topic": "Cold brew"}, {"title": "Cold brew", "sources": []})
+        self.assertEqual(review["status"], "passed")
+        self.assertEqual(review["issues"], ["Verify ambient sound license"])
+
+        overlaid = overlay_runtime_job_state(
+            {"id": "item-1", "stage": "failed", "active_job": None, "error": "App restarted during this operation"},
+            worker_locked=True,
+            active_item_id="item-1",
+            active_job_id="job-9",
+            active_stage="producing",
+        )
+        self.assertEqual(overlaid["active_job"], "job-9")
+        self.assertEqual(overlaid["stage"], "producing")
+        self.assertIsNone(overlaid["error"])
+
+        untouched = overlay_runtime_job_state(
+            {"id": "item-2", "stage": "failed", "active_job": None, "error": "Real failure"},
+            worker_locked=True,
+            active_item_id="item-1",
+            active_job_id="job-9",
+            active_stage="producing",
+        )
+        self.assertEqual(untouched["stage"], "failed")
+        self.assertEqual(untouched["error"], "Real failure")
+
 
 if __name__ == "__main__":
     unittest.main()

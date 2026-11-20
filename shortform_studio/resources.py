@@ -329,6 +329,12 @@ def search_pixabay_videos(scenes: list[dict[str, Any]], api_key: str) -> list[di
         url = f"{PIXABAY_VIDEO_SEARCH_URL}?{urllib.parse.urlencode({'key': api_key, 'q': query, 'per_page': max(3, min(10, MAX_VIDEOS_PER_SCENE * 3)), 'safesearch': 'true', 'video_type': 'all'})}"
         response = _get_json(url)
         hits = response.get("hits", [])
+        if not hits:
+            ascii_words = [w for w in query.split() if w.isascii() and len(w) > 1]
+            if len(ascii_words) > 2:
+                shorter_query = " ".join(ascii_words[:2])
+                retry_url = f"{PIXABAY_VIDEO_SEARCH_URL}?{urllib.parse.urlencode({'key': api_key, 'q': shorter_query, 'per_page': max(3, min(10, MAX_VIDEOS_PER_SCENE * 3)), 'safesearch': 'true', 'video_type': 'all'})}"
+                hits = _get_json(retry_url).get("hits", [])
         ranked_hits: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
         for hit in hits if isinstance(hits, list) else []:
             if not isinstance(hit, dict):

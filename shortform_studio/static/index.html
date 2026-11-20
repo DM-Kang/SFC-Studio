@@ -16,7 +16,7 @@
       <h1>Shortform Studio</h1>
       <p class="subtitle">기획부터 검수, 승인된 게시까지 한 흐름으로</p>
     </div>
-    <div class="provider-control"><div id="provider-status" class="provider-status" aria-live="polite">연결 상태 확인 중…</div><div class="actions"><button id="brand-settings-open" class="button" type="button">브랜드 · 시리즈 설정</button><button id="ai-settings-open" class="button" type="button">AI 모델 · OAuth 설정</button><button id="secrets-settings-open" class="button" type="button">API 키 · .env 설정</button><button id="schedule-calendar-open" class="button" type="button">예약 캘린더</button><button id="analytics-dashboard-open" class="button" type="button">성과 대시보드</button><button id="asset-library-open" class="button" type="button">소재 라이브러리</button><button id="experiments-open" class="button" type="button">A/B 실험</button><button id="backup-open" class="button" type="button">백업 · 복구</button></div></div>
+    <div class="provider-control"><div id="provider-status" class="provider-status" aria-live="polite">연결 상태 확인 중…</div><div class="actions"><button id="brand-settings-open" class="button" type="button">브랜드 · 시리즈 설정</button><button id="shorts-learn-open" class="button" type="button">쇼츠 학습 · 벤치마킹</button><button id="ai-settings-open" class="button" type="button">AI 모델 · OAuth 설정</button><button id="secrets-settings-open" class="button" type="button">API 키 · .env 설정</button><button id="schedule-calendar-open" class="button" type="button">예약 캘린더</button><button id="analytics-dashboard-open" class="button" type="button">성과 대시보드</button><button id="asset-library-open" class="button" type="button">소재 라이브러리</button><button id="experiments-open" class="button" type="button">A/B 실험</button><button id="backup-open" class="button" type="button">백업 · 복구</button></div></div>
   </header>
 
   <nav class="mobile-nav" aria-label="모바일 화면 선택">
@@ -125,6 +125,18 @@
   </dialog>
   <dialog id="backup-dialog" class="settings-dialog">
     <section class="settings-form"><header class="settings-header"><div><p class="eyebrow">LOCAL DATA RECOVERY</p><h2>백업 · 복구</h2><p class="muted">백업에는 SQLite 콘텐츠·설정과 프로젝트 미디어가 포함됩니다. `.env`, OAuth 토큰, API 자격 증명은 제외됩니다.</p></div><button class="icon-button dialog-close" type="button" aria-label="닫기">×</button></header><div class="settings-card"><a class="button primary" href="/api/backup">전체 백업 ZIP 다운로드</a><label class="restore-warning">백업 복원<input id="backup-restore-file" type="file" accept=".zip,application/zip"></label><p class="warning-banner">복원하면 현재 프로젝트를 ZIP 안전 복구본으로 보존한 뒤 선택한 백업으로 교체합니다. 예약 게시 항목은 자동 게시되지 않도록 취소되며, 다시 확인 후 예약해야 합니다.</p><p class="small-note">업로드 제한 10 GB, 압축 해제 제한 20 GB. ZIP 경로, 스키마와 SQLite 무결성을 검증합니다.</p></div></section>
+  </dialog>
+  <dialog id="shorts-learn-dialog" class="settings-dialog">
+    <form id="shorts-learn-form" class="settings-form">
+      <header class="settings-header"><div><p class="eyebrow">SHORTS BENCHMARKING · STYLE LEARNING</p><h2>유튜브 쇼츠 학습 · 벤치마킹</h2><p class="muted">잘 만든 YouTube Shorts URL을 추가하면 자막·훅 패턴·장면 전환 호흡을 추출해 새 콘텐츠 기획에 반영합니다.</p></div><button class="icon-button dialog-close" type="button" aria-label="닫기">×</button></header>
+      <div class="settings-card">
+        <label>YouTube Shorts URL<input name="url" type="url" required maxlength="512" placeholder="https://www.youtube.com/shorts/..."></label>
+        <label>참고 포인트 메모 (선택)<input name="notes" maxlength="500" placeholder="예: 2초 질문 훅, 빠른 3초 컷 전환, 숫자 비교 말투"></label>
+        <label>자막 비공개 시 대본 직접 입력 (선택)<textarea name="manual_transcript" rows="3" maxlength="6000" placeholder="유튜브 영상에 자막이 없는 경우 대본이나 핵심 멘트를 붙여넣으세요."></textarea></label>
+        <button id="shorts-learn-submit" class="button primary" type="submit">쇼츠 분석 및 학습 저장</button>
+      </div>
+      <div id="shorts-references-list" class="management-list"></div>
+    </form>
   </dialog>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
 </body>

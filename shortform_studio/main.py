@@ -36,7 +36,8 @@ from .config import (
     update_local_env_secrets,
 )
 from .analytics import build_analytics_dashboard, export_analytics_csv, parse_analytics_csv, summarize_analytics, summarize_experiment
-from .ai import ai_status
+from .ai import ai_ready, ai_status
+from .shorts_learner import analyze_shorts_reference, reference_to_series_template
 from .ai_config import save_ai_settings
 from .ai_providers import (
     clear_model_list_cache,
@@ -78,6 +79,7 @@ from .workflow import (
     run_stock_material_search,
     run_video_generation,
     run_web_research,
+    overlay_runtime_job_state,
     replace_final_video_rights_record,
     save_subtitles_and_rerender,
     save_thumbnail_from_video,
@@ -88,9 +90,8 @@ from .workflow import (
 load_local_environment()
 get_projects_dir().mkdir(parents=True, exist_ok=True)
 store = Store(get_database_path())
-store.recover_interrupted_jobs()
-store.recover_interrupted_schedules()
 _worker_lock = threading.Lock()
+_active_job_state: dict[str, str | None] = {"item_id": None, "job_id": None, "stage": None}
 _scheduler_stop = threading.Event()
 _scheduler_thread: threading.Thread | None = None
 _MODEL_SYNC_INTERVAL_SECONDS = 300
@@ -218,6 +219,20 @@ class DirectUrlResearchRequest(BaseModel):
     """Validate a public HTTPS URL for direct evidence extraction."""
 
     url: str = Field(min_length=10, max_length=2048)
+
+
+class ShortsReferenceCreate(BaseModel):
+    """Validate a YouTube Shorts URL and optional operator notes for style learning."""
+
+    url: str = Field(min_length=15, max_length=512)
+    notes: str = Field(default="", max_length=500)
+    manual_transcript: str = Field(default="", max_length=6000)
+
+
+class ShortsReferenceToggle(BaseModel):
+    """Toggle whether a learned YouTube Shorts reference guides new plans."""
+
+    active_for_planning: bool
 
 
 class SourceInclusionRequest(BaseModel):
@@ -394,12 +409,23 @@ class SubtitleUpdateRequest(BaseModel):
     rerender: bool = True
 
 
+def _overlay_runtime_job_state(item: dict[str, Any]) -> dict[str, Any]:
+    """@brief Keep an active in-process worker visible even if SQLite state lags behind."""
+    return overlay_runtime_job_state(
+        item,
+        worker_locked=_worker_lock.locked(),
+        active_item_id=_active_job_state.get("item_id"),
+        active_job_id=_active_job_state.get("job_id"),
+        active_stage=_active_job_state.get("stage"),
+    )
+
+
 def _get_item(item_id: str) -> dict[str, Any]:
     """@brief Load an item or raise a not-found response."""
     item = store.get_item(item_id)
     if item is None:
         raise HTTPException(status_code=404, detail="Content item not found.")
-    return item
+    return _overlay_runtime_job_state(item)
 
 
 def _ensure_mutable(item: dict[str, Any]) -> None:
@@ -560,6 +586,9 @@ def _run_worker(item_id: str, job_id: str, stage: str, action: Any, platform: st
                     store.set_schedule_state(item_id, platform, schedule_status, publication.get("error"))
             store.finish_job(item_id, job_id, final_stage, error_message)
         finally:
+            _active_job_state["item_id"] = None
+            _active_job_state["job_id"] = None
+            _active_job_state["stage"] = None
             _worker_lock.release()
 
 
@@ -581,9 +610,15 @@ def _schedule(item_id: str, stage: str, action: Any, platform: str | None = None
             publication_reserved = True
         if scheduled_platform:
             store.set_schedule_state(item_id, scheduled_platform, "running")
+        _active_job_state["item_id"] = item_id
+        _active_job_state["job_id"] = job_id
+        _active_job_state["stage"] = stage
         worker = threading.Thread(target=_run_worker, args=(item_id, job_id, stage, action, platform), daemon=True, name=f"shortform-{stage}")
         worker.start()
     except KeyError:
+        _active_job_state["item_id"] = None
+        _active_job_state["job_id"] = None
+        _active_job_state["stage"] = None
         _worker_lock.release()
         raise HTTPException(status_code=404, detail="Content item not found.") from None
     except Exception as error:
@@ -604,6 +639,9 @@ def _schedule(item_id: str, stage: str, action: Any, platform: str | None = None
                 except Exception:
                     pass
         finally:
+            _active_job_state["item_id"] = None
+            _active_job_state["job_id"] = None
+            _active_job_state["stage"] = None
             _worker_lock.release()
         status_code = 409 if isinstance(error, (RuntimeError, OSError)) else 500
         raise HTTPException(status_code=status_code, detail=str(error)[:1600]) from None
@@ -629,8 +667,10 @@ async def restrict_to_local_browser(request: Any, call_next: Any) -> Any:
 
 @app.on_event("startup")
 def start_publication_scheduler() -> None:
-    """@brief Start the single local scheduler thread once for this server process."""
+    """@brief Recover interrupted server-owned jobs on startup and start the single scheduler thread."""
     global _scheduler_thread
+    store.recover_interrupted_jobs()
+    store.recover_interrupted_schedules()
     _scheduler_stop.clear()
     if _scheduler_thread is None or not _scheduler_thread.is_alive():
         _scheduler_thread = threading.Thread(target=_scheduler_loop, daemon=True, name="shortform-scheduler")
@@ -728,6 +768,78 @@ def update_brand_settings(request: BrandSettingsUpdate) -> dict[str, Any]:
         normalized = normalize_brand_settings(request.model_dump())
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
+    store.set_setting("brand_settings", normalized)
+    return normalized
+
+
+@app.get("/api/shorts-references")
+def list_shorts_references() -> list[dict[str, Any]]:
+    """@brief Return saved YouTube Shorts structural style references."""
+    refs = store.get_setting("shorts_references", [])
+    return refs if isinstance(refs, list) else []
+
+
+@app.post("/api/shorts-references", status_code=201)
+def create_shorts_reference(request: ShortsReferenceCreate) -> dict[str, Any]:
+    """@brief Analyze a public YouTube Shorts URL and save reusable hook/pacing patterns."""
+    try:
+        analyzed = analyze_shorts_reference(
+            request.url,
+            manual_transcript=request.manual_transcript,
+            notes=request.notes,
+            use_ai=ai_ready("planning"),
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    except RuntimeError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from None
+    existing = [r for r in (store.get_setting("shorts_references", []) or []) if isinstance(r, dict)]
+    deduped = [r for r in existing if r.get("video_id") != analyzed["video_id"]]
+    deduped.append(analyzed)
+    store.set_setting("shorts_references", deduped[-30:])
+    return analyzed
+
+
+@app.patch("/api/shorts-references/{ref_id}")
+def toggle_shorts_reference(ref_id: str, request: ShortsReferenceToggle) -> dict[str, Any]:
+    """@brief Enable or disable a learned reference during future planning runs."""
+    existing = [r for r in (store.get_setting("shorts_references", []) or []) if isinstance(r, dict)]
+    updated: dict[str, Any] | None = None
+    for entry in existing:
+        if entry.get("id") == ref_id:
+            entry["active_for_planning"] = bool(request.active_for_planning)
+            updated = entry
+            break
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Saved Shorts reference not found.")
+    store.set_setting("shorts_references", existing)
+    return updated
+
+
+@app.delete("/api/shorts-references/{ref_id}", status_code=204)
+def delete_shorts_reference(ref_id: str) -> None:
+    """@brief Remove a saved YouTube Shorts reference."""
+    existing = [r for r in (store.get_setting("shorts_references", []) or []) if isinstance(r, dict)]
+    filtered = [r for r in existing if r.get("id") != ref_id]
+    if len(filtered) == len(existing):
+        raise HTTPException(status_code=404, detail="Saved Shorts reference not found.")
+    store.set_setting("shorts_references", filtered)
+
+
+@app.post("/api/shorts-references/{ref_id}/to-template")
+def convert_shorts_reference_to_template(ref_id: str) -> dict[str, Any]:
+    """@brief Save a learned YouTube Shorts reference as a reusable series template."""
+    existing = [r for r in (store.get_setting("shorts_references", []) or []) if isinstance(r, dict)]
+    target = next((r for r in existing if r.get("id") == ref_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Saved Shorts reference not found.")
+    raw_brand = store.get_setting("brand_settings", default_brand_settings())
+    current_brand = normalize_brand_settings(raw_brand)
+    if len(current_brand["series_templates"]) >= 20:
+        raise HTTPException(status_code=422, detail="At most twenty series templates can be saved.")
+    candidate = reference_to_series_template(target)
+    current_brand["series_templates"].append(candidate)
+    normalized = normalize_brand_settings(current_brand)
     store.set_setting("brand_settings", normalized)
     return normalized
 
@@ -929,7 +1041,7 @@ def list_items(
     include_archived: bool = True,
 ) -> list[dict[str, Any]]:
     """@brief Return recent content items for the local dashboard with optional filters."""
-    return store.list_items(query=q, stage=stage, platform=platform, include_archived=include_archived)
+    return [_overlay_runtime_job_state(item) for item in store.list_items(query=q, stage=stage, platform=platform, include_archived=include_archived)]
 
 
 @app.post("/api/items", status_code=201)

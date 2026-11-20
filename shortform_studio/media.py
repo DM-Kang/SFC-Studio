@@ -31,10 +31,21 @@ SUBTITLE_STYLE_PRESETS: dict[str, dict[str, Any]] = {
     "clean_bottom": {
         "label": "깔끔한 하단 자막",
         "font_name": "",
-        "font_size": 42,
-        "margin_v": 170,
-        "outline": 3,
-        "shadow": 1,
+        "font_size": 46,
+        "margin_v": 200,
+        "outline": 4,
+        "shadow": 2,
+        "alignment": 2,
+        "primary_colour": "&H00FFFFFF",
+        "outline_colour": "&H00000000",
+    },
+    "shorts_punch": {
+        "label": "쇼츠 볼드 강조 자막",
+        "font_name": "",
+        "font_size": 54,
+        "margin_v": 240,
+        "outline": 5,
+        "shadow": 2,
         "alignment": 2,
         "primary_colour": "&H00FFFFFF",
         "outline_colour": "&H00000000",
@@ -73,6 +84,11 @@ SUBTITLE_STYLE_PRESETS: dict[str, dict[str, Any]] = {
         "outline_colour": "&H00000000",
     },
 }
+
+
+def _contains_hangul(text: str) -> bool:
+    """@brief Detect whether text contains Korean Hangul syllables or Jamo characters."""
+    return bool(re.search(r"[\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]", str(text or "")))
 
 
 def default_subtitle_font() -> str:
@@ -314,13 +330,29 @@ def generate_voiceover(
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
         raise RuntimeError(f"ElevenLabs request failed: {type(error).__name__}.") from None
     encoded_audio = result.get("audio_base64")
-    alignment = result.get("normalized_alignment") or result.get("alignment")
+    raw_alignment = result.get("alignment")
+    norm_alignment = result.get("normalized_alignment")
+    has_hangul = _contains_hangul(text)
+    # ElevenLabs normalized_alignment romanizes Hangul into Latin phonetics ("annyeonghaseyo");
+    # always prefer raw alignment (or source text timings) so Korean subtitles stay in Hangul.
+    alignment = raw_alignment if (has_hangul and isinstance(raw_alignment, dict)) else (norm_alignment or raw_alignment)
     if not isinstance(encoded_audio, str) or not isinstance(alignment, dict):
         raise RuntimeError("ElevenLabs response is missing audio or character timing data.")
+    output_dir.mkdir(parents=True, exist_ok=True)
     audio_path = output_dir / "voiceover.mp3"
     audio_path.write_bytes(base64.b64decode(encoded_audio, validate=True))
     captions_path = output_dir / "captions.srt"
-    captions_path.write_text(alignment_to_srt(alignment), encoding="utf-8")
+    aligned_chars = "".join(str(ch) for ch in (alignment.get("characters") or []) if isinstance(ch, str))
+    if has_hangul and not _contains_hangul(aligned_chars):
+        duration = probe_audio_duration(audio_path)
+        if duration is None or duration <= 0:
+            from .planning import estimate_speaking_duration
+
+            duration = max(2.0, estimate_speaking_duration(text)["estimated_seconds"])
+        srt_text = text_to_fallback_srt(text, duration, max_chars=16)
+    else:
+        srt_text = alignment_to_srt(alignment, max_chars=16 if has_hangul else 24)
+    captions_path.write_text(srt_text, encoding="utf-8")
     return {"audio_path": str(audio_path), "captions_path": str(captions_path), "provider": "elevenlabs", "voice_id": voice_id}
 
 
@@ -356,7 +388,7 @@ def _generate_openai_tts(text: str, output_dir: Path, *, voice: str = "") -> dic
 
         duration = max(2.0, estimate_speaking_duration(text)["estimated_seconds"])
     captions_path = output_dir / "captions.srt"
-    captions_path.write_text(text_to_fallback_srt(text, duration), encoding="utf-8")
+    captions_path.write_text(text_to_fallback_srt(text, duration, max_chars=16 if _contains_hangul(text) else 26), encoding="utf-8")
     return {"audio_path": str(audio_path), "captions_path": str(captions_path), "provider": "openai_tts", "voice_id": chosen_voice}
 
 
@@ -633,8 +665,8 @@ def build_multiscene_ffmpeg_command(
     clips: list[dict[str, Any]],
     output_name: str,
     *,
-    width: int = 720,
-    height: int = 1280,
+    width: int = 1080,
+    height: int = 1920,
     transition: str = "cut",
     transition_seconds: float = 0.35,
     audio_name: str | None = None,

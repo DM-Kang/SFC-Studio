@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from .ai import ai_ready
 from .analytics import summarize_analytics
+from .shorts_learner import summarize_shorts_references_for_planning
 from .config import get_projects_dir, get_secret
 from .media import (
     SUBTITLE_STYLE_PRESETS,
@@ -148,6 +149,7 @@ def run_planning(store: Store, item_id: str) -> str:
     brief = _brief(item)
     prior_items = [candidate for candidate in store.list_items() if candidate.get("id") != item_id]
     brief["analytics_feedback"] = summarize_analytics(prior_items)
+    brief["shorts_references"] = summarize_shorts_references_for_planning(store.get_setting("shorts_references", []))
     if store.is_cancel_requested(item_id):
         raise RuntimeError("Operation cancelled by operator.")
     store.set_job_progress(item_id, "AI 기획안 생성 중", 60)
@@ -767,7 +769,7 @@ def run_scene_assembly(
     if bgm_path and not bgm_path.is_file():
         bgm_path = None
 
-    normalized_style = normalize_subtitle_style(subtitle_style or existing_assets.get("subtitle_style"))
+    normalized_style = normalize_subtitle_style(subtitle_style or existing_assets.get("subtitle_style") or {"preset": "shorts_punch"})
     master_path = folder / "source_assembled.mp4"
     final_path = folder / "final.mp4"
     # Render a clean master without burned captions first so subtitle editing can rerender without re-assembling.
@@ -1035,7 +1037,11 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
         store.set_job_progress(item_id, "2/4 반려 의견 반영해 기획안 재작성 중", 28)
         store.save_revision_snapshot(item_id, f"Operator rejection feedback: {cleaned_feedback[:120]}")
         prior_items = [candidate for candidate in store.list_items() if candidate.get("id") != item_id]
-        brief = {**_brief(item), "analytics_feedback": summarize_analytics(prior_items)}
+        brief = {
+            **_brief(item),
+            "analytics_feedback": summarize_analytics(prior_items),
+            "shorts_references": summarize_shorts_references_for_planning(store.get_setting("shorts_references", [])),
+        }
         revised_plan = revise_plan_with_feedback(brief, item["plan"], cleaned_feedback, ai_ready("planning"), research_sources)
         revision = int(item.get("plan_revision", item["plan"].get("revision", 0))) + 1
         revised_plan["revision"] = revision
@@ -1125,3 +1131,26 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
     store.set_job_progress(item_id, "4/4 완성 영상 기술 검사 · AI 독립 검수 중", 90)
     run_content_review(store, item_id)
     return "reviewed"
+
+
+def overlay_runtime_job_state(
+    item: dict[str, Any],
+    *,
+    worker_locked: bool,
+    active_item_id: str | None,
+    active_job_id: str | None,
+    active_stage: str | None,
+) -> dict[str, Any]:
+    """@brief Keep an active in-process worker visible even if SQLite state lags behind."""
+    if (
+        worker_locked
+        and active_item_id
+        and item.get("id") == active_item_id
+        and (not item.get("active_job") or item.get("stage") == "failed")
+    ):
+        updated = dict(item)
+        updated["active_job"] = item.get("active_job") or active_job_id
+        updated["stage"] = active_stage or item.get("stage")
+        updated["error"] = None
+        return updated
+    return item

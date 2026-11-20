@@ -1,8 +1,9 @@
-const state = { items: [], selectedId: null, settings: {}, aiModels: {}, brand: { profile: {}, series_templates: [] }, analytics: {}, dashboard: null, secretsStatus: {}, assetLibrary: [], schedules: [], experiments: [], assetLibraryMode: "manage", filters: { query: "", stage: "", platform: "" }, calendarView: "grid", calendarMonth: new Date(), safeZone: "none", subtitlesCache: {}, toastTimer: null, refreshTimer: null, modelSyncTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
+const state = { items: [], selectedId: null, settings: {}, aiModels: {}, brand: { profile: {}, series_templates: [] }, shortsReferences: [], analytics: {}, dashboard: null, secretsStatus: {}, assetLibrary: [], schedules: [], experiments: [], assetLibraryMode: "manage", filters: { query: "", stage: "", platform: "" }, calendarView: "grid", calendarMonth: new Date(), safeZone: "none", subtitlesCache: {}, toastTimer: null, refreshTimer: null, modelSyncTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
 const MODEL_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const stageLabels = { draft: "초안", researching: "웹 자료 조사 중", planning: "조사·기획 중", collecting_materials: "영상 소재 검색 중", planned: "기획 완료", generating: "영상 제작 중", generated: "영상 제작 완료", reviewing: "검수 중", reviewed: "검수 완료", approved: "게시 승인", publishing: "게시 중", published: "게시 완료", failed: "작업 오류" };
 const SUBTITLE_PRESETS = {
-  clean_bottom: { label: "깔끔한 하단 자막", font_size: 42, margin_v: 170, alignment: 2, outline: 3, shadow: 1, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" },
+  clean_bottom: { label: "깔끔한 하단 자막", font_size: 46, margin_v: 200, alignment: 2, outline: 4, shadow: 2, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" },
+  shorts_punch: { label: "쇼츠 볼드 강조 자막", font_size: 54, margin_v: 240, alignment: 2, outline: 5, shadow: 2, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" },
   bold_center: { label: "강조 중앙 자막", font_size: 52, margin_v: 80, alignment: 5, outline: 4, shadow: 2, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" },
   yellow_pop: { label: "노란색 포인트 자막", font_size: 46, margin_v: 210, alignment: 2, outline: 4, shadow: 2, primary_colour: "&H0000E5FF", outline_colour: "&H00000000" },
   top_news: { label: "상단 뉴스형 자막", font_size: 40, margin_v: 180, alignment: 8, outline: 3, shadow: 1, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" }
@@ -518,6 +519,85 @@ function bindManagementDialogs() {
   document.getElementById("analytics-csv-import")?.addEventListener("change", importAnalyticsCsv);
   document.getElementById("secrets-settings-open")?.addEventListener("click", openSecretsSettings);
   document.getElementById("secrets-settings-form")?.addEventListener("submit", saveSecretsSettings);
+  document.getElementById("shorts-learn-open")?.addEventListener("click", openShortsLearnDialog);
+  document.getElementById("shorts-learn-form")?.addEventListener("submit", analyzeAndSaveShortsReference);
+}
+
+function renderShortsReferences() {
+  const container = document.getElementById("shorts-references-list");
+  if (!container) return;
+  const refs = state.shortsReferences || [];
+  container.innerHTML = refs.length
+    ? refs.slice().reverse().map(ref => {
+        const analysis = ref.analysis || {};
+        const metrics = ref.metrics || {};
+        const rules = (analysis.learned_rules || []).map(rule => `<li>${escapeHtml(rule)}</li>`).join("");
+        const active = ref.active_for_planning !== false;
+        return `<article class="management-card">
+          <div>
+            <strong>${escapeHtml(ref.title)}</strong>
+            <small>${escapeHtml(ref.author || "YouTube")} · ${escapeHtml(ref.duration_seconds)}초 · 추천 ${escapeHtml(metrics.recommended_scenes || 5)}컷 · ${escapeHtml(analysis.hook_type || "쇼츠")}</small>
+            <small>훅 공식: ${escapeHtml(analysis.hook_formula || "")}</small>
+            <small>전개: ${escapeHtml(analysis.story_arc || "")} · 호흡: ${escapeHtml(analysis.pacing_style || "")}</small>
+            ${rules ? `<ul>${rules}</ul>` : ""}
+          </div>
+          <div class="actions">
+            <label class="check-row"><input type="checkbox" class="toggle-shorts-ref" data-ref-id="${escapeHtml(ref.id)}" ${active ? "checked" : ""}> 기획에 반영</label>
+            <button class="button convert-shorts-template" data-ref-id="${escapeHtml(ref.id)}" type="button">시리즈 템플릿 저장</button>
+            <button class="button danger delete-shorts-ref" data-ref-id="${escapeHtml(ref.id)}" type="button">삭제</button>
+          </div>
+        </article>`;
+      }).join("")
+    : '<p class="small-note">아직 학습한 유튜브 쇼츠가 없습니다. 위 입력란에 쇼츠 URL을 넣어 패턴을 추출해 보세요.</p>';
+
+  container.querySelectorAll(".toggle-shorts-ref").forEach(box => box.addEventListener("change", async () => {
+    try {
+      await api(`/api/shorts-references/${box.dataset.refId}`, { method: "PATCH", body: JSON.stringify({ active_for_planning: box.checked }) });
+      await openShortsLearnDialog(false);
+      toast(box.checked ? "앞으로 새 기획에 이 쇼츠 스타일을 반영합니다." : "이 쇼츠 참고를 비활성화했습니다.");
+    } catch (error) { toast(error.message); }
+  }));
+  container.querySelectorAll(".convert-shorts-template").forEach(btn => btn.addEventListener("click", async () => {
+    try {
+      state.brand = await api(`/api/shorts-references/${btn.dataset.refId}/to-template`, { method: "POST" });
+      populateSeriesTemplateSelect();
+      toast("학습한 구조를 시리즈 템플릿에 추가했습니다.");
+    } catch (error) { toast(error.message); }
+  }));
+  container.querySelectorAll(".delete-shorts-ref").forEach(btn => btn.addEventListener("click", async () => {
+    try {
+      await api(`/api/shorts-references/${btn.dataset.refId}`, { method: "DELETE" });
+      await openShortsLearnDialog(false);
+      toast("학습된 쇼츠 레퍼런스를 삭제했습니다.");
+    } catch (error) { toast(error.message); }
+  }));
+}
+
+async function openShortsLearnDialog(showModal = true) {
+  try {
+    state.shortsReferences = await api("/api/shorts-references");
+    renderShortsReferences();
+    if (showModal) document.getElementById("shorts-learn-dialog")?.showModal();
+  } catch (error) { toast(error.message); }
+}
+
+async function analyzeAndSaveShortsReference(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const submitBtn = document.getElementById("shorts-learn-submit");
+  const payload = {
+    url: form.elements.namedItem("url").value.trim(),
+    notes: form.elements.namedItem("notes").value.trim(),
+    manual_transcript: form.elements.namedItem("manual_transcript").value.trim()
+  };
+  if (submitBtn) submitBtn.disabled = true;
+  try {
+    await api("/api/shorts-references", { method: "POST", body: JSON.stringify(payload) });
+    form.reset();
+    await openShortsLearnDialog(false);
+    toast("유튜브 쇼츠 훅·대본 구조를 분석해 학습 목록에 저장했습니다.");
+  } catch (error) { toast(error.message); }
+  finally { if (submitBtn) submitBtn.disabled = false; }
 }
 
 function renderStageModelDropdown(stage, preferredModel = null) {
@@ -1045,11 +1125,11 @@ function renderItem(item) {
   const pct = Number(item.job_progress?.percent ?? 10);
   const progressText = item.job_progress?.message ? ` · ${escapeHtml(item.job_progress.message)}` : "";
   const jobMessage = item.active_job ? `<div class="success-banner"><div class="card-head"><span>${escapeHtml(stageLabels[item.stage] || item.stage)}${progressText}</span><button id="cancel-job-button" class="button danger" type="button" ${item.cancel_requested ? "disabled" : ""}>${item.cancel_requested ? "취소 요청됨" : "작업 취소 요청"}</button></div><div class="progress-bar"><span style="width:${Math.max(5, Math.min(100, pct))}%"></span></div></div>` : "";
-  const errorMessage = item.error ? `<div class="error-banner">${escapeHtml(item.error)}<br>오류가 난 생성·게시 작업은 자동 재시도하지 않았습니다.${item.workflow_mode === "autopilot" ? ' <button id="retry-autopilot-button" class="button" type="button">자동화 다시 실행</button>' : ""}</div>` : "";
-  const published = item.stage === "published" ? '<div class="success-banner">선택한 모든 플랫폼에 게시되었습니다.</div>' : "";
-  const seriesName = item.series_template_snapshot?.name ? ` · ${escapeHtml(item.series_template_snapshot.name)}` : "";
   const isPublishedOrLocked = Boolean(item.active_job) || Object.values(item.publications || {}).some(post => ["publishing", "published", "uncertain"].includes(post.status));
   const runningOther = (state.items || []).find(candidate => candidate.active_job && candidate.id !== item.id);
+  const errorMessage = item.error && !item.active_job ? `<div class="error-banner">${escapeHtml(item.error)}<br>오류가 난 생성·게시 작업은 자동 재시도하지 않았습니다.${item.workflow_mode === "autopilot" ? ` <button id="retry-autopilot-button" class="button" type="button" ${runningOther ? "disabled" : ""}>자동화 다시 실행</button>` : ""}</div>` : "";
+  const published = item.stage === "published" ? '<div class="success-banner">선택한 모든 플랫폼에 게시되었습니다.</div>' : "";
+  const seriesName = item.series_template_snapshot?.name ? ` · ${escapeHtml(item.series_template_snapshot.name)}` : "";
   const runningOtherBanner = runningOther
     ? `<div class="warning-banner"><div class="card-head"><span>⏳ 다른 작업이 진행 중이라 삭제·새 생성이 대기 중입니다: <strong>${escapeHtml(runningOther.plan?.title || runningOther.topic)}</strong> (${escapeHtml(runningOther.job_progress?.message || stageLabels[runningOther.stage] || runningOther.stage)})</span><div class="actions"><button id="jump-running-item" class="button" type="button">진행 중 작업 보기</button><button id="cancel-running-other" class="button danger" type="button" ${runningOther.cancel_requested ? "disabled" : ""}>${runningOther.cancel_requested ? "취소 요청됨" : "작업 취소 요청"}</button></div></div></div>`
     : "";
@@ -1057,6 +1137,8 @@ function renderItem(item) {
   workspace.innerHTML = `<div class="content-detail"><header class="detail-header panel"><div><p class="eyebrow">CONTENT WORKFLOW · ${escapeHtml(item.id.slice(0, 8))}${item.workflow_mode === "autopilot" ? " · AUTOPILOT" : ""}</p><h2>${escapeHtml(item.plan?.title || item.topic)}</h2><p>${escapeHtml(item.audience)} · ${escapeHtml(item.language)} · ${(item.platforms || []).map(escapeHtml).join(" + ")}${seriesName}</p></div><div class="header-controls"><span class="badge ${item.stage === "failed" ? "bad" : item.stage === "approved" || item.stage === "published" ? "good" : ""}">${escapeHtml(stageLabels[item.stage] || item.stage)}</span><button id="duplicate-item-button" class="button" type="button">복제</button><button id="archive-item-button" class="button" type="button">${item.archived ? "보관 해제" : "보관"}</button><button id="delete-item-button" class="button danger" type="button" ${isPublishedOrLocked ? "disabled" : ""}>삭제</button></div></header>${renderStages(item)}${runningOtherBanner}${jobMessage}${errorMessage}${published}${decisionCard}<div class="detail-grid"><div class="content-column">${renderPlan(item)}${renderProduction(item)}</div><div class="review-column">${renderReview(item)}${renderPublish(item)}</div></div><section class="small-note">작업 파일 위치: ${escapeHtml(state.settings.app_home || "사용자 데이터 폴더")}</section></div>`;
   wireItemActions(item);
   if (runningOther) {
+    const startAutoBtn = document.getElementById("start-autopilot-button");
+    if (startAutoBtn) startAutoBtn.disabled = true;
     document.getElementById("jump-running-item")?.addEventListener("click", () => selectItem(runningOther.id));
     document.getElementById("cancel-running-other")?.addEventListener("click", () => cancelItemJob(runningOther.id));
   }
