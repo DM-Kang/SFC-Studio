@@ -182,7 +182,8 @@ class Phase2MediaAndAssemblyTests(unittest.TestCase):
             ):
                 render_video(source, output, audio_path=audio, bgm_path=bgm, bgm_volume=0.2, ducking=True, loudnorm=True)
 
-            fc = captured[0][captured[0].index("-filter_complex") + 1]
+            ffmpeg_cmd = next(cmd for cmd in captured if "-filter_complex" in cmd)
+            fc = ffmpeg_cmd[ffmpeg_cmd.index("-filter_complex") + 1]
             self.assertIn("sidechaincompress", fc)
             self.assertIn("loudnorm", fc)
 
@@ -442,6 +443,44 @@ class Phase2MediaAndAssemblyTests(unittest.TestCase):
                 ig_res = publish_instagram(item["id"], mp4, "Caption", thumb_offset_ms=1200)
             self.assertEqual(ig_res["remote_id"], "media-1")
             self.assertEqual(ig_calls[0]["fields"]["thumb_offset"], "1200")
+
+    def test_render_video_bounds_loop_duration_and_supports_cancellation(self) -> None:
+        """@brief Cap looped render duration to narration length and stop FFmpeg immediately on cancel."""
+        from shortform_studio.media import _run_ffmpeg, render_video
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            src = root / "source.mp4"
+            aud = root / "voice.mp3"
+            out = root / "final.mp4"
+            src.write_bytes(b"mp4")
+            aud.write_bytes(b"mp3")
+
+            captured_cmd: list[str] = []
+
+            def fake_run(cmd, *, cwd, cancel_check=None, timeout=900):
+                captured_cmd.extend(cmd)
+                (cwd / "final.rendering.mp4").write_bytes(b"ok")
+                return 0, ""
+
+            with (
+                patch("shortform_studio.media.shutil.which", return_value="/usr/bin/ffmpeg"),
+                patch("shortform_studio.media.probe_audio_duration", return_value=24.5),
+                patch("shortform_studio.media._run_ffmpeg", side_effect=fake_run),
+            ):
+                render_video(src, out, audio_path=aud, loudnorm=True)
+
+            idx = captured_cmd.index("-t")
+            self.assertEqual(captured_cmd[idx + 1], "24.60")
+
+            fake_proc = type(
+                "_FakeProc",
+                (),
+                {"poll": lambda self: None, "terminate": lambda self: None, "kill": lambda self: None, "wait": lambda self, timeout=None: 0},
+            )()
+            with patch("shortform_studio.media.subprocess.Popen", return_value=fake_proc):
+                with self.assertRaisesRegex(RuntimeError, "cancelled by operator"):
+                    _run_ffmpeg(["ffmpeg"], cwd=root, cancel_check=lambda: True)
 
 
 if __name__ == "__main__":

@@ -122,6 +122,53 @@ def _normalize_scenes(scenes: Any, script: str, topic: str) -> list[dict[str, st
     return normalized
 
 
+def _build_plan_payload(
+    result: dict[str, Any],
+    model: str,
+    brief: dict[str, Any],
+    sources: list[dict[str, Any]],
+    *,
+    fallback_duration: int | None = None,
+    generated_by: str | None = None,
+) -> dict[str, Any]:
+    """@brief Validate and normalize a generated or revised plan JSON object."""
+    for wrapper_key in ("plan", "draft", "data", "result"):
+        if "title" not in result and isinstance(result.get(wrapper_key), dict):
+            result = result[wrapper_key]
+            break
+    hashtags = result.get("hashtags", [])
+    claims = result.get("claims", [])
+    raw_duration = result.get("duration_seconds", fallback_duration if fallback_duration is not None else brief["duration_seconds"])
+    if isinstance(raw_duration, str) and raw_duration.strip().isdigit():
+        raw_duration = int(raw_duration.strip())
+    elif isinstance(raw_duration, float) and not isinstance(raw_duration, bool):
+        raw_duration = int(round(raw_duration))
+    duration = raw_duration
+    if not isinstance(hashtags, list) or not all(isinstance(tag, str) for tag in hashtags):
+        raise ValueError("Generated hashtags must be a list of text values.")
+    if not isinstance(claims, list) or not all(isinstance(claim, dict) for claim in claims):
+        raise ValueError("Generated claims must be a list of objects.")
+    if isinstance(duration, bool) or not isinstance(duration, int) or not 4 <= duration <= 30:
+        if fallback_duration is not None and 4 <= fallback_duration <= 30:
+            duration = int(fallback_duration)
+        else:
+            raise ValueError("Generated duration must be an integer from 4 to 30 seconds.")
+    source_ids = {source["id"] for source in sources if isinstance(source, dict) and isinstance(source.get("id"), str)}
+    return {
+        "title": _bounded_text(result.get("title"), "title", 100),
+        "hook": _bounded_text(result.get("hook"), "hook", 240),
+        "script": _bounded_text(result.get("script"), "script", 6000),
+        "caption": _bounded_text(result.get("caption"), "caption", 5000),
+        "hashtags": [tag.strip()[:80] for tag in hashtags[:20] if tag.strip()],
+        "video_prompt": _bounded_text(result.get("video_prompt") or f"Vertical 9:16 visual about {brief.get('topic', '')}", "video_prompt", 1000),
+        "duration_seconds": duration,
+        "claims": _normalize_claims(claims, source_ids),
+        "scenes": _normalize_scenes(result.get("scenes"), str(result.get("script") or ""), str(brief.get("topic") or "")),
+        "sources": sources,
+        "generated_by": generated_by or model,
+    }
+
+
 def generate_plan(brief: dict[str, Any], use_ai: bool, research_sources: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """@brief Generate a structured short-form plan or a labeled local preview."""
     sources = _source_snapshot(research_sources)
@@ -130,7 +177,7 @@ def generate_plan(brief: dict[str, Any], use_ai: bool, research_sources: list[di
         plan["sources"] = sources
         return plan
     source_context = [
-        {"id": source["id"], "title": source["title"], "url": source["url"], "published_at": source["published_at"], "content": source["content"]}
+        {"id": source["id"], "title": source["title"], "url": source["url"], "published_at": source["published_at"], "content": source["content"][:3500]}
         for source in sources
     ]
     brand_context = brief.get("brand_profile") if isinstance(brief.get("brand_profile"), dict) else {}
@@ -148,34 +195,19 @@ def generate_plan(brief: dict[str, Any], use_ai: bool, research_sources: list[di
         "Do not treat a topic or operator notes as proof. If extracted sources are insufficient, write cautiously and identify what needs source verification."
     )
     result, model = generate_json(PLANNER_SYSTEM_PROMPT, user_prompt, stage="planning")
-    hashtags = result.get("hashtags", [])
-    claims = result.get("claims", [])
-    duration = result.get("duration_seconds", brief["duration_seconds"])
-    if not isinstance(hashtags, list) or not all(isinstance(tag, str) for tag in hashtags):
-        raise ValueError("Generated hashtags must be a list of text values.")
-    if not isinstance(claims, list) or not all(isinstance(claim, dict) for claim in claims):
-        raise ValueError("Generated claims must be a list of objects.")
-    if isinstance(duration, bool) or not isinstance(duration, int) or not 4 <= duration <= 30:
-        raise ValueError("Generated duration must be an integer from 4 to 30 seconds.")
-    return {
-        "title": _bounded_text(result.get("title"), "title", 100),
-        "hook": _bounded_text(result.get("hook"), "hook", 240),
-        "script": _bounded_text(result.get("script"), "script", 6000),
-        "caption": _bounded_text(result.get("caption"), "caption", 5000),
-        "hashtags": [tag.strip()[:80] for tag in hashtags[:20] if tag.strip()],
-        "video_prompt": _bounded_text(result.get("video_prompt"), "video_prompt", 1000),
-        "duration_seconds": duration,
-        "claims": _normalize_claims(claims, {source["id"] for source in sources}),
-        "scenes": _normalize_scenes(result.get("scenes"), str(result.get("script") or ""), brief["topic"]),
-        "sources": sources,
-        "generated_by": model,
-    }
+    return _build_plan_payload(result, model, brief, sources)
 
 
 def review_plan(brief: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
     """@brief Ask an independent text-model pass to review claims and editorial fit."""
+    compact_sources = [
+        {**src, "content": str(src.get("content") or "")[:2500]}
+        for src in (plan.get("sources") or [])
+        if isinstance(src, dict)
+    ]
+    compact_plan = {**plan, "sources": compact_sources} if compact_sources else plan
     prompt = (
-        f"Brief: {brief}\nDraft: {plan}\n"
+        f"Brief: {brief}\nDraft: {compact_plan}\n"
         "Check the content against the audience, tone, accuracy, misleading claims, rights, and platform safety."
     )
     result, model = generate_json(REVIEW_SYSTEM_PROMPT, prompt, stage="review")
@@ -280,31 +312,46 @@ def autofix_plan_with_review(brief: dict[str, Any], plan: dict[str, Any], review
         "Revise the plan to resolve these issues while keeping the requested language, tone, and factual caution."
     )
     result, model = generate_json(PLANNER_SYSTEM_PROMPT, user_prompt, stage="planning")
-    hashtags = result.get("hashtags", [])
-    claims = result.get("claims", [])
-    duration = result.get("duration_seconds", plan.get("duration_seconds", 30))
-    if not isinstance(hashtags, list) or not all(isinstance(tag, str) for tag in hashtags):
-        raise ValueError("Revised hashtags must be a list of text values.")
-    if not isinstance(claims, list) or not all(isinstance(claim, dict) for claim in claims):
-        raise ValueError("Revised claims must be a list of objects.")
-    if isinstance(duration, bool) or not isinstance(duration, int) or not 4 <= duration <= 30:
-        duration = int(plan.get("duration_seconds") or 30)
-    sources = plan.get("sources", [])
-    source_ids = {source["id"] for source in sources if isinstance(source, dict) and isinstance(source.get("id"), str)}
-    revised = {
-        **plan,
-        "title": _bounded_text(result.get("title"), "title", 100),
-        "hook": _bounded_text(result.get("hook"), "hook", 240),
-        "script": _bounded_text(result.get("script"), "script", 6000),
-        "caption": _bounded_text(result.get("caption"), "caption", 5000),
-        "hashtags": [tag.strip()[:80] for tag in hashtags[:20] if tag.strip()],
-        "video_prompt": _bounded_text(result.get("video_prompt"), "video_prompt", 1000),
-        "duration_seconds": duration,
-        "claims": _normalize_claims(claims, source_ids),
-        "scenes": _normalize_scenes(result.get("scenes"), str(result.get("script") or ""), str(brief.get("topic") or "")),
-        "generated_by": f"{model} (autofix)",
-    }
-    return revised, model
+    revised = _build_plan_payload(
+        result,
+        model,
+        brief,
+        list(plan.get("sources") or []),
+        fallback_duration=int(plan.get("duration_seconds") or 30),
+        generated_by=f"{model} (autofix)",
+    )
+    return {**plan, **revised}, model
+
+
+def revise_plan_with_feedback(
+    brief: dict[str, Any],
+    plan: dict[str, Any] | None,
+    feedback: str,
+    use_ai: bool,
+    research_sources: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """@brief Regenerate or adjust a short-form plan incorporating operator rejection feedback."""
+    sources = _source_snapshot(research_sources) if research_sources is not None else _source_snapshot(plan.get("sources") if isinstance(plan, dict) else [])
+    if not use_ai:
+        base = make_template_plan(brief)
+        base["sources"] = sources
+        base["caption"] = f"{base['caption']} ({feedback.strip()[:120]})"[:5000]
+        return base
+    current_draft = {k: plan.get(k) for k in ("title", "hook", "script", "caption", "hashtags", "video_prompt", "duration_seconds", "scenes")} if isinstance(plan, dict) else {}
+    source_context = [
+        {"id": source["id"], "title": source["title"], "url": source["url"], "published_at": source["published_at"], "content": source["content"]}
+        for source in sources
+    ]
+    user_prompt = (
+        f"Original brief: {json.dumps(brief, ensure_ascii=False)}\n"
+        f"Previous draft that the operator rejected: {json.dumps(current_draft, ensure_ascii=False)}\n"
+        f"Operator rejection feedback (highest editorial priority within safety/factual rules): {feedback.strip()[:2000]}\n"
+        f"Extracted web sources, the only citable evidence: {json.dumps(source_context, ensure_ascii=False)}\n"
+        "Create a fresh improved plan addressing all of the operator's feedback. Update scenes and English visual_query terms to match any visual/pacing changes requested."
+    )
+    result, model = generate_json(PLANNER_SYSTEM_PROMPT, user_prompt, stage="planning")
+    fallback_duration = int(plan.get("duration_seconds") or brief.get("duration_seconds") or 30) if isinstance(plan, dict) else int(brief.get("duration_seconds") or 30)
+    return _build_plan_payload(result, model, brief, sources, fallback_duration=fallback_duration, generated_by=f"{model} (revised)")
 
 
 def estimate_speaking_duration(script: str, language: str = "Korean") -> dict[str, Any]:

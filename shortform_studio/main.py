@@ -60,11 +60,14 @@ from .workflow import (
     can_reuse_video_for_plan,
     change_youtube_privacy,
     cleanup_instagram_r2_object,
+    confirm_item_rights_for_approval,
     delete_item_media,
     download_stock_material_clip,
     get_subtitles_state,
     item_directory,
+    record_rejection_feedback,
     revise_plan,
+    run_autopilot_pipeline,
     run_content_review,
     run_hook_suggestions,
     run_plan_autofix,
@@ -109,6 +112,7 @@ class NewItem(BaseModel):
     source_notes: str = Field(default="", max_length=12000)
     synthetic_media: bool = True
     series_template_id: str | None = Field(default=None, max_length=36)
+    workflow_mode: Literal["manual", "autopilot"] = "manual"
 
 
 class SceneEditInput(BaseModel):
@@ -178,6 +182,14 @@ class ApprovalRequest(BaseModel):
 
     confirm: bool
     human_reviewed: bool
+    confirm_rights: bool = False
+
+
+class RejectRequest(BaseModel):
+    """Capture operator rejection feedback and optionally trigger automatic regeneration."""
+
+    feedback: str = Field(min_length=2, max_length=2000)
+    auto_reproduce: bool = True
 
 
 class PublishRequest(BaseModel):
@@ -217,7 +229,7 @@ class SourceInclusionRequest(BaseModel):
 class AIStageSelection(BaseModel):
     """Validate one AI provider and model pairing."""
 
-    provider: Literal["openai_api", "chatgpt_oauth", "gemini_oauth", "anthropic_api", "ollama"]
+    provider: Literal["openai_api", "chatgpt_oauth", "gemini_api", "gemini_oauth", "anthropic_api", "ollama"]
     model: str = Field(min_length=1, max_length=100)
 
 
@@ -1613,6 +1625,33 @@ def start_review(item_id: str) -> dict[str, str]:
     return {"job_id": job_id, "status": "reviewing"}
 
 
+@app.post("/api/items/{item_id}/autopilot", status_code=202)
+def start_autopilot(item_id: str) -> dict[str, str]:
+    """@brief Run planning, stock/video production, TTS/subtitles, and review automatically."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    store.update_payload(item_id, {"workflow_mode": "autopilot"})
+    job_id = _schedule(item_id, "planning", lambda: run_autopilot_pipeline(store, item_id))
+    return {"job_id": job_id, "status": "planning"}
+
+
+@app.post("/api/items/{item_id}/reject", status_code=202)
+def reject_item(item_id: str, request: RejectRequest) -> Any:
+    """@brief Record operator rejection feedback and optionally re-run the autopilot pipeline."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    if item.get("active_job"):
+        raise HTTPException(status_code=409, detail="Wait for the active operation before rejecting.")
+    try:
+        updated = record_rejection_feedback(store, item_id, request.feedback)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    if not request.auto_reproduce:
+        return JSONResponse(status_code=200, content=updated)
+    job_id = _schedule(item_id, "planning", lambda: run_autopilot_pipeline(store, item_id, feedback=request.feedback))
+    return {"job_id": job_id, "status": "planning"}
+
+
 @app.post("/api/items/{item_id}/approve")
 def approve_item(item_id: str, request: ApprovalRequest) -> dict[str, Any]:
     """@brief Bind explicit human approval to the current plan revision and file hash."""
@@ -1630,17 +1669,26 @@ def approve_item(item_id: str, request: ApprovalRequest) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="The final MP4 is missing.")
     if review.get("plan_revision") != plan.get("revision") or review.get("asset_sha256") != sha256_file(video_path):
         raise HTTPException(status_code=409, detail="The plan or video changed after review; run review again.")
+    if request.confirm_rights:
+        confirmed_rights = confirm_item_rights_for_approval(item)
+        store.update_payload(item_id, {"rights_assets": confirmed_rights})
+        item = _get_item(item_id)
     current_hash = sha256_file(video_path)
     preflight = _preflight_for_item(item)
     review = dict(review)
     review["preflight"] = preflight
-    review["status"] = combine_review_status(str(review.get("status_without_preflight") or review.get("status") or "manual_required"), preflight)
+    base_status = str(review.get("status_without_preflight") or review.get("status") or "manual_required")
+    review["status"] = combine_review_status(base_status, preflight)
     store.update_payload(item_id, {"review": review})
     if preflight["status"] != "ready":
         raise HTTPException(status_code=409, detail="Resolve all blocked platform and rights checks in the review panel before approval.")
-    if review.get("status") == "needs_changes":
+    technical = review.get("technical") or {}
+    if technical.get("available") and not technical.get("passed"):
+        raise HTTPException(status_code=409, detail="The video failed technical media checks; fix media issues before approval.")
+    autopilot_override = item.get("workflow_mode") == "autopilot" and request.confirm_rights
+    if review.get("status") == "needs_changes" and not autopilot_override:
         raise HTTPException(status_code=409, detail="The review found a failed technical or editorial check. Fix the listed issues and review again before approval.")
-    if review.get("status") not in {"passed", "manual_required"}:
+    if review.get("status") not in {"passed", "manual_required"} and not autopilot_override:
         raise HTTPException(status_code=409, detail="Run a successful or manual-required review before approval.")
     approved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     approval_record = {"plan_revision": plan.get("revision"), "asset_sha256": current_hash, "rights_asset_sha256": rights_assets_fingerprint(item.get("rights_assets", [])), "copy_sha256": copy_fingerprint(plan, item.get("platform_variants", {})), "review_status": review.get("status"), "manual_reviewed": True}

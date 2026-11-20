@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _HOSTNAME_PATTERN = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 
 MANAGED_ENV_KEYS = (
+    "GEMINI_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_MODEL",
     "ANTHROPIC_API_KEY",
@@ -50,7 +51,9 @@ def load_local_environment() -> None:
         key = key.strip()
         value = value.strip().strip("\"").strip("'")
         if key and key.replace("_", "").isalnum():
-            os.environ.setdefault(key, value)
+            # Treat empty env placeholders (e.g. from Compose env_file templates) as unset so saved local secrets persist across restarts.
+            if value and not os.environ.get(key):
+                os.environ[key] = value
 
 
 def get_app_home() -> Path:

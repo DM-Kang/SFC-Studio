@@ -503,6 +503,12 @@ def test_provider_connection(provider: str) -> dict[str, Any]:
             return {"ok": False, "message": "OPENAI_API_KEY is not set."}
         _get_json("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {key}"}, timeout=15)
         return {"ok": True, "message": "OpenAI API key verified."}
+    if name == "gemini":
+        key = get_secret("GEMINI_API_KEY")
+        if not key:
+            return {"ok": False, "message": "GEMINI_API_KEY is not set."}
+        _get_json("https://generativelanguage.googleapis.com/v1beta/models?pageSize=5", headers={"x-goog-api-key": key}, timeout=15)
+        return {"ok": True, "message": "Gemini API key verified."}
     if name == "anthropic":
         key = get_secret("ANTHROPIC_API_KEY")
         if not key:

@@ -225,9 +225,11 @@ def get_provider_statuses() -> dict[str, dict[str, Any]]:
     try:
         from .config import get_secret
 
+        gemini_api_ready = bool(get_secret("GEMINI_API_KEY"))
         openai_ready = bool(get_secret("OPENAI_API_KEY"))
         anthropic_ready = bool(get_secret("ANTHROPIC_API_KEY"))
     except ImportError:
+        gemini_api_ready = False
         openai_ready = False
         anthropic_ready = False
     models = _ollama_models(str(settings["ollama_base_url"]))
@@ -236,6 +238,7 @@ def get_provider_statuses() -> dict[str, dict[str, Any]]:
         login_states = {provider: dict(value) for provider, value in _LOGIN_STATE.items()}
     statuses: dict[str, dict[str, Any]] = {
         "openai_api": {"ready": openai_ready, "installed": True, "message": "API 키 연결됨." if openai_ready else "OPENAI_API_KEY 설정이 필요합니다."},
+        "gemini_api": {"ready": gemini_api_ready, "installed": True, "message": "Gemini API 키 연결됨." if gemini_api_ready else "GEMINI_API_KEY 설정이 필요합니다."},
         "gemini_oauth": {"ready": gemini_ready, "installed": True, "connecting": False, "message": "Google OAuth 연결됨." if gemini_ready else "OAuth 클라이언트 파일, Cloud 프로젝트와 로그인이 필요합니다."},
         "chatgpt_oauth": {"ready": chatgpt_ready, "installed": True, "connecting": False, "message": "ChatGPT OAuth 연결됨." if chatgpt_ready else "Sign in with ChatGPT 연결이 필요합니다."},
         "anthropic_api": {"ready": anthropic_ready, "installed": True, "message": "Anthropic API 키 연결됨." if anthropic_ready else "ANTHROPIC_API_KEY 설정이 필요합니다."},
@@ -299,16 +302,34 @@ def _is_gemini_text_model(model_id: str) -> bool:
     return not any(token in lowered for token in excluded)
 
 
-def _fetch_gemini_models() -> list[dict[str, str]]:
-    """@brief Fetch live generateContent-capable models from Google Generative Language API."""
+def _gemini_auth_headers(*, use_api_key: bool, json_content: bool = False) -> dict[str, str]:
+    """@brief Build Google Generative Language API headers for either API-key or OAuth auth."""
+    from .config import get_secret
+
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if json_content:
+        headers["Content-Type"] = "application/json"
+    if use_api_key:
+        api_key = get_secret("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError("GEMINI_API_KEY 설정이 필요합니다.")
+        headers["x-goog-api-key"] = api_key
+        return headers
     settings = load_ai_settings()
     project_id = str(settings.get("gemini_google_cloud_project") or "").strip()
     if not project_id:
-        raise RuntimeError("Enter the Google Cloud project ID first.")
+        raise RuntimeError("Enter the Google Cloud project ID in AI settings before using Gemini OAuth.")
     credentials = _load_gemini_credentials()
+    headers["Authorization"] = f"Bearer {credentials.token}"
+    headers["x-goog-user-project"] = project_id
+    return headers
+
+
+def _fetch_gemini_models(*, use_api_key: bool = False) -> list[dict[str, str]]:
+    """@brief Fetch live generateContent-capable models from Google Generative Language API."""
     payload = _request_json(
         "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
-        headers={"Authorization": f"Bearer {credentials.token}", "x-goog-user-project": project_id, "Accept": "application/json"},
+        headers=_gemini_auth_headers(use_api_key=use_api_key),
         timeout=15,
     )
     entries = payload.get("models", []) if isinstance(payload, dict) else []
@@ -378,6 +399,8 @@ def list_provider_models(provider: str, *, force_refresh: bool = False) -> dict[
             models = _fetch_openai_models_with_bearer(api_key)
         elif provider == "chatgpt_oauth":
             models = _fetch_openai_models_with_bearer(_chatgpt_access_token())
+        elif provider == "gemini_api":
+            models = _fetch_gemini_models(use_api_key=True)
         elif provider == "gemini_oauth":
             models = _fetch_gemini_models()
         elif provider == "anthropic_api":
@@ -765,19 +788,14 @@ def _request_json(url: str, *, headers: dict[str, str], body: dict[str, Any] | N
     return payload
 
 
-def _generate_gemini(model: str, system_prompt: str, user_prompt: str) -> str:
-    """@brief Generate JSON text through Gemini API using this app's Google OAuth token."""
+def _generate_gemini(model: str, system_prompt: str, user_prompt: str, *, use_api_key: bool = False) -> str:
+    """@brief Generate JSON text through Gemini API using either API key or Google OAuth."""
     from urllib.parse import quote
 
-    settings = load_ai_settings()
-    credentials = _load_gemini_credentials()
-    project_id = str(settings["gemini_google_cloud_project"])
-    if not project_id:
-        raise RuntimeError("Enter the Google Cloud project ID in AI settings before using Gemini OAuth.")
     model_path = quote(model, safe="-_.:")
     response = _request_json(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model_path}:generateContent",
-        headers={"Authorization": f"Bearer {credentials.token}", "Content-Type": "application/json", "x-goog-user-project": project_id},
+        headers=_gemini_auth_headers(use_api_key=use_api_key, json_content=True),
         body={"systemInstruction": {"parts": [{"text": system_prompt}]}, "contents": [{"role": "user", "parts": [{"text": user_prompt}]}], "generationConfig": {"responseMimeType": "application/json"}},
     )
     candidates = response.get("candidates")
@@ -873,7 +891,13 @@ def _generate_ollama(model: str, system_prompt: str, user_prompt: str) -> str:
     response = _request_json(
         f"{settings['ollama_base_url']}/api/chat",
         headers={"Content-Type": "application/json"},
-        body={"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], "format": "json", "stream": False},
+        body={
+            "model": model,
+            "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            "format": "json",
+            "stream": False,
+            "options": {"num_ctx": 24576},
+        },
     )
     message = response.get("message")
     text = message.get("content") if isinstance(message, dict) else None
@@ -886,6 +910,8 @@ def generate_text(provider: str, model: str, system_prompt: str, user_prompt: st
     """@brief Dispatch one structured generation request to the selected provider."""
     if provider == "chatgpt_oauth":
         return _generate_chatgpt(model, system_prompt, user_prompt)
+    if provider == "gemini_api":
+        return _generate_gemini(model, system_prompt, user_prompt, use_api_key=True)
     if provider == "gemini_oauth":
         return _generate_gemini(model, system_prompt, user_prompt)
     if provider == "anthropic_api":

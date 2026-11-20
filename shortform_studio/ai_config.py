@@ -11,10 +11,11 @@ from urllib.parse import urlsplit
 
 from .config import get_app_home, get_secret
 
-AI_PROVIDERS = {"openai_api", "chatgpt_oauth", "gemini_oauth", "anthropic_api", "ollama"}
+AI_PROVIDERS = {"openai_api", "chatgpt_oauth", "gemini_api", "gemini_oauth", "anthropic_api", "ollama"}
 DEFAULT_MODELS = {
     "openai_api": "gpt-4.1-mini",
     "chatgpt_oauth": "gpt-6.1-sol",
+    "gemini_api": "gemini-2.5-flash",
     "gemini_oauth": "gemini-2.5-flash",
     "anthropic_api": "claude-sonnet-4-5",
     "ollama": "qwen3:8b",

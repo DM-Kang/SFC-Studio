@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -288,9 +289,10 @@ def generate_voiceover(
     if not api_key or not voice_id:
         raise RuntimeError("Both ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required.")
     encoded_voice = urllib.parse.quote(voice_id, safe="")
+    model_id = get_secret("ELEVENLABS_MODEL", "eleven_multilingual_v2") or "eleven_multilingual_v2"
     request = urllib.request.Request(
         f"{ELEVENLABS_BASE_URL}/text-to-speech/{encoded_voice}/with-timestamps",
-        data=json.dumps({"text": text}).encode("utf-8"),
+        data=json.dumps({"text": text, "model_id": model_id}).encode("utf-8"),
         headers={"Content-Type": "application/json", "xi-api-key": api_key},
         method="POST",
     )
@@ -298,7 +300,17 @@ def generate_voiceover(
         with urllib.request.urlopen(request, timeout=120) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        raise RuntimeError(f"ElevenLabs request failed with HTTP {error.code}.") from None
+        detail = ""
+        try:
+            err_body = json.loads(error.read(4096).decode("utf-8", errors="replace"))
+            err_detail = err_body.get("detail") if isinstance(err_body, dict) else None
+            if isinstance(err_detail, dict) and isinstance(err_detail.get("message"), str):
+                detail = f": {err_detail['message'][:300]}"
+            elif isinstance(err_detail, str):
+                detail = f": {err_detail[:300]}"
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"ElevenLabs request failed with HTTP {error.code}{detail}") from None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
         raise RuntimeError(f"ElevenLabs request failed: {type(error).__name__}.") from None
     encoded_audio = result.get("audio_base64")
@@ -399,8 +411,11 @@ def probe_audio_duration(audio_path: Path) -> float | None:
     )
     if result.returncode != 0:
         return None
+    raw_stdout = getattr(result, "stdout", None)
+    if not isinstance(raw_stdout, str) or not raw_stdout.strip():
+        return None
     try:
-        payload = json.loads(result.stdout)
+        payload = json.loads(raw_stdout)
         duration = float((payload.get("format") or {}).get("duration") or 0)
         return duration if duration > 0 else None
     except (json.JSONDecodeError, TypeError, ValueError):
@@ -490,6 +505,51 @@ def _build_audio_mix_graph(
     return filters, out_label
 
 
+def _run_ffmpeg(
+    command: list[str],
+    *,
+    cwd: Path,
+    cancel_check: Any = None,
+    timeout: int = 900,
+) -> tuple[int, str]:
+    """@brief Execute FFmpeg with non-blocking cancellation polling and bounded stderr capture."""
+    if cancel_check is None:
+        result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+        return result.returncode, (getattr(result, "stderr", "") or "")[-1200:].strip()
+    deadline = time.monotonic() + timeout
+    with tempfile.TemporaryFile("w+t", encoding="utf-8", errors="replace") as err_log:
+        proc = subprocess.Popen(command, cwd=cwd, stdout=subprocess.DEVNULL, stderr=err_log)
+        try:
+            while True:
+                code = proc.poll()
+                if code is not None:
+                    err_log.flush()
+                    err_log.seek(0)
+                    return code, err_log.read()[-1200:].strip()
+                if cancel_check():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=3)
+                    raise RuntimeError("Operation cancelled by operator.")
+                if time.monotonic() >= deadline:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=3)
+                    raise RuntimeError("FFmpeg timed out while rendering video.")
+                time.sleep(0.35)
+        except Exception:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=3)
+            raise
+
+
 def render_video(
     source_path: Path,
     output_path: Path,
@@ -501,6 +561,7 @@ def render_video(
     bgm_volume: float = 0.18,
     ducking: bool = True,
     loudnorm: bool = False,
+    cancel_check: Any = None,
 ) -> Path:
     """@brief Render an MP4 and optionally combine narration, BGM ducking, and burned-in captions."""
     ffmpeg = shutil.which("ffmpeg")
@@ -516,8 +577,10 @@ def render_video(
             raise
         return output_path
     command = [ffmpeg, "-y"]
+    audio_duration: float | None = None
     if audio_path:
         # Looping the visual lets the full narration finish instead of cutting audio to one generated shot.
+        audio_duration = probe_audio_duration(audio_path)
         command.extend(["-stream_loop", "-1", "-i", source_path.name, "-i", audio_path.name])
     else:
         command.extend(["-i", source_path.name])
@@ -526,6 +589,7 @@ def render_video(
 
     voice_idx = 1 if audio_path else None
     bgm_idx = (2 if audio_path else 1) if bgm_path else None
+    duration_args = ["-t", f"{audio_duration + 0.10:.2f}"] if (audio_duration is not None and audio_duration > 0) else []
     use_complex = bool(bgm_path or (loudnorm and audio_path))
     if use_complex:
         filter_parts: list[str] = []
@@ -537,9 +601,9 @@ def render_video(
         filter_parts.extend(audio_parts)
         command.extend(["-filter_complex", ";".join(filter_parts), "-map", v_label])
         if a_label:
-            command.extend(["-map", a_label, "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"])
+            command.extend(["-map", a_label, "-shortest", *duration_args, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"])
         else:
-            command.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+            command.extend([*duration_args, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
     else:
         filters: list[str] = []
         if captions_path:
@@ -547,17 +611,16 @@ def render_video(
         if filters:
             command.extend(["-vf", ",".join(filters)])
         if audio_path:
-            command.extend(["-map", "0:v:0", "-map", "1:a:0", "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"])
+            command.extend(["-map", "0:v:0", "-map", "1:a:0", "-shortest", *duration_args, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"])
         elif captions_path:
             command.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart"])
         else:
             command.extend(["-c", "copy"])
     command.extend([staging_path.name])
     try:
-        result = subprocess.run(command, cwd=source_path.parent, capture_output=True, text=True, timeout=1800, check=False)
-        if result.returncode != 0:
-            detail = result.stderr[-1200:].strip()
-            raise RuntimeError(f"FFmpeg render failed with exit code {result.returncode}: {detail}")
+        returncode, detail = _run_ffmpeg(command, cwd=source_path.parent, cancel_check=cancel_check)
+        if returncode != 0:
+            raise RuntimeError(f"FFmpeg render failed with exit code {returncode}: {detail}")
         staging_path.replace(output_path)
     except Exception:
         staging_path.unlink(missing_ok=True)
@@ -672,6 +735,7 @@ def assemble_multiscene_video(
     bgm_volume: float = 0.18,
     ducking: bool = True,
     loudnorm: bool = False,
+    cancel_check: Any = None,
 ) -> Path:
     """@brief Execute FFmpeg multi-scene assembly into a vertical 9:16 MP4."""
     ffmpeg = shutil.which("ffmpeg")
@@ -692,10 +756,9 @@ def assemble_multiscene_video(
         loudnorm=loudnorm,
     )
     try:
-        result = subprocess.run(command, cwd=work_dir, capture_output=True, text=True, timeout=1800, check=False)
-        if result.returncode != 0:
-            detail = result.stderr[-1200:].strip()
-            raise RuntimeError(f"FFmpeg multi-scene assembly failed with exit code {result.returncode}: {detail}")
+        returncode, detail = _run_ffmpeg(command, cwd=work_dir, cancel_check=cancel_check)
+        if returncode != 0:
+            raise RuntimeError(f"FFmpeg multi-scene assembly failed with exit code {returncode}: {detail}")
         staging_path.replace(output_path)
     except Exception:
         staging_path.unlink(missing_ok=True)

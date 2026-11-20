@@ -6,7 +6,18 @@ from pathlib import Path
 from unittest.mock import patch
 
 from shortform_studio.store import Store
-from shortform_studio.workflow import replace_final_video_rights_record, revise_plan, run_content_review, run_planning, run_stock_material_search, run_web_research
+from shortform_studio.workflow import (
+    _auto_select_scene_clips,
+    confirm_item_rights_for_approval,
+    record_rejection_feedback,
+    replace_final_video_rights_record,
+    revise_plan,
+    run_autopilot_pipeline,
+    run_content_review,
+    run_planning,
+    run_stock_material_search,
+    run_web_research,
+)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -162,6 +173,117 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(len(updated), 2)
         self.assertEqual(updated[1]["asset_type"], "final_video")
         self.assertEqual(updated[1]["rights_status"], "unverified")
+
+    def test_autopilot_pipeline_and_rejection_feedback_loop(self) -> None:
+        """@brief Run full autopilot from topic through review, reject with feedback, and confirm rights on approval."""
+        scenes = [
+            {"id": "scene-1", "narration": "Hook line", "visual_query": "wifi cafe"},
+            {"id": "scene-2", "narration": "Tip two", "visual_query": "smartphone settings"},
+        ]
+        materials = [
+            {"scene_id": "scene-1", "provider": "Pixabay", "provider_id": "pixabay-1", "download_url": "https://cdn.pixabay.com/1.mp4", "title": "Cafe", "author": "A", "source_url": "https://pixabay.com/videos/1/", "license_url": "https://pixabay.com/service/license-summary/"},
+            {"scene_id": "scene-2", "provider": "Pixabay", "provider_id": "pixabay-2", "download_url": "https://cdn.pixabay.com/2.mp4", "title": "Phone", "author": "B", "source_url": "https://pixabay.com/videos/2/", "license_url": "https://pixabay.com/service/license-summary/"},
+        ]
+        clips = _auto_select_scene_clips(scenes, materials, 20)
+        self.assertEqual([c["provider_id"] for c in clips], ["pixabay-1", "pixabay-2"])
+        self.assertEqual(clips[0]["source_kind"], "stock")
+
+        fake_plan = {
+            "title": "Wi-Fi Security",
+            "hook": "Stop connecting blindly!",
+            "script": "Hook line. Tip two.",
+            "caption": "Keep safe on public Wi-Fi",
+            "hashtags": ["#security"],
+            "video_prompt": "Vertical cafe smartphone",
+            "duration_seconds": 20,
+            "claims": [],
+            "scenes": scenes,
+            "sources": [],
+            "generated_by": "gemini_api:gemini-3-flash-preview",
+        }
+        item = self.store.create_item({"topic": "Public Wi-Fi tips", "platforms": ["youtube"], "workflow_mode": "autopilot"})
+
+        def fake_assemble(store_arg, item_id_arg, scene_inputs, **kwargs):
+            target = self.root / "projects" / item_id_arg / "final.mp4"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+            current = store_arg.get_item(item_id_arg)
+            store_arg.update_payload(
+                item_id_arg,
+                {
+                    "assets": {"final_video": str(target), "sha256": "fakehash1", "generated_for_plan_revision": current["plan"]["revision"]},
+                    "rights_assets": [{"id": "r1", "asset_name": "Pixabay Cafe", "asset_type": "video", "included": True, "rights_status": "unverified", "license_name": "Pixabay License", "rights_basis": ""}],
+                },
+            )
+            return "generated"
+
+        with (
+            patch("shortform_studio.workflow.get_projects_dir", return_value=self.root / "projects"),
+            patch("shortform_studio.workflow.get_secret", side_effect=lambda k, d="": "pix-key" if k == "PIXABAY_API_KEY" else ""),
+            patch("shortform_studio.workflow.ai_ready", side_effect=lambda s: s == "planning"),
+            patch("shortform_studio.workflow.generate_plan", return_value=dict(fake_plan)),
+            patch("shortform_studio.workflow.search_pixabay_videos", return_value=materials),
+            patch("shortform_studio.workflow.run_scene_assembly", side_effect=fake_assemble),
+            patch("shortform_studio.workflow.probe_video", return_value={"available": True, "passed": True, "width": 720, "height": 1280, "duration_seconds": 20.0}),
+        ):
+            stage = run_autopilot_pipeline(self.store, item["id"])
+        self.assertEqual(stage, "reviewed")
+        reviewed_item = self.store.get_item(item["id"])
+        self.assertEqual(reviewed_item["plan"]["title"], "Wi-Fi Security")
+        self.assertIsNotNone(reviewed_item["review"])
+
+        # Reject with feedback and verify rejection history + revision increment.
+        rejected = record_rejection_feedback(self.store, item["id"], "Make the hook punchier and shorter")
+        self.assertEqual(len(rejected["rejection_history"]), 1)
+        self.assertEqual(rejected["rejection_history"][0]["feedback"], "Make the hook punchier and shorter")
+        revised_plan = {**fake_plan, "hook": "Never trust airport Wi-Fi!"}
+        with (
+            patch("shortform_studio.workflow.get_projects_dir", return_value=self.root / "projects"),
+            patch("shortform_studio.workflow.get_secret", side_effect=lambda k, d="": "pix-key" if k == "PIXABAY_API_KEY" else ""),
+            patch("shortform_studio.workflow.ai_ready", side_effect=lambda s: s == "planning"),
+            patch("shortform_studio.workflow.revise_plan_with_feedback", return_value=revised_plan),
+            patch("shortform_studio.workflow.search_pixabay_videos", return_value=materials),
+            patch("shortform_studio.workflow.run_scene_assembly", side_effect=fake_assemble),
+            patch("shortform_studio.workflow.probe_video", return_value={"available": True, "passed": True, "width": 720, "height": 1280, "duration_seconds": 20.0}),
+        ):
+            stage_v2 = run_autopilot_pipeline(self.store, item["id"], feedback="Make the hook punchier and shorter")
+        self.assertEqual(stage_v2, "reviewed")
+        v2_item = self.store.get_item(item["id"])
+        self.assertEqual(v2_item["plan"]["revision"], 2)
+        self.assertEqual(v2_item["plan"]["hook"], "Never trust airport Wi-Fi!")
+
+        confirmed = confirm_item_rights_for_approval(v2_item)
+        self.assertEqual(confirmed[0]["rights_status"], "cleared")
+        self.assertTrue(confirmed[0]["rights_basis"])
+
+    def test_ollama_plan_wrapper_unwrapping_and_num_ctx_budget(self) -> None:
+        """@brief Unwrap nested local-LLM plan wrappers and send adequate num_ctx for multi-source prompts."""
+        from shortform_studio.ai_providers import _generate_ollama
+        from shortform_studio.planning import _build_plan_payload
+
+        wrapped = {
+            "plan": {
+                "title": "Wrapped Title",
+                "hook": "Hook!",
+                "script": "Short script.",
+                "caption": "Caption.",
+                "hashtags": ["#coffee"],
+                "duration_seconds": "25",
+                "claims": [],
+                "scenes": [{"narration": "Line 1", "visual_query": "cold brew coffee"}],
+            }
+        }
+        payload = _build_plan_payload(wrapped, "ollama:qwen2.5:7b", {"topic": "Coffee", "duration_seconds": 30}, [])
+        self.assertEqual(payload["title"], "Wrapped Title")
+        self.assertEqual(payload["duration_seconds"], 25)
+
+        with (
+            patch("shortform_studio.ai_providers.load_ai_settings", return_value={"ollama_base_url": "http://127.0.0.1:11434"}),
+            patch("shortform_studio.ai_providers._request_json", return_value={"message": {"content": "{\"ok\": true}"}}) as req,
+        ):
+            res = _generate_ollama("qwen2.5:7b", "sys", "usr")
+        self.assertEqual(res, '{"ok": true}')
+        self.assertGreaterEqual(req.call_args.kwargs["body"]["options"]["num_ctx"], 16384)
 
 
 if __name__ == "__main__":

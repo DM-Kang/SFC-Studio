@@ -27,6 +27,7 @@ from .planning import (
     autofix_plan_with_review,
     generate_plan,
     normalize_editable_scenes,
+    revise_plan_with_feedback,
     review_plan,
     suggest_hooks,
 )
@@ -770,6 +771,7 @@ def run_scene_assembly(
     master_path = folder / "source_assembled.mp4"
     final_path = folder / "final.mp4"
     # Render a clean master without burned captions first so subtitle editing can rerender without re-assembling.
+    cancel_fn = lambda: store.is_cancel_requested(item_id)
     assemble_multiscene_video(
         folder,
         resolved_clips,
@@ -778,6 +780,7 @@ def run_scene_assembly(
         audio_path=None,
         captions_path=None,
         bgm_path=None,
+        cancel_check=cancel_fn,
     )
     render_video(
         master_path,
@@ -789,6 +792,7 @@ def run_scene_assembly(
         bgm_volume=bgm_volume,
         ducking=ducking,
         loudnorm=loudnorm,
+        cancel_check=cancel_fn,
     )
     new_assets = {
         **existing_assets,
@@ -912,3 +916,212 @@ def save_thumbnail_from_video(store: Store, item_id: str, timestamp_seconds: flo
     assets["thumbnail_path"] = str(thumb_path)
     assets["thumbnail_offset_ms"] = max(0, int(round(float(timestamp_seconds) * 1000)))
     return store.update_payload(item_id, {"assets": assets})
+
+
+def _auto_select_scene_clips(
+    scenes: list[dict[str, Any]],
+    materials: list[dict[str, Any]],
+    target_duration: int | float,
+) -> list[dict[str, Any]]:
+    """@brief Automatically match the best unused stock video clip to each planned scene."""
+    downloadable = [m for m in materials if isinstance(m, dict) and m.get("provider_id") and m.get("download_url")]
+    if not downloadable:
+        return []
+    bounded_scenes = [s for s in scenes if isinstance(s, dict)][:8] or [{"id": "scene-1"}]
+    total = max(4.0, min(30.0, float(target_duration or 20)))
+    default_dur = round(max(2.0, min(30.0, total / len(bounded_scenes))), 1)
+
+    selected: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+    for scene in bounded_scenes:
+        sid = str(scene.get("id") or "")
+        scene_matches = [m for m in downloadable if str(m.get("scene_id") or "") == sid]
+        pool = (
+            [m for m in scene_matches if str(m["provider_id"]) not in used_ids]
+            or scene_matches
+            or [m for m in downloadable if str(m["provider_id"]) not in used_ids]
+            or downloadable
+        )
+        chosen = pool[0]
+        pid = str(chosen["provider_id"])
+        used_ids.add(pid)
+        raw_dur = scene.get("duration_seconds")
+        dur = round(max(1.0, min(30.0, float(raw_dur))), 1) if isinstance(raw_dur, (int, float)) and not isinstance(raw_dur, bool) else default_dur
+        selected.append({"source_kind": "stock", "provider_id": pid, "duration_seconds": dur})
+    return selected
+
+
+def confirm_item_rights_for_approval(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """@brief Mark included production and stock rights entries as operator-confirmed during approval."""
+    existing = item.get("rights_assets")
+    confirmed: list[dict[str, Any]] = []
+    if isinstance(existing, list):
+        for asset in existing:
+            if not isinstance(asset, dict):
+                continue
+            entry = dict(asset)
+            if entry.get("included", True) and entry.get("rights_status") != "cleared":
+                entry["rights_status"] = "cleared"
+                if not str(entry.get("rights_basis") or "").strip():
+                    basis = str(entry.get("license_name") or entry.get("source_description") or "Operator verified final production and source rights on approval").strip()
+                    entry["rights_basis"] = basis[:500]
+            confirmed.append(entry)
+    if not any(a.get("included", True) for a in confirmed):
+        record = final_video_rights_record("autopilot production")
+        record["rights_status"] = "cleared"
+        record["rights_basis"] = "Operator confirmed final production and source rights upon final approval"
+        confirmed.append(record)
+    return confirmed
+
+
+def record_rejection_feedback(store: Store, item_id: str, feedback: str) -> dict[str, Any]:
+    """@brief Persist operator rejection feedback and invalidate previous review or approval state."""
+    item = store.get_item(item_id)
+    if item is None:
+        raise KeyError(item_id)
+    cleaned = str(feedback or "").strip()[:2000]
+    if not cleaned:
+        raise ValueError("반려 의견을 입력해 주세요.")
+    history = list(item.get("rejection_history") or [])
+    history.append(
+        {
+            "id": str(uuid4()),
+            "feedback": cleaned,
+            "plan_revision": int(item.get("plan_revision") or (item.get("plan") or {}).get("revision") or 0),
+            "rejected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+    )
+    store.cancel_pending_schedules(item_id, "Draft rejected by operator with feedback; pending schedules cancelled.")
+    return store.update_payload(
+        item_id,
+        {
+            "rejection_history": history[-50:],
+            "last_rejection_feedback": cleaned,
+            "review": None,
+            "approved_at": None,
+            "approved_asset_sha256": None,
+            "reviewed_asset_sha256": None,
+            "approval_record": None,
+        },
+    )
+
+
+def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") -> str:
+    """@brief Run web research, AI planning/revision, clip matching, TTS/FFmpeg assembly, and review end-to-end."""
+    item = store.get_item(item_id)
+    if item is None:
+        raise KeyError(item_id)
+
+    tavily_key = get_secret("TAVILY_API_KEY")
+    existing_research = item.get("research") if isinstance(item.get("research"), dict) else {}
+    if tavily_key and not existing_research.get("sources"):
+        store.set_job_progress(item_id, "1/4 웹 출처 조사 중 (Tavily)", 12)
+        try:
+            research = collect_web_research(_brief(item), tavily_key)
+            store.update_payload(item_id, {"research": research})
+        except Exception:
+            # Non-fatal when operator source notes or topic guidance already exist.
+            pass
+    if store.is_cancel_requested(item_id):
+        raise RuntimeError("Operation cancelled by operator.")
+
+    item = store.get_item(item_id) or item
+    research = item.get("research") if isinstance(item.get("research"), dict) else {}
+    raw_sources = research.get("sources", []) if isinstance(research, dict) else []
+    research_sources = [src for src in raw_sources if isinstance(src, dict) and src.get("included", True) is not False]
+
+    cleaned_feedback = str(feedback or "").strip()
+    if cleaned_feedback and isinstance(item.get("plan"), dict):
+        store.set_job_progress(item_id, "2/4 반려 의견 반영해 기획안 재작성 중", 28)
+        store.save_revision_snapshot(item_id, f"Operator rejection feedback: {cleaned_feedback[:120]}")
+        prior_items = [candidate for candidate in store.list_items() if candidate.get("id") != item_id]
+        brief = {**_brief(item), "analytics_feedback": summarize_analytics(prior_items)}
+        revised_plan = revise_plan_with_feedback(brief, item["plan"], cleaned_feedback, ai_ready("planning"), research_sources)
+        revision = int(item.get("plan_revision", item["plan"].get("revision", 0))) + 1
+        revised_plan["revision"] = revision
+        store.update_payload(
+            item_id,
+            {
+                "plan": revised_plan,
+                "platform_variants": {},
+                "plan_revision": revision,
+                "materials": [],
+                "materials_collected_at": None,
+                "review": None,
+                "approved_at": None,
+                "approved_asset_sha256": None,
+                "reviewed_asset_sha256": None,
+                "approval_record": None,
+            },
+        )
+    else:
+        store.set_job_progress(item_id, "2/4 AI 기획안 생성 중", 28)
+        run_planning(store, item_id)
+    if store.is_cancel_requested(item_id):
+        raise RuntimeError("Operation cancelled by operator.")
+
+    item = store.get_item(item_id) or item
+    if isinstance(item.get("plan"), dict) and ai_ready("review") and ai_ready("planning"):
+        try:
+            editorial = review_plan(_brief(item), item["plan"])
+            if editorial.get("status") != "passed":
+                polished, _model = autofix_plan_with_review(
+                    _brief(item),
+                    item["plan"],
+                    {"editorial": editorial, "unverified_claims": [], "preflight": {}},
+                )
+                polished["revision"] = item["plan"].get("revision", 1)
+                store.update_payload(item_id, {"plan": polished})
+        except Exception:
+            pass
+    if store.is_cancel_requested(item_id):
+        raise RuntimeError("Operation cancelled by operator.")
+
+    item = store.get_item(item_id) or item
+    plan = item.get("plan") or {}
+    scenes = plan.get("scenes") or []
+    pixabay_key = get_secret("PIXABAY_API_KEY")
+    pexels_key = get_secret("PEXELS_API_KEY")
+    runway_key = get_secret("RUNWAY_API_KEY")
+
+    store.set_job_progress(item_id, "3/4 스톡 영상 검색 · 음성·자막 · 영상 제작 중", 55)
+    materials: list[dict[str, Any]] = []
+    if pixabay_key:
+        materials.extend(search_pixabay_videos(scenes, pixabay_key))
+    if pexels_key:
+        materials.extend(search_pexels_videos(scenes, pexels_key))
+    if materials:
+        store.update_payload(
+            item_id,
+            {"materials": materials, "materials_collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds")},
+        )
+    scene_inputs = _auto_select_scene_clips(scenes, materials, plan.get("duration_seconds") or 20)
+    if not scene_inputs:
+        uploaded_clips = ((item.get("assets") or {}).get("uploaded_clips")) or []
+        if uploaded_clips:
+            per_dur = round(max(2.0, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, min(len(scenes), len(uploaded_clips))))), 1)
+            scene_inputs = [
+                {"source_kind": "uploaded", "filename": str(uploaded_clips[idx % len(uploaded_clips)]["filename"]), "duration_seconds": per_dur}
+                for idx in range(max(1, min(len(scenes), 8)))
+            ]
+    if scene_inputs:
+        store.set_job_progress(item_id, "3/4 클립 저장 · ElevenLabs/TTS · FFmpeg 합성 중", 72)
+        run_scene_assembly(
+            store,
+            item_id,
+            scene_inputs,
+            transition="fade" if len(scene_inputs) > 1 else "cut",
+            tts_provider="auto",
+            loudnorm=True,
+        )
+    elif runway_key:
+        run_video_generation(store, item_id)
+    else:
+        raise RuntimeError("완전 자동화 제작에는 스톡 영상 API(PIXABAY_API_KEY/PEXELS_API_KEY), 업로드 클립, 또는 RUNWAY_API_KEY가 필요합니다.")
+
+    if store.is_cancel_requested(item_id):
+        raise RuntimeError("Operation cancelled by operator.")
+
+    store.set_job_progress(item_id, "4/4 완성 영상 기술 검사 · AI 독립 검수 중", 90)
+    run_content_review(store, item_id)
+    return "reviewed"

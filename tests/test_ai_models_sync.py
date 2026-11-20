@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from shortform_studio.ai_providers import (
     clear_model_list_cache,
+    generate_text,
     list_all_provider_models,
     list_provider_models,
     sync_ready_provider_models,
@@ -106,11 +107,12 @@ class LiveAIModelCatalogTests(unittest.TestCase):
         ):
             all_catalogs = list_all_provider_models(force_refresh=True)
 
-        self.assertEqual(set(all_catalogs.keys()), {"openai_api", "chatgpt_oauth", "gemini_oauth", "anthropic_api", "ollama"})
+        self.assertEqual(set(all_catalogs.keys()), {"openai_api", "chatgpt_oauth", "gemini_api", "gemini_oauth", "anthropic_api", "ollama"})
         self.assertEqual([m["id"] for m in all_catalogs["ollama"]["models"]], ["qwen3:8b", "llama3.3:latest"])
         self.assertEqual(all_catalogs["chatgpt_oauth"]["models"], [])
         self.assertIn("Connect Sign in with ChatGPT", all_catalogs["chatgpt_oauth"]["error"])
         self.assertIn("OPENAI_API_KEY", all_catalogs["openai_api"]["error"])
+        self.assertIn("GEMINI_API_KEY", all_catalogs["gemini_api"]["error"])
 
     def test_sync_ready_provider_models_only_queries_ready_providers(self) -> None:
         """@brief Periodic server sync only refreshes providers whose credentials are ready."""
@@ -129,6 +131,26 @@ class LiveAIModelCatalogTests(unittest.TestCase):
 
         self.assertEqual(set(synced.keys()), {"gemini_oauth", "ollama"})
         self.assertEqual(mock_list.call_count, 2)
+
+    def test_gemini_api_key_models_and_generation_use_api_key_header(self) -> None:
+        """@brief Support Google AI Studio GEMINI_API_KEY for both live model discovery and generation."""
+        models_payload = {
+            "models": [
+                {"name": "models/gemini-2.5-flash", "displayName": "Gemini 2.5 Flash", "supportedGenerationMethods": ["generateContent"]},
+            ]
+        }
+        gen_payload = {"candidates": [{"content": {"parts": [{"text": "{\"ok\":true}"}]}}]}
+        with (
+            patch("shortform_studio.config.get_secret", side_effect=lambda k, d="": "ai-studio-key" if k == "GEMINI_API_KEY" else d),
+            patch("shortform_studio.ai_providers._request_json", side_effect=[models_payload, gen_payload]) as req,
+        ):
+            catalog = list_provider_models("gemini_api", force_refresh=True)
+            output = generate_text("gemini_api", "gemini-2.5-flash", "sys", "usr")
+
+        self.assertEqual([m["id"] for m in catalog["models"]], ["gemini-2.5-flash"])
+        self.assertEqual(req.call_args_list[0].kwargs["headers"]["x-goog-api-key"], "ai-studio-key")
+        self.assertEqual(req.call_args_list[1].kwargs["headers"]["x-goog-api-key"], "ai-studio-key")
+        self.assertEqual(output, '{"ok":true}')
 
 
 if __name__ == "__main__":

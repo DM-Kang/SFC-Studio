@@ -270,6 +270,21 @@ class Phase3DashboardSecretsAndResearchTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     update_local_env_secrets({"UNSUPPORTED_KEY": "123"})
 
+    def test_load_local_environment_populates_when_process_env_has_empty_placeholders(self) -> None:
+        """@brief Fill empty Compose env_file placeholders from local .env without overriding non-empty values."""
+        from shortform_studio.config import load_local_environment
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text("TAVILY_API_KEY=saved-tavily\nOPENAI_API_KEY=saved-openai\n", encoding="utf-8")
+            with (
+                patch("shortform_studio.config.get_app_home", return_value=root),
+                patch.dict(os.environ, {"TAVILY_API_KEY": "", "OPENAI_API_KEY": "explicit-override"}, clear=False),
+            ):
+                load_local_environment()
+                self.assertEqual(os.environ["TAVILY_API_KEY"], "saved-tavily")
+                self.assertEqual(os.environ["OPENAI_API_KEY"], "explicit-override")
+
     def test_direct_url_research_ssrf_guard_source_toggle_and_cancel(self) -> None:
         """@brief Block private IP resolution on URL fetch, allow source inclusion toggles, and cancel jobs cleanly."""
         with patch("shortform_studio.resources.socket.getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]):

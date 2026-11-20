@@ -45,7 +45,7 @@ async function api(path, options = {}) {
 
 function renderProviders() {
   const aiStages = state.settings.ai?.stages || {};
-  const providerNames = { openai_api: "OpenAI API", chatgpt_oauth: "ChatGPT OAuth", gemini_oauth: "Gemini OAuth", anthropic_api: "Claude API", ollama: "Ollama 로컬" };
+  const providerNames = { openai_api: "OpenAI API", chatgpt_oauth: "ChatGPT OAuth", gemini_api: "Gemini API", gemini_oauth: "Gemini OAuth", anthropic_api: "Claude API", ollama: "Ollama 로컬" };
   const values = [
     [`기획 AI · ${providerNames[aiStages.planning?.provider] || "미설정"}`, aiStages.planning?.ready],
     [`검수 AI · ${providerNames[aiStages.review?.provider] || "미설정"}`, aiStages.review?.ready],
@@ -82,6 +82,8 @@ function renderAIAuthStatus() {
   if (disconnect) disconnect.hidden = !providers.gemini_oauth?.ready;
   const chatgptDisconnect = document.getElementById("disconnect-chatgpt");
   if (chatgptDisconnect) chatgptDisconnect.hidden = !providers.chatgpt_oauth?.ready;
+  const geminiApiStatus = document.getElementById("gemini-api-status");
+  if (geminiApiStatus) geminiApiStatus.textContent = providers.gemini_api?.message || "상태를 확인할 수 없습니다.";
   const anthropicStatus = document.getElementById("anthropic-api-status");
   if (anthropicStatus) anthropicStatus.textContent = providers.anthropic_api?.message || "상태를 확인할 수 없습니다.";
 }
@@ -977,20 +979,101 @@ function renderPublish(item) {
   return `<section class="card panel"><h3>⑤ 게시</h3><p class="muted">채널별로 별도 게시합니다. 로컬 예약 시각에는 이 앱이 실행 중이어야 합니다.</p>${entries}<p class="small-note">불확실한 게시 결과와 앱 종료 중 처리된 예약은 자동 재시도하지 않습니다. 채널의 게시 상태를 확인한 뒤 다시 조치하세요.</p>${renderAnalytics(item)}</section>`;
 }
 
+function renderDecisionCard(item) {
+  if (item.active_job || item.stage === "published") return "";
+  const isAutopilot = item.workflow_mode === "autopilot";
+  const videoPath = item.assets?.final_video;
+  const plan = item.plan;
+  const review = item.review;
+  const isStale = Boolean(videoPath && plan && item.assets?.generated_for_plan_revision !== plan.revision);
+
+  if (!videoPath || !review || isStale) {
+    if (!isAutopilot) return "";
+    return `<section class="decision-card panel"><div class="card-head"><div><p class="eyebrow">FULL AUTOPILOT</p><h3>완전 자동화 파이프라인</h3></div><span class="badge">${item.stage === "failed" ? "재실행 가능" : "대기 중"}</span></div><p class="muted">주제와 참고 자료·근거를 바탕으로 웹 조사 → AI 기획 → 스톡 영상·음성·자막 제작 → 검수까지 한 번에 실행해 완성본을 가져옵니다.</p><div class="actions"><button id="start-autopilot-button" class="button primary" type="button">원클릭 자동 기획 · 제작 · 검수 실행</button></div></section>`;
+  }
+
+  if (item.stage === "approved") return "";
+
+  const preflightChecks = review.preflight?.checks || [];
+  const rightsCodes = new Set(["asset_rights", "rights_basis", "rights_records"]);
+  const hardBlockers = preflightChecks.filter(c => c.status === "blocked" && !rightsCodes.has(c.code));
+  const techFailed = Boolean(review.technical?.available && !review.technical?.passed);
+  const blocked = techFailed || hardBlockers.length > 0;
+
+  const editorial = review.editorial;
+  const issuesHtml = editorial?.issues?.length ? `<div class="warning-banner"><strong>검수 참고 사항</strong><ul>${editorial.issues.map(i => `<li>${escapeHtml(i)}</li>`).join("")}</ul></div>` : "";
+  const blockerHtml = hardBlockers.length ? `<div class="error-banner"><strong>해결 필요한 차단 항목</strong><ul>${hardBlockers.map(c => `<li>${escapeHtml(c.message)}</li>`).join("")}</ul></div>` : "";
+  const usedSources = (item.rights_assets || []).filter(a => a.included !== false && a.source_url).map(a => `<a href="${escapeHtml(a.source_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(a.asset_name)} ↗</a>`).join(" · ");
+  const rejections = (item.rejection_history || []).slice().reverse().slice(0, 3);
+  const rejectionHtml = rejections.length ? `<div class="rejection-history"><strong>이전 반려 의견 (${rejections.length})</strong>${rejections.map(r => `<span>• ${escapeHtml(r.feedback)}</span>`).join("")}</div>` : "";
+
+  const ytSelected = (item.platforms || []).includes("youtube");
+  const ytReady = Boolean(state.settings.youtube_ready);
+  const ytControls = ytSelected ? `<div class="form-row"><label>YouTube 공개 설정<select id="decision-youtube-privacy"><option value="private" selected>비공개 (private)</option><option value="unlisted">일부 공개 (unlisted)</option><option value="public">전체 공개 (public)</option></select></label><div></div></div>` : "";
+  const primaryApproveBtn = ytSelected && ytReady
+    ? `<button id="decision-approve-publish" class="button good" type="button" ${blocked ? "disabled" : ""}>승인 및 YouTube Shorts 게시</button><button id="decision-approve-only" class="button" type="button" ${blocked ? "disabled" : ""}>승인만 하기</button>`
+    : `<button id="decision-approve-only" class="button good" type="button" ${blocked ? "disabled" : ""}>완성본 승인</button>`;
+  const ytNote = ytSelected && !ytReady ? '<p class="small-note">YouTube OAuth JSON 경로를 연결하면 승인 즉시 YouTube Shorts로 바로 업로드됩니다.</p>' : "";
+
+  return `<section class="decision-card panel">
+    <div class="card-head"><div><p class="eyebrow">FINAL APPROVAL · HUMAN IN THE LOOP</p><h3>완성본 최종 확인 · 승인 또는 반려</h3></div><span class="badge ${techFailed ? "bad" : "good"}">revision ${escapeHtml(plan?.revision ?? 1)}</span></div>
+    <div class="decision-grid">
+      <div>${renderSafeZoneVideo(item, "approval-video")}</div>
+      <div class="decision-meta">
+        <div><strong>${escapeHtml(plan?.title || item.topic)}</strong><p class="muted">${escapeHtml(plan?.hook || "")}</p></div>
+        <div class="source-excerpt">${escapeHtml(plan?.script || "")}</div>
+        <p class="small-note">검수 요약: ${escapeHtml(editorial?.summary || review.technical?.message || "자동 검수 완료")}</p>
+        ${usedSources ? `<p class="small-note">포함된 소재 출처: ${usedSources}</p>` : ""}
+        ${issuesHtml}${blockerHtml}${rejectionHtml}
+        <div class="decision-actions">
+          ${ytControls}
+          <label class="approval-check"><input id="decision-confirm-check" type="checkbox" ${blocked ? "disabled" : ""}> 완성된 영상·음성·자막, 사용된 스톡·TTS 권리 및 플랫폼 정책을 직접 확인했습니다.</label>
+          <div class="actions">${primaryApproveBtn}<button id="decision-reject-toggle" class="button danger" type="button">반려 (의견 전달)</button></div>
+          ${ytNote}
+          <div id="reject-feedback-panel" class="reject-box" hidden>
+            <label>반려 의견 (수정·재제작 방향 입력)<textarea id="reject-feedback-input" rows="3" maxlength="2000" placeholder="예: 첫 문장이 너무 평범해요. 더 호기심을 끄는 훅으로 바꾸고, 배경 영상도 바꿔서 다시 만들어 주세요."></textarea></label>
+            <div class="actions"><button id="decision-reject-submit" class="button danger" type="button">반려 의견 반영해 다시 제작</button></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>`;
+}
+
 function renderItem(item) {
   const workspace = document.getElementById("workspace");
   const pct = Number(item.job_progress?.percent ?? 10);
   const progressText = item.job_progress?.message ? ` · ${escapeHtml(item.job_progress.message)}` : "";
   const jobMessage = item.active_job ? `<div class="success-banner"><div class="card-head"><span>${escapeHtml(stageLabels[item.stage] || item.stage)}${progressText}</span><button id="cancel-job-button" class="button danger" type="button" ${item.cancel_requested ? "disabled" : ""}>${item.cancel_requested ? "취소 요청됨" : "작업 취소 요청"}</button></div><div class="progress-bar"><span style="width:${Math.max(5, Math.min(100, pct))}%"></span></div></div>` : "";
-  const errorMessage = item.error ? `<div class="error-banner">${escapeHtml(item.error)}<br>오류가 난 생성·게시 작업은 자동 재시도하지 않았습니다.</div>` : "";
+  const errorMessage = item.error ? `<div class="error-banner">${escapeHtml(item.error)}<br>오류가 난 생성·게시 작업은 자동 재시도하지 않았습니다.${item.workflow_mode === "autopilot" ? ' <button id="retry-autopilot-button" class="button" type="button">자동화 다시 실행</button>' : ""}</div>` : "";
   const published = item.stage === "published" ? '<div class="success-banner">선택한 모든 플랫폼에 게시되었습니다.</div>' : "";
   const seriesName = item.series_template_snapshot?.name ? ` · ${escapeHtml(item.series_template_snapshot.name)}` : "";
   const isPublishedOrLocked = Boolean(item.active_job) || Object.values(item.publications || {}).some(post => ["publishing", "published", "uncertain"].includes(post.status));
-  workspace.innerHTML = `<div class="content-detail"><header class="detail-header panel"><div><p class="eyebrow">CONTENT WORKFLOW · ${escapeHtml(item.id.slice(0, 8))}</p><h2>${escapeHtml(item.plan?.title || item.topic)}</h2><p>${escapeHtml(item.audience)} · ${escapeHtml(item.language)} · ${(item.platforms || []).map(escapeHtml).join(" + ")}${seriesName}</p></div><div class="header-controls"><span class="badge ${item.stage === "failed" ? "bad" : item.stage === "approved" || item.stage === "published" ? "good" : ""}">${escapeHtml(stageLabels[item.stage] || item.stage)}</span><button id="duplicate-item-button" class="button" type="button">복제</button><button id="archive-item-button" class="button" type="button">${item.archived ? "보관 해제" : "보관"}</button><button id="delete-item-button" class="button danger" type="button" ${isPublishedOrLocked ? "disabled" : ""}>삭제</button></div></header>${renderStages(item)}${jobMessage}${errorMessage}${published}<div class="detail-grid"><div class="content-column">${renderPlan(item)}${renderProduction(item)}</div><div class="review-column">${renderReview(item)}${renderPublish(item)}</div></div><section class="small-note">작업 파일 위치: ${escapeHtml(state.settings.app_home || "사용자 데이터 폴더")}</section></div>`;
+  const runningOther = (state.items || []).find(candidate => candidate.active_job && candidate.id !== item.id);
+  const runningOtherBanner = runningOther
+    ? `<div class="warning-banner"><div class="card-head"><span>⏳ 다른 작업이 진행 중이라 삭제·새 생성이 대기 중입니다: <strong>${escapeHtml(runningOther.plan?.title || runningOther.topic)}</strong> (${escapeHtml(runningOther.job_progress?.message || stageLabels[runningOther.stage] || runningOther.stage)})</span><div class="actions"><button id="jump-running-item" class="button" type="button">진행 중 작업 보기</button><button id="cancel-running-other" class="button danger" type="button" ${runningOther.cancel_requested ? "disabled" : ""}>${runningOther.cancel_requested ? "취소 요청됨" : "작업 취소 요청"}</button></div></div></div>`
+    : "";
+  const decisionCard = renderDecisionCard(item);
+  workspace.innerHTML = `<div class="content-detail"><header class="detail-header panel"><div><p class="eyebrow">CONTENT WORKFLOW · ${escapeHtml(item.id.slice(0, 8))}${item.workflow_mode === "autopilot" ? " · AUTOPILOT" : ""}</p><h2>${escapeHtml(item.plan?.title || item.topic)}</h2><p>${escapeHtml(item.audience)} · ${escapeHtml(item.language)} · ${(item.platforms || []).map(escapeHtml).join(" + ")}${seriesName}</p></div><div class="header-controls"><span class="badge ${item.stage === "failed" ? "bad" : item.stage === "approved" || item.stage === "published" ? "good" : ""}">${escapeHtml(stageLabels[item.stage] || item.stage)}</span><button id="duplicate-item-button" class="button" type="button">복제</button><button id="archive-item-button" class="button" type="button">${item.archived ? "보관 해제" : "보관"}</button><button id="delete-item-button" class="button danger" type="button" ${isPublishedOrLocked ? "disabled" : ""}>삭제</button></div></header>${renderStages(item)}${runningOtherBanner}${jobMessage}${errorMessage}${published}${decisionCard}<div class="detail-grid"><div class="content-column">${renderPlan(item)}${renderProduction(item)}</div><div class="review-column">${renderReview(item)}${renderPublish(item)}</div></div><section class="small-note">작업 파일 위치: ${escapeHtml(state.settings.app_home || "사용자 데이터 폴더")}</section></div>`;
   wireItemActions(item);
+  if (runningOther) {
+    document.getElementById("jump-running-item")?.addEventListener("click", () => selectItem(runningOther.id));
+    document.getElementById("cancel-running-other")?.addEventListener("click", () => cancelItemJob(runningOther.id));
+  }
 }
 
 function wireItemActions(item) {
+  document.getElementById("start-autopilot-button")?.addEventListener("click", () => runAction(`/api/items/${item.id}/autopilot`, "POST", "완전 자동화 파이프라인을 시작했습니다."));
+  document.getElementById("retry-autopilot-button")?.addEventListener("click", () => runAction(`/api/items/${item.id}/autopilot`, "POST", "완전 자동화 파이프라인을 다시 시작했습니다."));
+  document.getElementById("decision-approve-publish")?.addEventListener("click", () => decideAutopilotItem(item, true));
+  document.getElementById("decision-approve-only")?.addEventListener("click", () => decideAutopilotItem(item, false));
+  document.getElementById("decision-reject-toggle")?.addEventListener("click", () => {
+    const panel = document.getElementById("reject-feedback-panel");
+    if (!panel) return;
+    panel.hidden = !panel.hidden;
+    if (!panel.hidden) document.getElementById("reject-feedback-input")?.focus();
+  });
+  document.getElementById("decision-reject-submit")?.addEventListener("click", () => rejectAutopilotItem(item.id));
   document.getElementById("duplicate-item-button")?.addEventListener("click", () => duplicateItem(item.id));
   document.getElementById("archive-item-button")?.addEventListener("click", () => toggleArchiveItem(item.id, !item.archived));
   document.getElementById("delete-item-button")?.addEventListener("click", () => deleteItem(item.id));
@@ -1492,6 +1575,56 @@ async function approveItem() {
   } catch (error) { toast(error.message); }
 }
 
+async function decideAutopilotItem(item, publishYouTube) {
+  const checked = document.getElementById("decision-confirm-check")?.checked;
+  if (!checked) return toast("완성 영상과 소재 권리 확인 체크박스를 먼저 선택하세요.");
+  const privacy = document.getElementById("decision-youtube-privacy")?.value || "private";
+  const promptText = publishYouTube
+    ? `완성본을 승인하고 즉시 YouTube Shorts(${privacy})로 업로드를 시작합니다. 계속할까요?`
+    : "완성본과 소재 권리를 승인합니다. 게시는 나중에 직접 진행할 수 있습니다. 계속할까요?";
+  if (!confirm(promptText)) return;
+
+  const authTab = publishYouTube ? window.open("about:blank", "_blank") : null;
+  if (authTab) {
+    authTab.opener = null;
+    state.oauthTabs.youtube = authTab;
+  }
+  try {
+    await api(`/api/items/${item.id}/approve`, {
+      method: "POST",
+      body: JSON.stringify({ confirm: true, human_reviewed: true, confirm_rights: true })
+    });
+    if (publishYouTube) {
+      await api(`/api/items/${item.id}/publish`, {
+        method: "POST",
+        body: JSON.stringify({ platform: "youtube", confirm: true, privacy_status: privacy, publish_at: null })
+      });
+      toast(`승인 완료 · YouTube Shorts(${privacy}) 업로드를 시작했습니다.`);
+    } else {
+      toast("완성본을 승인했습니다.");
+    }
+    await refresh(item.id);
+  } catch (error) {
+    if (authTab && !authTab.closed) authTab.close();
+    if (publishYouTube) delete state.oauthTabs.youtube;
+    toast(error.message);
+    await refresh(item.id).catch(() => {});
+  }
+}
+
+async function rejectAutopilotItem(itemId) {
+  const feedback = String(document.getElementById("reject-feedback-input")?.value || "").trim();
+  if (feedback.length < 2) return toast("반려 의견(수정 방향)을 2자 이상 입력하세요.");
+  try {
+    await api(`/api/items/${itemId}/reject`, {
+      method: "POST",
+      body: JSON.stringify({ feedback, auto_reproduce: true })
+    });
+    toast("반려 의견을 전달했습니다. 수정된 기획과 영상을 자동으로 다시 제작합니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+}
+
 async function publishItem(platform) {
   const privacy = platform === "youtube"
     ? document.querySelector(".youtube-privacy")?.value || "private"
@@ -1594,6 +1727,7 @@ async function importAnalyticsCsv(event) {
 }
 
 const SECRET_FIELD_DEFS = [
+  ["GEMINI_API_KEY", "Google Gemini API Key (AI Studio)", "gemini"],
   ["OPENAI_API_KEY", "OpenAI API Key", "openai"],
   ["OPENAI_MODEL", "OpenAI 기본 모델 (예: gpt-4.1-mini)", null],
   ["ANTHROPIC_API_KEY", "Anthropic Claude API Key", "anthropic"],
@@ -1743,11 +1877,32 @@ async function runAction(path, method, message) {
   } catch (error) { toast(error.message); }
 }
 
+function syncWorkflowModeUI() {
+  const modeSelect = document.getElementById("workflow-mode-select");
+  const submitBtn = document.getElementById("create-item-submit");
+  if (!modeSelect || !submitBtn) return;
+  const mode = modeSelect.value === "autopilot" ? "autopilot" : "manual";
+  try { localStorage.setItem("sfc_workflow_mode", mode); } catch {}
+  submitBtn.textContent = mode === "autopilot" ? "원클릭 자동 기획 · 제작 · 검수 시작" : "콘텐츠 작업 만들기";
+}
+
+function initWorkflowModeSelect() {
+  const modeSelect = document.getElementById("workflow-mode-select");
+  if (!modeSelect) return;
+  try {
+    const saved = localStorage.getItem("sfc_workflow_mode");
+    if (saved === "autopilot" || saved === "manual") modeSelect.value = saved;
+  } catch {}
+  syncWorkflowModeUI();
+  modeSelect.addEventListener("change", syncWorkflowModeUI);
+}
+
 async function createItem(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const data = new FormData(form);
   const body = Object.fromEntries(data.entries());
+  const mode = body.workflow_mode === "autopilot" ? "autopilot" : "manual";
   body.platforms = [...form.querySelectorAll('input[name="platforms"]:checked')].map(input => input.value);
   body.synthetic_media = form.querySelector('input[name="synthetic_media"]').checked;
   body.duration_seconds = Number(body.duration_seconds);
@@ -1758,9 +1913,21 @@ async function createItem(event) {
     form.querySelector('input[name="audience"]').value = "일반 시청자";
     form.querySelector('input[name="tone"]').value = "쉽고 신뢰감 있게";
     form.querySelector('input[value="youtube"]').checked = true;
+    const modeSelect = document.getElementById("workflow-mode-select");
+    if (modeSelect) modeSelect.value = mode;
+    syncWorkflowModeUI();
     state.selectedId = item.id;
     setMobileView("workspace");
-    toast("새 콘텐츠 작업을 만들었습니다.");
+    if (mode === "autopilot") {
+      try {
+        await api(`/api/items/${item.id}/autopilot`, { method: "POST" });
+        toast("완전 자동화 파이프라인을 시작했습니다. 완료되면 승인/반려 창이 뜹니다.");
+      } catch (autoErr) {
+        toast(`작업은 생성되었지만 자동화 시작에 실패했습니다: ${autoErr.message}`);
+      }
+    } else {
+      toast("새 콘텐츠 작업을 만들었습니다.");
+    }
     await refresh(item.id);
   } catch (error) { toast(error.message); }
 }
@@ -1880,3 +2047,4 @@ document.getElementById("disconnect-chatgpt").addEventListener("click", async ()
 });
 refresh().catch(error => toast(error.message));
 startAutoModelSync();
+initWorkflowModeSelect();
