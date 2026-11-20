@@ -27,3 +27,4 @@ chatgpt-profile.json
 *.mp3
 *.wav
 *.srt
+.DS_Store
