@@ -402,7 +402,7 @@ def list_provider_models(provider: str, *, force_refresh: bool = False) -> dict[
     }
     if not error_message:
         with _STATUS_LOCK:
-            _MODEL_LIST_CACHE[provider] = (now + 60, result)
+            _MODEL_LIST_CACHE[provider] = (now + 300, result)
     return result
 
 
@@ -411,6 +411,16 @@ def list_all_provider_models(*, force_refresh: bool = False) -> dict[str, dict[s
     from .ai_config import AI_PROVIDERS
 
     return {provider: list_provider_models(provider, force_refresh=force_refresh) for provider in sorted(AI_PROVIDERS)}
+
+
+def sync_ready_provider_models(*, force_refresh: bool = True) -> dict[str, dict[str, Any]]:
+    """@brief Periodically refresh live model catalogs for every currently ready provider."""
+    statuses = get_provider_statuses()
+    synced: dict[str, dict[str, Any]] = {}
+    for provider, status in statuses.items():
+        if isinstance(status, dict) and status.get("ready"):
+            synced[provider] = list_provider_models(provider, force_refresh=force_refresh)
+    return synced
 
 
 def clear_model_list_cache(provider: str | None = None) -> None:

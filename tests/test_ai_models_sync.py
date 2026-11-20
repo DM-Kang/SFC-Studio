@@ -10,6 +10,7 @@ from shortform_studio.ai_providers import (
     clear_model_list_cache,
     list_all_provider_models,
     list_provider_models,
+    sync_ready_provider_models,
 )
 
 
@@ -110,6 +111,24 @@ class LiveAIModelCatalogTests(unittest.TestCase):
         self.assertEqual(all_catalogs["chatgpt_oauth"]["models"], [])
         self.assertIn("Connect Sign in with ChatGPT", all_catalogs["chatgpt_oauth"]["error"])
         self.assertIn("OPENAI_API_KEY", all_catalogs["openai_api"]["error"])
+
+    def test_sync_ready_provider_models_only_queries_ready_providers(self) -> None:
+        """@brief Periodic server sync only refreshes providers whose credentials are ready."""
+        statuses = {
+            "openai_api": {"ready": False},
+            "chatgpt_oauth": {"ready": False},
+            "gemini_oauth": {"ready": True},
+            "anthropic_api": {"ready": False},
+            "ollama": {"ready": True},
+        }
+        with (
+            patch("shortform_studio.ai_providers.get_provider_statuses", return_value=statuses),
+            patch("shortform_studio.ai_providers.list_provider_models", side_effect=lambda p, force_refresh=True: {"provider": p, "models": [], "error": None}) as mock_list,
+        ):
+            synced = sync_ready_provider_models(force_refresh=True)
+
+        self.assertEqual(set(synced.keys()), {"gemini_oauth", "ollama"})
+        self.assertEqual(mock_list.call_count, 2)
 
 
 if __name__ == "__main__":

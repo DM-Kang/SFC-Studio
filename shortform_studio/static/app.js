@@ -1,4 +1,5 @@
-const state = { items: [], selectedId: null, settings: {}, aiModels: {}, brand: { profile: {}, series_templates: [] }, analytics: {}, dashboard: null, secretsStatus: {}, assetLibrary: [], schedules: [], experiments: [], assetLibraryMode: "manage", filters: { query: "", stage: "", platform: "" }, calendarView: "grid", calendarMonth: new Date(), safeZone: "none", subtitlesCache: {}, toastTimer: null, refreshTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
+const state = { items: [], selectedId: null, settings: {}, aiModels: {}, brand: { profile: {}, series_templates: [] }, analytics: {}, dashboard: null, secretsStatus: {}, assetLibrary: [], schedules: [], experiments: [], assetLibraryMode: "manage", filters: { query: "", stage: "", platform: "" }, calendarView: "grid", calendarMonth: new Date(), safeZone: "none", subtitlesCache: {}, toastTimer: null, refreshTimer: null, modelSyncTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
+const MODEL_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const stageLabels = { draft: "초안", researching: "웹 자료 조사 중", planning: "조사·기획 중", collecting_materials: "영상 소재 검색 중", planned: "기획 완료", generating: "영상 제작 중", generated: "영상 제작 완료", reviewing: "검수 중", reviewed: "검수 완료", approved: "게시 승인", publishing: "게시 중", published: "게시 완료", failed: "작업 오류" };
 const SUBTITLE_PRESETS = {
   clean_bottom: { label: "깔끔한 하단 자막", font_size: 42, margin_v: 170, alignment: 2, outline: 3, shadow: 1, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" },
@@ -563,16 +564,16 @@ function renderStageModelDropdown(stage, preferredModel = null) {
 
   if (hint) {
     if (catalog.error) {
-      hint.textContent = `${catalog.error} (목록을 불러오지 못해 직접 입력하거나 연결 후 동기화하세요)`;
+      hint.textContent = `${catalog.error} (목록을 불러오지 못해 직접 입력하거나 연결 후 자동으로 동기화됩니다)`;
     } else if (liveModels.length) {
-      hint.textContent = `실시간 동기화됨 · ${liveModels.length}개 모델 (${catalog.synced_at ? new Date(catalog.synced_at).toLocaleTimeString() : ""})`;
+      hint.textContent = `자동 동기화됨 · ${liveModels.length}개 모델 (${catalog.synced_at ? new Date(catalog.synced_at).toLocaleTimeString() : ""})`;
     } else {
-      hint.textContent = "연결 후 '목록 동기화'를 누르면 지원 모델 목록을 자동으로 가져옵니다.";
+      hint.textContent = "공급자가 연결되면 지원 모델 목록을 자동으로 가져옵니다.";
     }
   }
 }
 
-async function syncAIModels(forceRefresh = true, provider = "") {
+async function syncAIModels(forceRefresh = false, provider = "") {
   const query = new URLSearchParams();
   if (provider) query.set("provider", provider);
   if (forceRefresh) query.set("refresh", "true");
@@ -584,10 +585,21 @@ async function syncAIModels(forceRefresh = true, provider = "") {
     const form = document.getElementById("ai-settings-form");
     const selectedProvider = form?.elements.namedItem(`${stage}.provider`)?.value;
     if (!provider || selectedProvider === provider) {
-      const preferred = selectedProvider === config[stage]?.provider ? (config[stage]?.model || "") : null;
+      const modelSelect = form?.elements.namedItem(`${stage}.model_select`);
+      const modelInput = form?.elements.namedItem(`${stage}.model`);
+      const activeChoice = modelSelect?.value === "__custom__" ? modelInput?.value?.trim() : modelSelect?.value?.trim();
+      const preferred = activeChoice || (selectedProvider === config[stage]?.provider ? (config[stage]?.model || "") : "");
       renderStageModelDropdown(stage, preferred);
     }
   });
+}
+
+function startAutoModelSync() {
+  if (state.modelSyncTimer) clearInterval(state.modelSyncTimer);
+  syncAIModels(false).catch(() => {});
+  state.modelSyncTimer = setInterval(() => {
+    syncAIModels(false).catch(() => {});
+  }, MODEL_SYNC_INTERVAL_MS);
 }
 
 function populateAISettings() {
@@ -632,7 +644,7 @@ async function openAISettings() {
     populateAISettings();
     renderProviders();
     document.getElementById("ai-settings-dialog").showModal();
-    syncAIModels(true).catch(() => {});
+    syncAIModels(false).catch(() => {});
   } catch (error) { toast(error.message); }
 }
 
@@ -1823,14 +1835,6 @@ document.getElementById("ai-settings-form").addEventListener("submit", async eve
     else input.focus();
   });
 });
-document.querySelectorAll(".sync-models-btn").forEach(btn => btn.addEventListener("click", async () => {
-  const stage = btn.dataset.stage;
-  const provider = document.getElementById("ai-settings-form")?.elements.namedItem(`${stage}.provider`)?.value || "";
-  try {
-    await syncAIModels(true, provider);
-    toast("지원 모델 목록을 최신 상태로 동기화했습니다.");
-  } catch (error) { toast(error.message); }
-}));
 bindManagementDialogs();
 document.getElementById("connect-gemini").addEventListener("click", () => connectAIProvider("gemini"));
 document.getElementById("connect-chatgpt").addEventListener("click", () => connectAIProvider("chatgpt_oauth"));
@@ -1851,3 +1855,4 @@ document.getElementById("disconnect-chatgpt").addEventListener("click", async ()
   } catch (error) { toast(error.message); }
 });
 refresh().catch(error => toast(error.message));
+startAutoModelSync();

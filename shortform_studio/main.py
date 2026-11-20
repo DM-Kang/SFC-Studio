@@ -9,6 +9,7 @@ import sqlite3
 import shutil
 import tempfile
 import threading
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -44,6 +45,7 @@ from .ai_providers import (
     list_all_provider_models,
     list_provider_models,
     start_oauth_login,
+    sync_ready_provider_models,
 )
 from .brand import default_brand_settings, find_series_template, normalize_brand_settings
 from .oauth_callbacks import get_authorization_urls
@@ -88,6 +90,8 @@ store.recover_interrupted_schedules()
 _worker_lock = threading.Lock()
 _scheduler_stop = threading.Event()
 _scheduler_thread: threading.Thread | None = None
+_MODEL_SYNC_INTERVAL_SECONDS = 300
+_last_model_sync_at = 0.0
 
 app = FastAPI(title="Shortform Content Studio", version="0.1.0")
 app.mount("/static", StaticFiles(directory=PROJECT_ROOT / "shortform_studio" / "static"), name="static")
@@ -473,13 +477,21 @@ def _validate_publish_candidate(item: dict[str, Any], platform: str) -> Path:
 
 
 def _scheduler_loop() -> None:
-    """@brief Dispatch due approved schedules while the local app process is running."""
+    """@brief Dispatch due approved schedules and periodically sync ready AI provider models."""
+    global _last_model_sync_at
     while not _scheduler_stop.is_set():
         try:
             _dispatch_due_schedules()
         except Exception:
             # A single scheduler error must not permanently stop future due-time checks.
             pass
+        now = time.monotonic()
+        if now - _last_model_sync_at >= _MODEL_SYNC_INTERVAL_SECONDS:
+            try:
+                sync_ready_provider_models(force_refresh=True)
+            except Exception:
+                pass
+            _last_model_sync_at = now
         _scheduler_stop.wait(10)
 
 
@@ -665,9 +677,11 @@ def get_secrets_status() -> dict[str, bool]:
 def save_secrets_status(request: SecretsUpdateRequest) -> dict[str, bool]:
     """@brief Atomically merge updated API keys into the local .env file."""
     try:
-        return update_local_env_secrets(request.updates, clear_keys=request.clear_keys)
+        result = update_local_env_secrets(request.updates, clear_keys=request.clear_keys)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
+    clear_model_list_cache()
+    return result
 
 
 @app.post("/api/settings/test/{provider}")
