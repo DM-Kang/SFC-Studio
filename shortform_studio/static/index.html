@@ -16,7 +16,7 @@
       <h1>Shortform Studio</h1>
       <p class="subtitle">기획부터 검수, 승인된 게시까지 한 흐름으로</p>
     </div>
-    <div class="provider-control"><div id="provider-status" class="provider-status" aria-live="polite">연결 상태 확인 중…</div><div class="actions"><button id="brand-settings-open" class="button" type="button">브랜드 · 시리즈 설정</button><button id="ai-settings-open" class="button" type="button">AI 모델 · OAuth 설정</button><button id="schedule-calendar-open" class="button" type="button">예약 캘린더</button><button id="asset-library-open" class="button" type="button">소재 라이브러리</button><button id="experiments-open" class="button" type="button">A/B 실험</button><button id="backup-open" class="button" type="button">백업 · 복구</button></div></div>
+    <div class="provider-control"><div id="provider-status" class="provider-status" aria-live="polite">연결 상태 확인 중…</div><div class="actions"><button id="brand-settings-open" class="button" type="button">브랜드 · 시리즈 설정</button><button id="ai-settings-open" class="button" type="button">AI 모델 · OAuth 설정</button><button id="secrets-settings-open" class="button" type="button">API 키 · .env 설정</button><button id="schedule-calendar-open" class="button" type="button">예약 캘린더</button><button id="analytics-dashboard-open" class="button" type="button">성과 대시보드</button><button id="asset-library-open" class="button" type="button">소재 라이브러리</button><button id="experiments-open" class="button" type="button">A/B 실험</button><button id="backup-open" class="button" type="button">백업 · 복구</button></div></div>
   </header>
 
   <nav class="mobile-nav" aria-label="모바일 화면 선택">
@@ -42,6 +42,7 @@
             <legend>게시 대상</legend>
             <label class="check-row"><input type="checkbox" name="platforms" value="youtube" checked> YouTube Shorts</label>
             <label class="check-row"><input type="checkbox" name="platforms" value="instagram"> Instagram Reels</label>
+            <label class="check-row"><input type="checkbox" name="platforms" value="tiktok"> TikTok</label>
           </fieldset>
           <label class="check-row"><input type="checkbox" name="synthetic_media" checked> 실제처럼 보이는 AI 생성·변형 콘텐츠 포함 (YouTube 표시)</label>
           <label>참고 자료·근거<textarea name="source_notes" rows="3" maxlength="12000" placeholder="URL, 검증된 사실, 피해야 할 표현 등을 입력하세요."></textarea></label>
@@ -50,6 +51,27 @@
       </section>
       <section class="panel list-panel">
         <div class="section-heading"><div><p class="eyebrow">WORKSPACE</p><h2>작업 목록</h2></div><button id="refresh-button" class="icon-button" type="button" aria-label="새로고침">↻</button></div>
+        <div class="list-filters">
+          <input id="item-search" type="search" placeholder="제목·주제 검색…" aria-label="작업 검색">
+          <div class="form-row">
+            <select id="item-stage-filter" aria-label="상태 필터">
+              <option value="">전체 상태</option>
+              <option value="active">진행 중 (미게시)</option>
+              <option value="planned">기획 완료</option>
+              <option value="generated">제작 완료</option>
+              <option value="reviewed">검수 완료</option>
+              <option value="approved">게시 승인</option>
+              <option value="published">게시 완료</option>
+              <option value="failed">오류</option>
+              <option value="archived">보관함</option>
+            </select>
+            <select id="item-platform-filter" aria-label="플랫폼 필터">
+              <option value="">전체 채널</option>
+              <option value="youtube">YouTube</option>
+              <option value="instagram">Instagram</option>
+            </select>
+          </div>
+        </div>
         <div id="item-list" class="item-list"><p class="muted">아직 콘텐츠 작업이 없습니다.</p></div>
       </section>
       <p class="local-note">🔒 이 앱은 이 PC의 127.0.0.1에서만 실행됩니다.</p>
@@ -86,13 +108,19 @@
     </form>
   </dialog>
   <dialog id="schedule-calendar-dialog" class="settings-dialog">
-    <section class="settings-form"><header class="settings-header"><div><p class="eyebrow">SCHEDULED PUBLISHING</p><h2>예약 캘린더</h2><p class="muted">예약 게시에는 서버가 실행 중이어야 합니다. 기획과 영상이 승인된 상태를 유지하지 않으면 자동 게시하지 않습니다.</p></div><button class="icon-button dialog-close" type="button" aria-label="닫기">×</button></header><div id="schedule-calendar-list" class="management-list"></div></section>
+    <section class="settings-form"><header class="settings-header"><div><p class="eyebrow">SCHEDULED PUBLISHING</p><h2>예약 캘린더</h2><p class="muted">예약 게시에는 서버가 실행 중이어야 합니다. 기획과 영상이 승인된 상태를 유지하지 않으면 자동 게시하지 않습니다.</p></div><button class="icon-button dialog-close" type="button" aria-label="닫기">×</button></header><div class="calendar-toolbar"><div class="actions"><button id="calendar-prev-month" class="button" type="button">◀ 이전 달</button><strong id="calendar-month-label"></strong><button id="calendar-next-month" class="button" type="button">다음 달 ▶</button></div><div class="actions"><button id="calendar-view-grid" class="button primary" type="button">월간 달력</button><button id="calendar-view-list" class="button" type="button">목록 보기</button></div></div><div id="schedule-calendar-grid" class="calendar-grid"></div><div id="schedule-calendar-list" class="management-list" hidden></div></section>
+  </dialog>
+  <dialog id="analytics-dashboard-dialog" class="settings-dialog">
+    <section class="settings-form"><header class="settings-header"><div><p class="eyebrow">PERFORMANCE OBSERVATIONS · CSV</p><h2>성과 분석 대시보드</h2><p class="muted">수동으로 기록한 플랫폼·시리즈별 성과 추이를 확인하고 CSV로 내보내거나 일괄 가져옵니다.</p></div><button class="icon-button dialog-close" type="button" aria-label="닫기">×</button></header><div class="actions"><a class="button primary" href="/api/analytics/export.csv">성과 CSV 다운로드</a><label class="button upload-label">성과 CSV 가져오기<input id="analytics-csv-import" type="file" accept=".csv,text/csv"></label></div><div id="analytics-dashboard-content" class="management-list"></div></section>
+  </dialog>
+  <dialog id="secrets-settings-dialog" class="settings-dialog">
+    <form id="secrets-settings-form" class="settings-form"><header class="settings-header"><div><p class="eyebrow">LOCAL .ENV CREDENTIALS</p><h2>API 키 · .env 설정 마법사</h2><p class="muted">기존 키 값은 화면에 절대 표시하지 않습니다. 변경할 항목만 새 값을 입력해 저장하세요.</p></div><button class="icon-button dialog-close" type="button" aria-label="닫기">×</button></header><div id="secrets-fields-container" class="management-list"></div><footer class="settings-footer"><p class="small-note">값은 이 PC의 사용자 데이터 폴더 .env 파일(권한 0600)에만 저장됩니다.</p><button class="button primary" type="submit">.env 저장</button></footer></form>
   </dialog>
   <dialog id="asset-library-dialog" class="settings-dialog">
     <form id="asset-library-form" class="settings-form"><header class="settings-header"><div><p class="eyebrow">REUSABLE RIGHTS RECORDS</p><h2>소재 라이브러리</h2><p class="muted">소재와 라이선스 메타데이터를 재사용합니다. 권리 상태는 운영자가 확인해야 하며, 프로젝트에 추가한 기록은 독립 복사본입니다.</p></div><button class="icon-button dialog-close" type="button" aria-label="닫기">×</button></header><input name="id" type="hidden"><div class="settings-card"><div class="form-row"><label>소재 이름<input name="asset_name" required maxlength="160"></label><label>종류<select name="asset_type"><option value="video">영상</option><option value="image">이미지</option><option value="audio">오디오</option><option value="voice">목소리</option><option value="music">음악</option><option value="other">기타</option></select></label></div><label>출처 설명<input name="source_description" maxlength="300"></label><label>출처 URL<input name="source_url" type="url" maxlength="2048" placeholder="https://…"></label><div class="form-row"><label>라이선스 이름<input name="license_name" maxlength="200"></label><label>라이선스 URL<input name="license_url" type="url" maxlength="2048" placeholder="https://…"></label></div><label>권리 근거<input name="rights_basis" maxlength="500" placeholder="자체 제작, 허가 문서, 라이선스 범위 등"></label><div class="form-row"><label>표시·출처 표기<input name="attribution" maxlength="500"></label><label>라이선스 만료일<input name="license_expires_on" type="date"></label></div><label>검토 상태<select name="rights_status"><option value="unverified">미확인</option><option value="cleared">권리 확인 완료</option></select></label><div class="actions"><button class="button primary" type="submit">라이브러리에 저장</button><button id="asset-library-reset" class="button" type="button">새 항목</button></div></div><div id="asset-library-list" class="management-list"></div></form>
   </dialog>
   <dialog id="experiments-dialog" class="settings-dialog">
-    <form id="experiment-form" class="settings-form"><header class="settings-header"><div><p class="eyebrow">MANUAL A/B OBSERVATIONS</p><h2>A/B 실험</h2><p class="muted">이미 게시된 두 콘텐츠를 연결해 직접 입력한 성과를 비교합니다. 노출량과 기간 차이가 반영된 통계적 유의성 검정은 제공하지 않습니다.</p></div><button class="icon-button dialog-close" type="button" aria-label="닫기">×</button></header><div class="settings-card"><label>실험 이름<input name="name" required maxlength="160" placeholder="예: 첫 문장 톤 비교"></label><label>가설<textarea name="hypothesis" rows="2" maxlength="1000"></textarea></label><label>플랫폼<select name="platform"><option value="youtube">YouTube Shorts</option><option value="instagram">Instagram Reels</option></select></label><div class="form-row"><label>변형 A 게시물<select name="item_a" required></select></label><label>변형 B 게시물<select name="item_b" required></select></label></div><div class="form-row"><label>A 표시 이름<input name="label_a" maxlength="40" value="A"></label><label>B 표시 이름<input name="label_b" maxlength="40" value="B"></label></div><button class="button primary" type="submit">실험 비교 만들기</button></div><div id="experiment-list" class="management-list"></div></form>
+    <form id="experiment-form" class="settings-form"><header class="settings-header"><div><p class="eyebrow">MANUAL A/B OBSERVATIONS</p><h2>A/B 실험</h2><p class="muted">이미 게시된 두 콘텐츠를 연결해 직접 입력한 성과를 비교합니다. 노출량과 기간 차이가 반영된 통계적 유의성 검정은 제공하지 않습니다.</p></div><button class="icon-button dialog-close" type="button" aria-label="닫기">×</button></header><div class="settings-card"><label>실험 이름<input name="name" required maxlength="160" placeholder="예: 첫 문장 톤 비교"></label><label>가설<textarea name="hypothesis" rows="2" maxlength="1000"></textarea></label><label>플랫폼<select name="platform"><option value="youtube">YouTube Shorts</option><option value="instagram">Instagram Reels</option><option value="tiktok">TikTok</option></select></label><div class="form-row"><label>변형 A 게시물<select name="item_a" required></select></label><label>변형 B 게시물<select name="item_b" required></select></label></div><div class="form-row"><label>A 표시 이름<input name="label_a" maxlength="40" value="A"></label><label>B 표시 이름<input name="label_b" maxlength="40" value="B"></label></div><button class="button primary" type="submit">실험 비교 만들기</button></div><div id="experiment-list" class="management-list"></div></form>
   </dialog>
   <dialog id="backup-dialog" class="settings-dialog">
     <section class="settings-form"><header class="settings-header"><div><p class="eyebrow">LOCAL DATA RECOVERY</p><h2>백업 · 복구</h2><p class="muted">백업에는 SQLite 콘텐츠·설정과 프로젝트 미디어가 포함됩니다. `.env`, OAuth 토큰, API 자격 증명은 제외됩니다.</p></div><button class="icon-button dialog-close" type="button" aria-label="닫기">×</button></header><div class="settings-card"><a class="button primary" href="/api/backup">전체 백업 ZIP 다운로드</a><label class="restore-warning">백업 복원<input id="backup-restore-file" type="file" accept=".zip,application/zip"></label><p class="warning-banner">복원하면 현재 프로젝트를 ZIP 안전 복구본으로 보존한 뒤 선택한 백업으로 교체합니다. 예약 게시 항목은 자동 게시되지 않도록 취소되며, 다시 확인 후 예약해야 합니다.</p><p class="small-note">업로드 제한 10 GB, 압축 해제 제한 20 GB. ZIP 경로, 스키마와 SQLite 무결성을 검증합니다.</p></div></section>

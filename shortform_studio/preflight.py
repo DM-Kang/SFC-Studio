@@ -7,11 +7,12 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from .platform_content import instagram_caption
+from .platform_content import instagram_caption, tiktok_title
 
 YOUTUBE_TITLE_MAX_CHARS = 100
 YOUTUBE_DESCRIPTION_MAX_BYTES = 5_000
 INSTAGRAM_CAPTION_MAX_CHARS = 2_200
+TIKTOK_TITLE_MAX_CHARS = 2_200
 
 
 def _check(platform: str, code: str, status: str, message: str) -> dict[str, str]:
@@ -98,7 +99,12 @@ def build_publish_preflight(
         caption = instagram_caption({**plan, **instagram_copy})
         caption_valid = len(caption) <= INSTAGRAM_CAPTION_MAX_CHARS
         checks.append(_check("instagram", "caption_limit", "passed" if caption_valid else "blocked", "Instagram caption is within this app's 2200-character input limit." if caption_valid else "Instagram caption exceeds this app's 2200-character input limit."))
-    valid_platforms = {"youtube", "instagram"}
+    if "tiktok" in platforms:
+        tiktok_copy = variants.get("tiktok") if isinstance(variants.get("tiktok"), dict) else plan
+        tt_title = tiktok_title({**plan, **tiktok_copy})
+        tt_valid = bool(tt_title.strip()) and len(tt_title) <= TIKTOK_TITLE_MAX_CHARS
+        checks.append(_check("tiktok", "title_limit", "passed" if tt_valid else "blocked", "TikTok caption is within the 2200-character limit." if tt_valid else "TikTok caption must be non-empty and at most 2200 characters."))
+    valid_platforms = {"youtube", "instagram", "tiktok"}
     for platform in platforms:
         if platform not in valid_platforms:
             checks.append(_check(platform, "platform_supported", "blocked", "This platform has no configured publishing adapter."))

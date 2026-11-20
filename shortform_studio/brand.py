@@ -22,7 +22,7 @@ TEMPLATE_TEXT_LIMITS = {
 }
 PROFILE_LIST_FIELD_LIMITS = {"preferred_terms": (20, 80), "prohibited_terms": (30, 80), "required_disclosures": (20, 150)}
 TEMPLATE_LIST_FIELD_LIMITS = {"key_points": (15, 180)}
-ALLOWED_PLATFORMS = {"youtube", "instagram"}
+ALLOWED_PLATFORMS = {"youtube", "instagram", "tiktok"}
 
 
 def default_brand_settings() -> dict[str, Any]:
@@ -104,8 +104,8 @@ def normalize_brand_settings(value: Any) -> dict[str, Any]:
             raise ValueError("Series template duration must be from 4 to 30 seconds.")
         template["duration_seconds"] = duration
         platforms = raw_template.get("platforms", ["youtube"])
-        if not isinstance(platforms, list) or not platforms or len(platforms) > 2 or any(platform not in ALLOWED_PLATFORMS for platform in platforms) or len(set(platforms)) != len(platforms):
-            raise ValueError("Series template platforms must be unique YouTube and/or Instagram selections.")
+        if not isinstance(platforms, list) or not platforms or len(platforms) > 3 or any(platform not in ALLOWED_PLATFORMS for platform in platforms) or len(set(platforms)) != len(platforms):
+            raise ValueError("Series template platforms must be unique YouTube, Instagram, and/or TikTok selections.")
         template["platforms"] = platforms
         template["key_points"] = _clean_string_list(raw_template.get("key_points", []), f"series_templates[{index}].key_points", *TEMPLATE_LIST_FIELD_LIMITS["key_points"])
         templates.append(template)

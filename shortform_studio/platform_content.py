@@ -41,6 +41,19 @@ def instagram_caption(plan: dict[str, Any]) -> str:
     return f"{caption}\n\n{' '.join(tags)}".strip()
 
 
+def tiktok_title(plan: dict[str, Any]) -> str:
+    """@brief Compose TikTok post title/caption with selected hashtags."""
+    base = str(plan.get("caption") or plan.get("title") or "").strip()
+    existing = {token.casefold().strip(".,!?;:()[]{}") for token in base.split()}
+    tags: list[str] = []
+    for raw_tag in plan.get("hashtags", []) if isinstance(plan.get("hashtags"), list) else []:
+        value = str(raw_tag).strip().lstrip("#")
+        tag = f"#{value}" if value else ""
+        if tag and tag.casefold() not in existing and tag.casefold() not in {entry.casefold() for entry in tags}:
+            tags.append(tag)
+    return f"{base} {' '.join(tags)}".strip()
+
+
 def copy_fingerprint(plan: dict[str, Any], variants: dict[str, Any]) -> str:
     """@brief Hash shared and platform-specific publishing text for approval binding.
 

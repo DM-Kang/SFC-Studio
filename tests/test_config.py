@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from shortform_studio.config import get_app_home
+from shortform_studio.config import get_app_home, is_allowed_request_origin
 
 
 class ConfigPathTests(unittest.TestCase):
@@ -30,6 +30,26 @@ class ConfigPathTests(unittest.TestCase):
             self.assertEqual(get_app_home(), Path("/tmp/studio-xdg/shortform-content-studio"))
         with patch.dict(os.environ, {"SHORTFORM_STUDIO_HOME": "", "LOCALAPPDATA": "", "XDG_DATA_HOME": ""}), patch("shortform_studio.config.Path.home", return_value=Path("/tmp/studio-user")):
             self.assertEqual(get_app_home(), Path("/tmp/studio-user/.local/share/shortform-content-studio"))
+
+    def test_allowed_request_origin_honors_explicit_tailscale_hosts(self) -> None:
+        """@brief Allow Tailscale Serve HTTPS hosts only when explicitly configured."""
+        self.assertEqual(is_allowed_request_origin("127.0.0.1:8765", "http://127.0.0.1:8765"), (True, ""))
+        self.assertFalse(is_allowed_request_origin("dmkang-mbp16.tail835374.ts.net", None)[0])
+        self.assertEqual(
+            is_allowed_request_origin(
+                "dmkang-mbp16.tail835374.ts.net",
+                "https://dmkang-mbp16.tail835374.ts.net",
+                "dmkang-mbp16.tail835374.ts.net",
+            ),
+            (True, ""),
+        )
+        self.assertFalse(
+            is_allowed_request_origin(
+                "dmkang-mbp16.tail835374.ts.net",
+                "https://evil.example.com",
+                "dmkang-mbp16.tail835374.ts.net",
+            )[0]
+        )
 
 
 if __name__ == "__main__":

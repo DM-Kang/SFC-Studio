@@ -1,5 +1,11 @@
-const state = { items: [], selectedId: null, settings: {}, brand: { profile: {}, series_templates: [] }, analytics: {}, assetLibrary: [], schedules: [], experiments: [], assetLibraryMode: "manage", toastTimer: null, refreshTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
+const state = { items: [], selectedId: null, settings: {}, brand: { profile: {}, series_templates: [] }, analytics: {}, dashboard: null, secretsStatus: {}, assetLibrary: [], schedules: [], experiments: [], assetLibraryMode: "manage", filters: { query: "", stage: "", platform: "" }, calendarView: "grid", calendarMonth: new Date(), safeZone: "none", subtitlesCache: {}, toastTimer: null, refreshTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
 const stageLabels = { draft: "초안", researching: "웹 자료 조사 중", planning: "조사·기획 중", collecting_materials: "영상 소재 검색 중", planned: "기획 완료", generating: "영상 제작 중", generated: "영상 제작 완료", reviewing: "검수 중", reviewed: "검수 완료", approved: "게시 승인", publishing: "게시 중", published: "게시 완료", failed: "작업 오류" };
+const SUBTITLE_PRESETS = {
+  clean_bottom: { label: "깔끔한 하단 자막", font_size: 42, margin_v: 170, alignment: 2, outline: 3, shadow: 1, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" },
+  bold_center: { label: "강조 중앙 자막", font_size: 52, margin_v: 80, alignment: 5, outline: 4, shadow: 2, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" },
+  yellow_pop: { label: "노란색 포인트 자막", font_size: 46, margin_v: 210, alignment: 2, outline: 4, shadow: 2, primary_colour: "&H0000E5FF", outline_colour: "&H00000000" },
+  top_news: { label: "상단 뉴스형 자막", font_size: 40, margin_v: 180, alignment: 8, outline: 3, shadow: 1, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" }
+};
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
@@ -45,7 +51,8 @@ function renderProviders() {
     ["음성·자막", state.settings.elevenlabs_ready],
     ["FFmpeg", state.settings.ffmpeg_ready],
     ["YouTube", state.settings.youtube_ready],
-    ["Instagram", state.settings.instagram_ready]
+    ["Instagram", state.settings.instagram_ready],
+    ["TikTok", state.settings.tiktok_ready]
   ];
   document.getElementById("provider-status").innerHTML = values.map(([name, ready]) => `<span class="provider-chip ${ready ? "ready" : ""}">${escapeHtml(name)} · ${ready ? "연결됨" : "미설정"}</span>`).join("");
   renderAIAuthStatus();
@@ -167,7 +174,7 @@ function renderSeriesTemplates() {
   const container = document.getElementById("series-template-list");
   if (!container) return;
   const templates = state.brand.series_templates || [];
-  container.innerHTML = templates.length ? templates.map((template, index) => `<fieldset class="series-template-editor" data-template-index="${index}" data-template-id="${escapeHtml(template.id || "")}"><legend>시리즈 ${index + 1}</legend><div class="form-row"><label>이름<input data-field="name" required maxlength="80" value="${escapeHtml(template.name)}"></label><label>기본 언어<input data-field="language" maxlength="50" value="${escapeHtml(template.language || "")}"></label></div><label>반복 형식·구성<textarea data-field="format" rows="2" maxlength="1000">${escapeHtml(template.format || "")}</textarea></label><div class="form-row"><label>기본 시청자<input data-field="audience" maxlength="300" value="${escapeHtml(template.audience || "")}"></label><label>말투<input data-field="tone" maxlength="200" value="${escapeHtml(template.tone || "")}"></label></div><div class="form-row"><label>기본 길이<select data-field="duration_seconds">${[10, 15, 20, 30].map(duration => `<option value="${duration}" ${Number(template.duration_seconds) === duration ? "selected" : ""}>${duration}초</option>`).join("")}</select></label><label>행동 유도 문구<input data-field="call_to_action" maxlength="300" value="${escapeHtml(template.call_to_action || "")}"></label></div><fieldset class="template-platforms"><legend>기본 게시 대상</legend><label class="check-row"><input data-platform="youtube" type="checkbox" ${template.platforms?.includes("youtube") ? "checked" : ""}> YouTube Shorts</label><label class="check-row"><input data-platform="instagram" type="checkbox" ${template.platforms?.includes("instagram") ? "checked" : ""}> Instagram Reels</label></fieldset><label>반복 포함 포인트 · 한 줄에 하나<textarea data-field="key_points" rows="2">${escapeHtml((template.key_points || []).join("\n"))}</textarea></label><button class="button danger remove-series-template" type="button">템플릿 삭제</button></fieldset>`).join("") : '<p class="small-note">아직 저장한 시리즈 템플릿이 없습니다.</p>';
+  container.innerHTML = templates.length ? templates.map((template, index) => `<fieldset class="series-template-editor" data-template-index="${index}" data-template-id="${escapeHtml(template.id || "")}"><legend>시리즈 ${index + 1}</legend><div class="form-row"><label>이름<input data-field="name" required maxlength="80" value="${escapeHtml(template.name)}"></label><label>기본 언어<input data-field="language" maxlength="50" value="${escapeHtml(template.language || "")}"></label></div><label>반복 형식·구성<textarea data-field="format" rows="2" maxlength="1000">${escapeHtml(template.format || "")}</textarea></label><div class="form-row"><label>기본 시청자<input data-field="audience" maxlength="300" value="${escapeHtml(template.audience || "")}"></label><label>말투<input data-field="tone" maxlength="200" value="${escapeHtml(template.tone || "")}"></label></div><div class="form-row"><label>기본 길이<select data-field="duration_seconds">${[10, 15, 20, 30].map(duration => `<option value="${duration}" ${Number(template.duration_seconds) === duration ? "selected" : ""}>${duration}초</option>`).join("")}</select></label><label>행동 유도 문구<input data-field="call_to_action" maxlength="300" value="${escapeHtml(template.call_to_action || "")}"></label></div><fieldset class="template-platforms"><legend>기본 게시 대상</legend><label class="check-row"><input data-platform="youtube" type="checkbox" ${template.platforms?.includes("youtube") ? "checked" : ""}> YouTube Shorts</label><label class="check-row"><input data-platform="instagram" type="checkbox" ${template.platforms?.includes("instagram") ? "checked" : ""}> Instagram Reels</label><label class="check-row"><input data-platform="tiktok" type="checkbox" ${template.platforms?.includes("tiktok") ? "checked" : ""}> TikTok</label></fieldset><label>반복 포함 포인트 · 한 줄에 하나<textarea data-field="key_points" rows="2">${escapeHtml((template.key_points || []).join("\n"))}</textarea></label><button class="button danger remove-series-template" type="button">템플릿 삭제</button></fieldset>`).join("") : '<p class="small-note">아직 저장한 시리즈 템플릿이 없습니다.</p>';
   container.querySelectorAll(".remove-series-template").forEach(button => button.addEventListener("click", () => {
     const index = Number(button.closest(".series-template-editor").dataset.templateIndex);
     state.brand.series_templates.splice(index, 1);
@@ -217,7 +224,7 @@ function renderAnalyticsFeedback() {
   const platforms = state.analytics.platforms || {};
   const entries = Object.entries(platforms).filter(([, data]) => data.sample_count > 0);
   if (!entries.length) return '<section class="resource-panel analytics-feedback"><h4>이전 게시 성과 참고</h4><p class="small-note">게시 후 지표를 등록하면 다음 기획에 플랫폼별 관측 추세가 참고 맥락으로 전달됩니다. 아직 기록이 없습니다.</p></section>';
-  const labels = { youtube: "YouTube", instagram: "Instagram" };
+  const labels = { youtube: "YouTube", instagram: "Instagram", tiktok: "TikTok" };
   const stats = entries.map(([platform, data]) => `<div class="analytics-summary"><strong>${labels[platform] || escapeHtml(platform)} · ${data.sample_count}개</strong><span>중앙 조회 ${data.median_views_per_day ?? "—"}/일</span><span>중앙 반응률 ${data.median_engagement_rate === null ? "—" : `${(data.median_engagement_rate * 100).toFixed(1)}%`}</span><span>조회당 시청 ${data.median_average_watch_seconds_per_view ?? "—"}초</span>${(data.recent_samples || []).slice(0, 3).map(sample => `<small>${escapeHtml(sample.topic)}${sample.engagement_rate === undefined ? "" : ` · ${(sample.engagement_rate * 100).toFixed(1)}%`}</small>`).join("")}</div>`).join("");
   return `<section class="resource-panel analytics-feedback"><h4>이전 게시 성과 참고</h4><div class="analytics-summary-list">${stats}</div><p class="small-note">관측된 연관성일 뿐 원인이나 도달 보장은 아닙니다. 기획 AI 사용 시 요약 지표와 최근 주제 예시가 선택한 공급자에 전송됩니다. ${escapeHtml(state.analytics.note || "")}</p></section>`;
 }
@@ -232,8 +239,8 @@ function renderPlatformCopies(item) {
   const variants = item.platform_variants || {};
   const forms = (item.platforms || []).map(platform => {
     const value = variants[platform] || item.plan;
-    const label = platform === "youtube" ? "YouTube Shorts" : "Instagram Reels";
-    const titleLabel = platform === "youtube" ? "게시 제목" : "내부 콘텐츠 제목 (Instagram 게시물에는 전송되지 않음)";
+    const label = platform === "youtube" ? "YouTube Shorts" : platform === "tiktok" ? "TikTok" : "Instagram Reels";
+    const titleLabel = platform === "youtube" ? "게시 제목" : "내부 콘텐츠 제목 (캡션·태그가 전송됩니다)";
     return `<form class="platform-copy-form" data-platform="${platform}"><h4>${label} 문구</h4><label>${titleLabel}<input name="title" required maxlength="100" value="${escapeHtml(value.title || "")}"></label><label>게시 설명·캡션<textarea name="caption" required rows="3" maxlength="${platform === "instagram" ? 2200 : 5000}">${escapeHtml(value.caption || "")}</textarea></label><label>해시태그<input name="hashtags" maxlength="500" value="${escapeHtml((value.hashtags || []).join(" "))}"></label><p class="copy-preview"><strong>미리보기</strong><span data-preview="title">${escapeHtml(value.title || "")}</span><span data-preview="caption">${escapeHtml(value.caption || "")}</span><small data-preview="hashtags">${escapeHtml((value.hashtags || []).join(" "))}</small></p><button class="button save-platform-copy" type="submit" ${item.active_job || Object.values(item.publications || {}).some(post => post.status === "published") ? "disabled" : ""}>${platform} 문구 저장</button></form>`;
   }).join("");
   return `<section class="resource-panel platform-copies"><div class="card-head"><h4>플랫폼별 게시 문구</h4><span class="badge">수정 후 재승인 필요</span></div><p class="small-note">공통 내레이션은 유지하고 채널별 제목·캡션·태그를 편집합니다. 변경하면 기존 승인은 취소되며, 게시 전 현재 문구를 다시 승인해야 합니다.</p>${forms}</section>`;
@@ -258,16 +265,55 @@ function renderVersionHistory(item) {
  * @returns {void}
  */
 function renderScheduleCalendar() {
-  const container = document.getElementById("schedule-calendar-list");
-  if (!container) return;
+  const listEl = document.getElementById("schedule-calendar-list");
+  const gridEl = document.getElementById("schedule-calendar-grid");
+  const labelEl = document.getElementById("calendar-month-label");
+  if (!listEl || !gridEl) return;
+  const isGrid = state.calendarView !== "list";
+  gridEl.hidden = !isGrid;
+  listEl.hidden = isGrid;
+  document.getElementById("calendar-view-grid")?.classList.toggle("primary", isGrid);
+  document.getElementById("calendar-view-list")?.classList.toggle("primary", !isGrid);
+
+  const cursor = state.calendarMonth instanceof Date ? state.calendarMonth : new Date();
+  const year = cursor.getFullYear();
+  const month = cursor.getMonth();
+  if (labelEl) labelEl.textContent = `${year}년 ${month + 1}월`;
+
+  const byDay = new Map();
+  state.schedules.forEach(s => {
+    if (!s.scheduled_at) return;
+    const d = new Date(s.scheduled_at);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    if (!byDay.has(key)) byDay.set(key, []);
+    byDay.get(key).push(s);
+  });
+
+  const firstDay = new Date(year, month, 1);
+  const startOffset = firstDay.getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const weekdays = ["일", "월", "화", "수", "목", "금", "토"].map(w => `<div class="calendar-weekday">${w}</div>`).join("");
+  const cells = [];
+  for (let i = 0; i < startOffset; i++) cells.push('<div class="calendar-cell muted"></div>');
+  for (let day = 1; day <= daysInMonth; day++) {
+    const key = `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    const pills = (byDay.get(key) || []).map(s => `<button type="button" class="calendar-pill ${escapeHtml(s.platform)}" data-item-id="${escapeHtml(s.item_id)}" title="${escapeHtml(s.topic || s.item_id)} · ${escapeHtml(s.status)}">${escapeHtml(s.platform)} · ${escapeHtml((s.topic || "게시물").slice(0, 14))}</button>`).join("");
+    cells.push(`<div class="calendar-cell"><span class="calendar-day">${day}</span>${pills}</div>`);
+  }
+  gridEl.innerHTML = `${weekdays}${cells.join("")}`;
+  gridEl.querySelectorAll(".calendar-pill").forEach(pill => pill.addEventListener("click", () => {
+    document.getElementById("schedule-calendar-dialog")?.close();
+    selectItem(pill.dataset.itemId);
+  }));
+
   const rows = state.schedules.map(schedule => {
     const title = schedule.item_title || schedule.topic || schedule.item_id;
     const time = schedule.scheduled_at ? new Date(schedule.scheduled_at).toLocaleString(undefined, { timeZone: schedule.timezone_name }) : "—";
     const cancel = schedule.status === "scheduled" ? `<button class="button danger cancel-managed-schedule" data-item-id="${escapeHtml(schedule.item_id)}" data-platform="${escapeHtml(schedule.platform)}" type="button">취소</button>` : "";
     return `<article class="management-card"><div><strong>${escapeHtml(title)} · ${escapeHtml(schedule.platform)}</strong><small>${escapeHtml(time)} · ${escapeHtml(schedule.status)}${schedule.error ? ` · ${escapeHtml(schedule.error)}` : ""}</small></div>${cancel}</article>`;
   }).join("");
-  container.innerHTML = rows || '<p class="small-note">예약된 게시가 없습니다.</p>';
-  container.querySelectorAll(".cancel-managed-schedule").forEach(button => button.addEventListener("click", () => cancelSchedule(button.dataset.itemId, button.dataset.platform)));
+  listEl.innerHTML = rows || '<p class="small-note">예약된 게시가 없습니다.</p>';
+  listEl.querySelectorAll(".cancel-managed-schedule").forEach(button => button.addEventListener("click", () => cancelSchedule(button.dataset.itemId, button.dataset.platform)));
 }
 
 /**
@@ -455,6 +501,14 @@ function bindManagementDialogs() {
   document.getElementById("experiment-form").addEventListener("submit", createExperiment);
   document.getElementById("experiment-form").elements.namedItem("platform").addEventListener("change", populateExperimentItems);
   document.getElementById("backup-restore-file").addEventListener("change", restoreBackup);
+  document.getElementById("calendar-view-grid")?.addEventListener("click", () => { state.calendarView = "grid"; renderScheduleCalendar(); });
+  document.getElementById("calendar-view-list")?.addEventListener("click", () => { state.calendarView = "list"; renderScheduleCalendar(); });
+  document.getElementById("calendar-prev-month")?.addEventListener("click", () => { state.calendarMonth = new Date(state.calendarMonth.getFullYear(), state.calendarMonth.getMonth() - 1, 1); renderScheduleCalendar(); });
+  document.getElementById("calendar-next-month")?.addEventListener("click", () => { state.calendarMonth = new Date(state.calendarMonth.getFullYear(), state.calendarMonth.getMonth() + 1, 1); renderScheduleCalendar(); });
+  document.getElementById("analytics-dashboard-open")?.addEventListener("click", openAnalyticsDashboard);
+  document.getElementById("analytics-csv-import")?.addEventListener("change", importAnalyticsCsv);
+  document.getElementById("secrets-settings-open")?.addEventListener("click", openSecretsSettings);
+  document.getElementById("secrets-settings-form")?.addEventListener("submit", saveSecretsSettings);
 }
 
 function populateAISettings() {
@@ -515,13 +569,44 @@ async function connectAIProvider(provider) {
   }
 }
 
+function filterItems(items) {
+  const query = (state.filters.query || "").trim().toLowerCase();
+  const stage = state.filters.stage || "";
+  const platform = state.filters.platform || "";
+  return items.filter(item => {
+    const archived = Boolean(item.archived);
+    if (stage === "archived") {
+      if (!archived) return false;
+    } else if (archived) {
+      return false;
+    }
+    if (stage === "active") {
+      if (item.stage === "published") return false;
+    } else if (stage && stage !== "archived" && item.stage !== stage) {
+      return false;
+    }
+    if (platform && !(item.platforms || []).includes(platform)) return false;
+    if (query) {
+      const title = String(item.plan?.title || "").toLowerCase();
+      const topic = String(item.topic || "").toLowerCase();
+      if (!title.includes(query) && !topic.includes(query)) return false;
+    }
+    return true;
+  });
+}
+
 function renderList() {
   const list = document.getElementById("item-list");
+  const visible = filterItems(state.items);
   if (!state.items.length) {
     list.innerHTML = '<p class="muted">아직 콘텐츠 작업이 없습니다.</p>';
     return;
   }
-  list.innerHTML = state.items.map(item => `<button class="item-card ${item.id === state.selectedId ? "selected" : ""}" data-item-id="${escapeHtml(item.id)}"><strong>${escapeHtml(item.plan?.title || item.topic)}</strong><small>${escapeHtml(stageLabels[item.stage] || item.stage)} · ${new Date(item.created_at).toLocaleString()}</small></button>`).join("");
+  if (!visible.length) {
+    list.innerHTML = '<p class="muted">조건에 맞는 작업이 없습니다.</p>';
+    return;
+  }
+  list.innerHTML = visible.map(item => `<button class="item-card ${item.id === state.selectedId ? "selected" : ""}" data-item-id="${escapeHtml(item.id)}"><strong>${escapeHtml(item.plan?.title || item.topic)}</strong><small>${escapeHtml(stageLabels[item.stage] || item.stage)}${item.archived ? " · 보관됨" : ""} · ${new Date(item.created_at).toLocaleString()}</small></button>`).join("");
   list.querySelectorAll("[data-item-id]").forEach(button => button.addEventListener("click", () => selectItem(button.dataset.itemId)));
 }
 
@@ -548,11 +633,12 @@ function renderStages(item) {
 function renderResearch(item) {
   const research = item.research;
   const sources = research?.sources || [];
-  const sourceCards = sources.map(source => `<details class="source-card"><summary><span class="badge ${source.status === "fetched" ? "good" : "warn"}">${source.status === "fetched" ? "원문 추출" : "검색 요약만 · 근거 사용 불가"}</span><strong>${escapeHtml(source.title)}</strong><small>${escapeHtml(source.domain || source.url)}${source.published_at ? ` · ${escapeHtml(source.published_at)}` : ""}</small></summary><p>${escapeHtml(source.snippet || "검색 요약이 없습니다.")}</p>${source.content ? `<p class="source-excerpt">${escapeHtml(source.content.slice(0, 1800))}${source.content.length > 1800 ? "…" : ""}</p>` : ""}<a href="${escapeHtml(source.url)}" target="_blank" rel="noopener noreferrer">원문 열기 ↗</a></details>`).join("");
+  const sourceCards = sources.map(source => `<details class="source-card"><summary><span class="badge ${source.status === "fetched" ? "good" : "warn"}">${source.status === "fetched" ? "원문 추출" : "검색 요약만 · 근거 사용 불가"}</span><strong>${escapeHtml(source.title)}</strong><small>${escapeHtml(source.domain || source.url)}${source.published_at ? ` · ${escapeHtml(source.published_at)}` : ""}</small></summary><p>${escapeHtml(source.snippet || "검색 요약이 없습니다.")}</p>${source.content ? `<p class="source-excerpt">${escapeHtml(source.content.slice(0, 1800))}${source.content.length > 1800 ? "…" : ""}</p>` : ""}<div class="card-head"><a href="${escapeHtml(source.url)}" target="_blank" rel="noopener noreferrer">원문 열기 ↗</a>${source.status === "fetched" ? `<label class="check-row"><input type="checkbox" class="research-source-include" data-source-id="${escapeHtml(source.id)}" ${source.included !== false ? "checked" : ""} ${item.active_job ? "disabled" : ""}> 기획 근거에 포함</label>` : ""}</div></details>`).join("");
   const stateText = research?.status === "complete" ? "원문을 가져왔습니다. 기획 시 가져온 원문만 사실 근거로 전달됩니다." : research?.status === "partial" ? "일부 페이지만 추출했습니다. 검색 요약만 있는 결과는 사실 근거로 사용되지 않습니다." : "주제와 직접 입력한 URL에서 웹 출처를 수집합니다. 검색 결과 요약만으로 사실을 인용하지 않습니다.";
   const button = `<button id="research-button" class="button" ${state.settings.research_ready && !item.active_job ? "" : "disabled"}>${sources.length ? "웹 출처 다시 조사" : "웹 조사 및 출처 수집"}</button>`;
-  const configNote = state.settings.research_ready ? "Tavily를 사용합니다. 주제와 직접 입력한 참고 URL이 외부 조사 서비스로 전송됩니다." : "사용하려면 사용자 데이터 폴더의 .env에 TAVILY_API_KEY를 설정하세요. 설정하지 않아도 직접 입력한 참고 메모로 기획할 수 있습니다.";
-  return `<section class="resource-panel"><div class="card-head"><h4>웹 조사 · 사실 근거</h4>${research?.collected_at ? `<span class="muted">${escapeHtml(new Date(research.collected_at).toLocaleString())}</span>` : ""}</div><p class="small-note">${stateText}</p>${sourceCards || ""}<div class="actions">${button}</div><p class="small-note">${configNote}</p>${research?.extraction_error ? `<p class="warning-banner">일부 원문 추출 실패: ${escapeHtml(research.extraction_error)}</p>` : ""}</section>`;
+  const directUrlRow = `<div class="hook-row"><label>공개 HTTPS URL 직접 본문 추출 (Tavily 불필요)<input id="direct-url-input" type="url" placeholder="https://example.com/article" ${item.active_job ? "disabled" : ""}></label><button id="direct-url-button" class="button" type="button" ${item.active_job ? "disabled" : ""}>URL 추출</button></div>`;
+  const configNote = state.settings.research_ready ? "Tavily를 사용합니다. 주제와 직접 입력한 참고 URL이 외부 조사 서비스로 전송됩니다." : "사용하려면 사용자 데이터 폴더의 .env에 TAVILY_API_KEY를 설정하세요. 설정하지 않아도 직접 URL 추출·참고 메모로 기획할 수 있습니다.";
+  return `<section class="resource-panel"><div class="card-head"><h4>웹 조사 · 사실 근거</h4>${research?.collected_at ? `<span class="muted">${escapeHtml(new Date(research.collected_at).toLocaleString())}</span>` : ""}</div><p class="small-note">${stateText}</p>${sourceCards || ""}${directUrlRow}<div class="actions">${button}</div><p class="small-note">${configNote}</p>${research?.extraction_error ? `<p class="warning-banner">일부 원문 추출 실패: ${escapeHtml(research.extraction_error)}</p>` : ""}</section>`;
 }
 
 /**
@@ -566,12 +652,34 @@ function renderMaterials(item) {
   const materials = item.materials || [];
   const sceneCards = (plan.scenes || []).map(scene => {
     const candidates = materials.filter(candidate => candidate.scene_id === scene.id);
-    const candidateCards = candidates.map(candidate => `<article class="material-card">${candidate.poster_url ? `<img src="${escapeHtml(candidate.poster_url)}" alt="${escapeHtml(candidate.title)}" loading="lazy">` : ""}<div><strong>${escapeHtml(candidate.title)}</strong><small>${escapeHtml(candidate.width || "?")}×${escapeHtml(candidate.height || "?")} · ${escapeHtml(candidate.duration_seconds ?? "?")}초 · <a href="${escapeHtml(candidate.author_url || candidate.source_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(candidate.author)} · Pexels</a></small><a href="${escapeHtml(candidate.source_url)}" target="_blank" rel="noopener noreferrer">Pexels 영상 페이지 ↗</a><a href="${escapeHtml(candidate.license_url)}" target="_blank" rel="noopener noreferrer">사용 조건 확인</a><span class="badge warn">권리·인물·상표 직접 확인 필요</span><button class="button add-rights-candidate" type="button" data-candidate-id="${escapeHtml(candidate.provider_id)}" ${item.active_job ? "disabled" : ""}>권리 기록에 추가</button></div></article>`).join("");
+    const candidateCards = candidates.map(candidate => `<article class="material-card">${candidate.poster_url ? `<img src="${escapeHtml(candidate.poster_url)}" alt="${escapeHtml(candidate.title)}" loading="lazy">` : ""}<div><strong>${escapeHtml(candidate.title)}</strong><small>${escapeHtml(candidate.width || "?")}×${escapeHtml(candidate.height || "?")} · ${escapeHtml(candidate.duration_seconds ?? "?")}초 · <a href="${escapeHtml(candidate.author_url || candidate.source_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(candidate.author)} · Pexels</a></small><a href="${escapeHtml(candidate.source_url)}" target="_blank" rel="noopener noreferrer">Pexels 영상 페이지 ↗</a><a href="${escapeHtml(candidate.license_url)}" target="_blank" rel="noopener noreferrer">사용 조건 확인</a><span class="badge warn">권리·인물·상표 직접 확인 필요</span><div class="actions"><button class="button add-rights-candidate" type="button" data-candidate-id="${escapeHtml(candidate.provider_id)}" ${item.active_job ? "disabled" : ""}>권리 기록에 추가</button>${candidate.download_url ? `<button class="button download-material-clip" type="button" data-candidate-id="${escapeHtml(candidate.provider_id)}" ${item.active_job ? "disabled" : ""}>${candidate.local_path ? "클립 재다운로드" : "로컬 클립 저장"}</button>` : ""}</div>${candidate.local_path ? '<span class="badge good">조립용 클립 저장됨</span>' : ""}</div></article>`).join("");
     return `<div class="scene-material"><strong>${escapeHtml(scene.id)} · ${escapeHtml(scene.visual_query)}</strong><p class="muted">${escapeHtml(scene.narration)}</p>${candidateCards || `<p class="small-note">아직 검색된 소재가 없습니다.</p>`}</div>`;
   }).join("");
   const button = `<button id="materials-button" class="button" ${state.settings.stock_video_ready && !item.active_job ? "" : "disabled"}>${materials.length ? "장면별 소재 다시 검색" : "장면별 Pexels 영상 소재 검색"}</button>`;
   const configNote = state.settings.stock_video_ready ? "장면별 검색어로 세로 영상을 찾습니다. 소재는 후보로만 저장되며 현재 MP4에 자동 합성되지 않습니다." : "사용하려면 사용자 데이터 폴더의 .env에 PEXELS_API_KEY를 설정하세요.";
   return `<section class="resource-panel"><div class="card-head"><h4>장면별 영상 소재</h4>${item.materials_collected_at ? `<span class="muted">${escapeHtml(new Date(item.materials_collected_at).toLocaleString())}</span>` : ""}</div>${sceneCards}<div class="actions">${button}</div><p class="small-note">${configNote} Pexels 제공 자료도 개별 권리·초상권·상표를 게시 전에 확인해야 합니다.</p></section>`;
+}
+
+function estimateSpeakingDuration(script, language = "Korean") {
+  const cleaned = String(script || "").trim();
+  if (!cleaned) return { estimatedSeconds: 0, unitCount: 0, unitLabel: "자" };
+  const lang = String(language || "").trim().toLowerCase();
+  if (["korean", "ko", "한국어", "japanese", "ja", "日本語"].includes(lang)) {
+    const units = cleaned.replace(/[\s.,!?;:"'()\[\]{}\-_/\\~`]+/g, "").length;
+    const rate = ["japanese", "ja", "日本語"].includes(lang) ? 5.5 : 5.2;
+    return { estimatedSeconds: Math.round((units / rate) * 10) / 10, unitCount: units, unitLabel: "자" };
+  }
+  const words = cleaned.split(/\s+/).filter(Boolean).length;
+  return { estimatedSeconds: Math.round((words / 2.4) * 10) / 10, unitCount: words, unitLabel: "단어" };
+}
+
+function renderPaceMeterMarkup(script, language, targetSeconds) {
+  const pace = estimateSpeakingDuration(script, language);
+  const target = Number(targetSeconds || 30);
+  const ratio = target > 0 ? pace.estimatedSeconds / target : 0;
+  const cls = ratio > 1.05 ? "over" : pace.estimatedSeconds > 0 && ratio >= 0.65 ? "fit" : "";
+  const status = ratio > 1.05 ? "목표 시간 초과 위험" : pace.estimatedSeconds > 0 && ratio >= 0.65 ? "적정 분량" : "짧은 분량";
+  return `<div id="script-pace-meter" class="pace-meter ${cls}"><span>예상 발화 약 <strong>${pace.estimatedSeconds}초</strong> (${pace.unitCount}${pace.unitLabel})</span><span>목표 ${target}초 · ${status}</span></div>`;
 }
 
 function renderPlan(item) {
@@ -584,7 +692,9 @@ function renderPlan(item) {
     return `<li><strong>${escapeHtml(claim.claim || "")}</strong><p>${escapeHtml(claim.evidence || "")}</p>${citations || `<span class="badge warn">출처 근거 미확인 · 게시 전 확인 필요</span>`}</li>`;
   }).join("");
   const planSources = sources.length ? `<div class="source-list"><h4>기획에 사용된 원문 출처</h4>${sources.map(source => `<a href="${escapeHtml(source.url)}" target="_blank" rel="noopener noreferrer"><span>${escapeHtml(source.id)} · ${escapeHtml(source.title)}</span><small>${escapeHtml(source.domain)}${source.published_at ? ` · ${escapeHtml(source.published_at)}` : ""}</small></a>`).join("")}</div>` : `<p class="warning-banner">이 기획에는 추출된 웹 출처가 포함되지 않았습니다. 사실 주장은 게시 전에 직접 확인하세요.</p>`;
-  return `<section class="card panel"><div class="card-head"><h3>① 자료 조사 · 콘텐츠 기획</h3><span class="badge">${escapeHtml(plan.generated_by || "local_template")}</span></div>${renderAnalyticsFeedback()}<div class="plan-form"><label>제목<input name="title" value="${escapeHtml(plan.title)}" maxlength="100"></label><label>첫 문장<input name="hook" value="${escapeHtml(plan.hook)}" maxlength="240"></label><label>내레이션 대본<textarea name="script" rows="5" maxlength="6000">${escapeHtml(plan.script)}</textarea></label><label>게시 문구<textarea name="caption" rows="3" maxlength="5000">${escapeHtml(plan.caption)}</textarea></label><label>영상 생성 프롬프트<textarea name="video_prompt" rows="3" maxlength="1000">${escapeHtml(plan.video_prompt)}</textarea></label><label>해시태그<input name="hashtags" value="${escapeHtml((plan.hashtags || []).join(" "))}" placeholder="#shorts #tips"></label><button id="save-plan-button" class="button">수정 저장</button></div>${renderPlatformCopies(item)}${renderVersionHistory(item)}${claims ? `<div class="claims-panel"><h4>사실 주장과 근거</h4><ul>${claims}</ul></div>` : ""}${planSources}${renderResearch(item)}${renderMaterials(item)}<p class="small-note">기획안을 수정하면 이전 검수·승인은 취소됩니다. 검색 요약은 근거로 취급하지 않으며, 출처의 주장과 영상 소재 권리는 사람이 최종 확인해야 합니다.</p></section>`;
+  const hookSuggestions = (item.hook_suggestions || []).length ? `<div class="hook-suggestions">${(item.hook_suggestions || []).map(h => `<button type="button" class="hook-suggestion-chip" data-hook="${escapeHtml(h)}">${escapeHtml(h)}</button>`).join("")}</div>` : "";
+  const sceneEditors = (plan.scenes || []).map((scene, idx) => `<div class="scene-editor-row" data-scene-id="${escapeHtml(scene.id || `scene-${idx + 1}`)}"><div class="card-head"><strong>장면 ${idx + 1}</strong><button type="button" class="button danger remove-scene-row">삭제</button></div><label>장면 나레이션<textarea data-scene-field="narration" rows="2" maxlength="800">${escapeHtml(scene.narration || "")}</textarea></label><div class="form-row"><label>영상 검색어(영문 권장)<input data-scene-field="visual_query" maxlength="200" value="${escapeHtml(scene.visual_query || "")}"></label><label>길이(초)<input data-scene-field="duration_seconds" type="number" min="1" max="30" step="0.5" value="${escapeHtml(scene.duration_seconds ?? "")}" placeholder="자동"></label></div></div>`).join("");
+  return `<section class="card panel"><div class="card-head"><h3>① 자료 조사 · 콘텐츠 기획</h3><span class="badge">${escapeHtml(plan.generated_by || "local_template")}</span></div>${renderAnalyticsFeedback()}<form class="plan-form"><label>제목<input name="title" value="${escapeHtml(plan.title)}" maxlength="100"></label><div class="hook-row"><label>첫 문장<input name="hook" value="${escapeHtml(plan.hook)}" maxlength="240"></label><button id="suggest-hooks-button" class="button" type="button">훅 5개 추천</button></div>${hookSuggestions}<label>내레이션 대본<textarea name="script" rows="5" maxlength="6000">${escapeHtml(plan.script)}</textarea>${renderPaceMeterMarkup(plan.script, item.language, plan.duration_seconds || item.duration_seconds)}</label><label>게시 문구<textarea name="caption" rows="3" maxlength="5000">${escapeHtml(plan.caption)}</textarea></label><label>영상 생성 프롬프트<textarea name="video_prompt" rows="3" maxlength="1000">${escapeHtml(plan.video_prompt)}</textarea></label><label>해시태그<input name="hashtags" value="${escapeHtml((plan.hashtags || []).join(" "))}" placeholder="#shorts #tips"></label><div class="card-head"><strong>장면 구성 (${(plan.scenes || []).length})</strong><button id="add-scene-row" class="button" type="button">장면 추가</button></div><div class="scene-editor-list">${sceneEditors}</div><button id="save-plan-button" class="button" type="button">수정 저장</button></form>${renderPlatformCopies(item)}${renderVersionHistory(item)}${claims ? `<div class="claims-panel"><h4>사실 주장과 근거</h4><ul>${claims}</ul></div>` : ""}${planSources}${renderResearch(item)}${renderMaterials(item)}<p class="small-note">기획안을 수정하면 이전 검수·승인은 취소됩니다. 검색 요약은 근거로 취급하지 않으며, 출처의 주장과 영상 소재 권리는 사람이 최종 확인해야 합니다.</p></section>`;
 }
 
 /**
@@ -634,22 +744,72 @@ function renderPreflight(review) {
  */
 function renderAnalytics(item) {
   const publications = item.publications || {};
-  const platforms = ["youtube", "instagram"].filter(platform => publications[platform]?.status === "published");
+  const platforms = ["youtube", "instagram", "tiktok"].filter(platform => publications[platform]?.status === "published");
   if (!platforms.length) return "";
   const forms = platforms.map(platform => {
     const records = (item.analytics?.[platform] || []).slice().reverse().slice(0, 5);
     const history = records.map(record => `<li><span>${escapeHtml(new Date(record.measured_at).toLocaleString())}</span><small>${["views", "watch_time_seconds", "likes", "comments", "shares", "saves"].filter(field => record[field] !== null && record[field] !== undefined).map(field => `${field}: ${escapeHtml(record[field])}`).join(" · ")}</small></li>`).join("");
-    return `<form class="analytics-form" data-platform="${platform}"><h4>${platform === "youtube" ? "YouTube Shorts" : "Instagram Reels"}</h4><label>측정 시각<input name="measured_at" type="datetime-local" required></label><div class="analytics-fields">${[["views", "조회수"], ["watch_time_seconds", "시청 시간(초)"], ["likes", "좋아요"], ["comments", "댓글"], ["shares", "공유"], ["saves", "저장"]].map(([field, label]) => `<label>${label}<input name="${field}" type="number" min="0" step="${field === "watch_time_seconds" ? "0.1" : "1"}" inputmode="decimal"></label>`).join("")}</div><label>메모<input name="notes" maxlength="500" placeholder="선택 입력"></label><button class="button" type="submit">성과 기록</button>${history ? `<ul class="analytics-history">${history}</ul>` : '<p class="small-note">아직 성과 기록이 없습니다.</p>'}</form>`;
+    const label = platform === "youtube" ? "YouTube Shorts" : platform === "tiktok" ? "TikTok" : "Instagram Reels";
+    return `<form class="analytics-form" data-platform="${platform}"><h4>${label}</h4><label>측정 시각<input name="measured_at" type="datetime-local" required></label><div class="analytics-fields">${[["views", "조회수"], ["watch_time_seconds", "시청 시간(초)"], ["likes", "좋아요"], ["comments", "댓글"], ["shares", "공유"], ["saves", "저장"]].map(([field, label]) => `<label>${label}<input name="${field}" type="number" min="0" step="${field === "watch_time_seconds" ? "0.1" : "1"}" inputmode="decimal"></label>`).join("")}</div><label>메모<input name="notes" maxlength="500" placeholder="선택 입력"></label><button class="button" type="submit">성과 기록</button>${history ? `<ul class="analytics-history">${history}</ul>` : '<p class="small-note">아직 성과 기록이 없습니다.</p>'}</form>`;
   }).join("");
   return `<section class="resource-panel analytics-entry"><h4>게시 후 성과 기록</h4><p class="small-note">각 플랫폼의 인사이트에서 확인한 수치를 직접 입력하세요. 외부 계정 데이터를 자동으로 읽지 않습니다.</p>${forms}</section>`;
+}
+
+function renderSafeZoneVideo(item, videoClass) {
+  const safeZone = state.safeZone || "none";
+  const label = safeZone === "youtube" ? "YouTube" : safeZone === "instagram" ? "Instagram" : "";
+  return `<div class="video-stage-wrap"><video class="${videoClass}" controls playsinline preload="metadata" src="/api/items/${encodeURIComponent(item.id)}/video?v=${encodeURIComponent(item.assets?.sha256 || "")}"></video><div class="safezone-overlay" ${safeZone === "none" ? "hidden" : ""}><div class="safezone-top">${label} 상단 UI 영역</div><div class="safezone-right">버튼</div><div class="safezone-bottom">${label} 제목·설명 영역</div></div></div><div class="safezone-toolbar"><span class="small-note">안전 영역(Safe Zone) 가이드</span><select class="safezone-select" aria-label="안전 영역 가이드"><option value="none" ${safeZone === "none" ? "selected" : ""}>가이드 끄기</option><option value="youtube" ${safeZone === "youtube" ? "selected" : ""}>YouTube Shorts 영역</option><option value="instagram" ${safeZone === "instagram" ? "selected" : ""}>Instagram Reels 영역</option></select></div>`;
+}
+
+function renderSubtitleEditor(item) {
+  const videoPath = item.assets?.final_video;
+  if (!videoPath) return "";
+  const disabled = item.active_job || Object.values(item.publications || {}).some(post => post.status === "published");
+  const saved = state.subtitlesCache[item.id];
+  const style = saved?.style || item.assets?.subtitle_style || SUBTITLE_PRESETS.clean_bottom;
+  const presetKey = style.preset || "clean_bottom";
+  const presetOptions = Object.entries(SUBTITLE_PRESETS).map(([key, info]) => `<option value="${key}" ${presetKey === key ? "selected" : ""}>${escapeHtml(info.label)}</option>`).join("");
+  const srtValue = saved ? saved.srt : "";
+  return `<details class="subtitle-editor-panel" id="subtitle-editor-details"><summary>자막(SRT) 편집 · 스타일 설정</summary><form id="subtitle-editor-form" class="subtitle-editor-form"><div class="form-row"><label>스타일 프리셋<select name="preset">${presetOptions}</select></label><label>글자 크기<input name="font_size" type="number" min="18" max="96" value="${escapeHtml(style.font_size ?? 42)}"></label></div><div class="form-row"><label>하단/상단 여백<input name="margin_v" type="number" min="10" max="600" value="${escapeHtml(style.margin_v ?? 170)}"></label><label>정렬<select name="alignment"><option value="2" ${Number(style.alignment ?? 2) === 2 ? "selected" : ""}>하단</option><option value="5" ${Number(style.alignment) === 5 ? "selected" : ""}>중앙</option><option value="8" ${Number(style.alignment) === 8 ? "selected" : ""}>상단</option></select></label></div><label>SRT 자막 내용<textarea name="srt" rows="6" placeholder="1&#10;00:00:00,000 --> 00:00:02,500&#10;여기에 자막을 입력하세요">${escapeHtml(srtValue)}</textarea></label><div class="actions"><button id="load-subtitles-button" class="button" type="button">저장된 자막 불러오기</button><button class="button primary" type="submit" ${disabled ? "disabled" : ""}>자막 적용 및 영상 재렌더링</button></div><p class="small-note">재렌더링에는 FFmpeg가 필요하며 Runway API는 다시 호출하지 않습니다. 변경 시 검수·승인은 초기화됩니다.</p></form></details>`;
+}
+
+function renderAssemblyAndAudioPanel(item) {
+  const plan = item.plan;
+  if (!plan) return "";
+  const disabled = item.active_job || Object.values(item.publications || {}).some(post => post.status === "published");
+  const downloadedPexels = (item.materials || []).filter(m => m.local_path);
+  const uploadedClips = item.assets?.uploaded_clips || [];
+  const hasSource = Boolean(item.assets?.source_video);
+  const optionItems = [
+    ...downloadedPexels.map(m => ({ value: `pexels:${m.provider_id}`, label: `Pexels · ${m.title || m.provider_id}` })),
+    ...uploadedClips.map(c => ({ value: `uploaded:${c.filename}`, label: `업로드 · ${c.original_name || c.filename}` })),
+    ...(hasSource ? [{ value: "source:", label: "현재 원본 영상" }] : [])
+  ];
+  const scenes = plan.scenes || [];
+  const defaultDuration = Math.max(2, Math.round(((plan.duration_seconds || 20) / Math.max(1, scenes.length)) * 10) / 10);
+  const sceneRows = scenes.map((scene, idx) => {
+    const opts = optionItems.length ? optionItems.map(opt => `<option value="${escapeHtml(opt.value)}">${escapeHtml(opt.label)}</option>`).join("") : '<option value="">클립을 먼저 업로드하거나 Pexels에서 저장하세요</option>';
+    return `<div class="assembly-scene-row"><label>장면 ${idx + 1} (${escapeHtml(scene.visual_query || "")})<select class="assembly-scene-source" data-scene-idx="${idx}">${opts}</select></label><label>길이(초)<input class="assembly-scene-duration" type="number" min="1" max="30" step="0.5" value="${escapeHtml(scene.duration_seconds ?? defaultDuration)}"></label></div>`;
+  }).join("");
+  const bgmInfo = item.assets?.bgm_name ? `<span class="badge good">BGM: ${escapeHtml(item.assets.bgm_name)}</span>` : '<span class="small-note">BGM 미등록</span>';
+  const postprocessBtn = item.assets?.final_video ? `<button id="postprocess-video-button" class="button" type="button" ${disabled ? "disabled" : ""}>기존 MP4에 BGM·음량·자막 후처리</button>` : "";
+  return `<details class="assembly-panel"><summary>멀티 씬 조립 · BGM 오토 덕킹 · TTS 설정</summary><div class="actions"><label class="button upload-label">장면 클립/이미지 업로드<input id="scene-clip-upload" type="file" accept=".mp4,.mov,.jpg,.jpeg,.png,.webp" ${disabled ? "disabled" : ""}></label><label class="button upload-label">BGM 오디오 업로드<input id="bgm-upload" type="file" accept=".mp3,.wav,.m4a,.aac" ${disabled ? "disabled" : ""}></label>${bgmInfo}</div><div class="form-row"><label>전환 효과<select id="assembly-transition"><option value="cut">바로 전환 (컷)</option><option value="fade">페이드 (xfade)</option></select></label><label>나레이션 TTS<select id="assembly-tts"><option value="auto">자동 (ElevenLabs/OpenAI)</option><option value="elevenlabs">ElevenLabs</option><option value="openai_tts">OpenAI TTS</option><option value="none">음성 생성 안 함</option></select></label></div><div class="form-row"><label>BGM 볼륨 (0.02~1.0)<input id="bgm-volume" type="number" min="0.02" max="1" step="0.02" value="0.18"></label><label class="check-row"><input id="bgm-ducking" type="checkbox" checked> BGM 오토 덕킹</label></div><label class="check-row"><input id="audio-loudnorm" type="checkbox" checked> 음량 자동 정규화 (loudnorm)</label>${sceneRows}<div class="actions"><button id="assemble-scenes-button" class="button primary" type="button" ${disabled || !optionItems.length || !state.settings.ffmpeg_ready ? "disabled" : ""}>멀티 씬 조립 제작</button>${postprocessBtn}</div></details>`;
+}
+
+function renderThumbnailPanel(item) {
+  const videoPath = item.assets?.final_video;
+  if (!videoPath) return "";
+  const disabled = item.active_job || Object.values(item.publications || {}).some(post => post.status === "published");
+  const thumbPreview = item.assets?.thumbnail_path ? `<img class="thumbnail-preview" src="/api/items/${encodeURIComponent(item.id)}/thumbnail?t=${Date.now()}" alt="커버 썸네일">` : "";
+  return `<div class="thumbnail-panel"><div class="card-head"><strong>커버 썸네일</strong>${item.assets?.thumbnail_path ? '<span class="badge good">저장됨</span>' : '<span class="badge">미지정</span>'}</div>${thumbPreview}<div class="form-row"><label>프레임 시각(초)<input id="thumbnail-timestamp" type="number" min="0" max="180" step="0.1" value="0.5"></label><button id="extract-thumbnail-button" class="button" type="button" ${disabled || !state.settings.ffmpeg_ready ? "disabled" : ""}>영상 프레임 추출</button></div><label class="button upload-label">썸네일 JPG/PNG 업로드<input id="thumbnail-upload" type="file" accept=".jpg,.jpeg,.png" ${disabled ? "disabled" : ""}></label></div>`;
 }
 
 function renderProduction(item) {
   const videoPath = item.assets?.final_video;
   const staleVideo = Boolean(videoPath && item.assets?.generated_for_plan_revision !== item.plan?.revision);
-  const video = videoPath ? `<video class="video-frame" controls playsinline preload="metadata" src="/api/items/${encodeURIComponent(item.id)}/video"></video><p class="small-note">현재 저장된 MP4 미리보기 · 게시 전에 화면·음성·자막을 직접 확인하세요.</p>` : '<p class="muted">아직 저장된 영상이 없습니다. 생성 API를 설정하거나 MP4를 직접 업로드하세요.</p>';
+  const video = videoPath ? `${renderSafeZoneVideo(item, "video-frame")}<p class="small-note">현재 저장된 MP4 미리보기 · 게시 전에 화면·음성·자막을 직접 확인하세요.</p>` : '<p class="muted">아직 저장된 영상이 없습니다. 생성 API를 설정하거나 MP4를 직접 업로드하세요.</p>';
   const staleNotice = staleVideo ? '<p class="warning-banner">기획안이 수정되어 이 영상은 이전 버전 기준입니다. 현재 기획에 맞춰 다시 생성하거나 MP4를 업로드해야 검수할 수 있습니다.</p>' : "";
-  return `<section class="card panel"><div class="card-head"><h3>② 제작</h3>${item.assets?.sha256 ? `<span class="badge">SHA-256 ${escapeHtml(item.assets.sha256.slice(0, 12))}…</span>` : ""}</div>${video}${staleNotice}<div class="actions"><button id="generate-button" class="button primary" ${state.settings.runway_ready && item.plan ? "" : "disabled"}>Runway 영상 생성</button><label class="button upload-label">MP4 업로드<input id="video-upload" type="file" accept="video/mp4,.mp4"></label><button id="review-button" class="button" ${item.plan && videoPath && !staleVideo ? "" : "disabled"}>검수 시작</button></div><p class="small-note">영상 생성은 외부 유료 API를 호출합니다. 한 번의 생성 작업만 실행되며 결과를 자동으로 다시 생성하지 않습니다.</p></section>`;
+  return `<section class="card panel"><div class="card-head"><h3>② 제작</h3>${item.assets?.sha256 ? `<span class="badge">SHA-256 ${escapeHtml(item.assets.sha256.slice(0, 12))}…</span>` : ""}</div>${video}${staleNotice}<div class="actions"><button id="generate-button" class="button primary" ${state.settings.runway_ready && item.plan ? "" : "disabled"}>Runway 영상 생성</button><label class="button upload-label">MP4 업로드<input id="video-upload" type="file" accept="video/mp4,.mp4"></label><button id="review-button" class="button" ${item.plan && videoPath && !staleVideo ? "" : "disabled"}>검수 시작</button></div>${renderAssemblyAndAudioPanel(item)}${renderSubtitleEditor(item)}${renderThumbnailPanel(item)}<p class="small-note">영상 생성은 외부 유료 API를 호출합니다. 한 번의 생성 작업만 실행되며 결과를 자동으로 다시 생성하지 않습니다.</p></section>`;
 }
 
 function renderReview(item) {
@@ -665,8 +825,9 @@ function renderReview(item) {
   const publications = Object.values(item.publications || {}).map(post => `<div class="publication"><span>${escapeHtml(post.platform)} · ${escapeHtml(post.status)}</span>${post.permalink ? `<a href="${escapeHtml(post.permalink)}" target="_blank" rel="noreferrer">게시물 열기 ↗</a>` : post.error ? `<span class="muted">${escapeHtml(post.error)}</span>` : ""}</div>`).join("");
   const blocked = review.status === "needs_changes" || !videoPath || review.plan_revision !== item.plan?.revision;
   const reviewClass = review.status === "passed" ? "pass" : review.status === "manual_required" ? "warn" : "fail";
-  const approvalPreview = videoPath ? `<div class="approval-preview"><span>승인 대상 영상 미리보기</span><video class="approval-video" controls playsinline preload="metadata" src="/api/items/${encodeURIComponent(item.id)}/video"></video></div>` : "";
-  return `<section class="card panel"><h3>③ 검수 결과</h3><div class="review-result ${reviewClass}"><h4>${escapeHtml(statusText)}</h4><p>${escapeHtml(editorial?.summary || technical.message || "자동 내용 검수가 설정되지 않았습니다.")}</p>${issueList}${metrics}</div>${unverifiedClaims}${renderPreflight(review)}<p class="small-note">${escapeHtml(technical.message || "")} ${editorial ? "자동 검수는 대본 기반이며 최종 영상의 시각·음성 내용을 독립 확인하지 않습니다." : "AI 검수 미설정 상태입니다. 아래 항목을 사람이 직접 확인해야 합니다."}</p>${renderRightsLedger(item)}${publications ? `<h3 class="subheading">게시 기록</h3>${publications}` : ""}<div class="approval-box"><strong>게시 전 사람 검수</strong>${approvalPreview}<label class="approval-check"><input id="manual-review-check" type="checkbox" ${blocked ? "disabled" : ""}> 영상·음성·자막, 사실 근거, 음악·영상·목소리 권리와 플랫폼 정책을 직접 확인했습니다.</label><button id="approve-button" class="button good" ${blocked ? "disabled" : ""}>확인한 초안 승인</button></div><p class="small-note">승인은 현재 기획안, MP4 파일과 권리 기록의 SHA-256에 묶입니다. 파일이나 권리 기록이 바뀌면 다시 승인해야 합니다.</p></section>`;
+  const approvalPreview = videoPath ? `<div class="approval-preview"><span>승인 대상 영상 미리보기</span>${renderSafeZoneVideo(item, "approval-video")}</div>` : "";
+  const autofixButton = (editorial?.issues?.length || review.unverified_claims?.length || review.status === "needs_changes") && state.settings.ai?.stages?.planning?.ready && !item.active_job ? `<div class="actions"><button id="autofix-plan-button" class="button" type="button">검수 이슈 AI 자동 보완</button></div>` : "";
+  return `<section class="card panel"><h3>③ 검수 결과</h3><div class="review-result ${reviewClass}"><h4>${escapeHtml(statusText)}</h4><p>${escapeHtml(editorial?.summary || technical.message || "자동 내용 검수가 설정되지 않았습니다.")}</p>${issueList}${metrics}${autofixButton}</div>${unverifiedClaims}${renderPreflight(review)}<p class="small-note">${escapeHtml(technical.message || "")} ${editorial ? "자동 검수는 대본 기반이며 최종 영상의 시각·음성 내용을 독립 확인하지 않습니다." : "AI 검수 미설정 상태입니다. 아래 항목을 사람이 직접 확인해야 합니다."}</p>${renderRightsLedger(item)}${publications ? `<h3 class="subheading">게시 기록</h3>${publications}` : ""}<div class="approval-box"><strong>게시 전 사람 검수</strong>${approvalPreview}<label class="approval-check"><input id="manual-review-check" type="checkbox" ${blocked ? "disabled" : ""}> 영상·음성·자막, 사실 근거, 음악·영상·목소리 권리와 플랫폼 정책을 직접 확인했습니다.</label><button id="approve-button" class="button good" ${blocked ? "disabled" : ""}>확인한 초안 승인</button></div><p class="small-note">승인은 현재 기획안, MP4 파일과 권리 기록의 SHA-256에 묶입니다. 파일이나 권리 기록이 바뀌면 다시 승인해야 합니다.</p></section>`;
 }
 
 function renderPublishLegacy(item) {
@@ -691,31 +852,78 @@ function renderPublish(item) {
   if (!item.approved_at) return "";
   const entries = (item.platforms || []).map(platform => {
     const existing = item.publications?.[platform];
-    const label = platform === "youtube" ? "YouTube Shorts" : "Instagram Reels";
-    if (existing?.status === "published") return `<div class="publication"><span>${label} · 게시 완료</span>${existing.permalink ? `<a href="${escapeHtml(existing.permalink)}" target="_blank" rel="noreferrer">게시물 열기 ↗</a>` : ""}</div>`;
-    const ready = platform === "youtube" ? state.settings.youtube_ready : state.settings.instagram_ready;
-    const privacy = platform === "youtube" ? '<select class="youtube-privacy"><option value="private" selected>비공개</option><option value="unlisted">일부 공개</option><option value="public">전체 공개</option></select>' : "";
+    const label = platform === "youtube" ? "YouTube Shorts" : platform === "tiktok" ? "TikTok" : "Instagram Reels";
+    if (existing?.status === "published") {
+      const ytControls = platform === "youtube" ? `<div class="actions"><select id="yt-post-privacy"><option value="private">비공개</option><option value="unlisted">일부 공개</option><option value="public">전체 공개</option></select><button id="yt-update-privacy-btn" class="button" type="button">공개 범위 변경</button></div>` : "";
+      const r2Cleanup = platform === "instagram" && item.assets?.instagram_staged_object ? `<button id="cleanup-r2-btn" class="button" type="button">R2 임시 파일 정리</button>` : "";
+      return `<div class="publication"><div><span>${label} · 게시 완료</span>${existing.permalink ? ` <a href="${escapeHtml(existing.permalink)}" target="_blank" rel="noreferrer">게시물 열기 ↗</a>` : ""}</div>${ytControls}${r2Cleanup}</div>`;
+    }
+    const ready = platform === "youtube" ? state.settings.youtube_ready : platform === "tiktok" ? state.settings.tiktok_ready : state.settings.instagram_ready;
+    const privacy = platform === "youtube"
+      ? '<select class="youtube-privacy"><option value="private" selected>비공개</option><option value="unlisted">일부 공개</option><option value="public">전체 공개</option></select><label>YouTube 네이티브 예약(선택)<input type="datetime-local" id="youtube-native-publish-at"></label>'
+      : platform === "tiktok"
+        ? '<select class="tiktok-privacy"><option value="SELF_ONLY" selected>나만 보기 (비공개)</option><option value="MUTUAL_FOLLOW_FRIENDS">서로 팔로우</option><option value="FOLLOWER_OF_CREATOR">팔로워</option><option value="PUBLIC_TO_EVERYONE">전체 공개</option></select>'
+        : "";
     const status = existing ? `<p class="small-note">이전 결과: ${escapeHtml(existing.status)}${existing.error ? ` · ${escapeHtml(existing.error)}` : ""}</p>` : "";
     const scheduled = item.schedules?.[platform];
     const scheduleBlocksImmediate = ["scheduled", "dispatching", "running"].includes(scheduled?.status);
     const scheduledText = scheduled ? `<p class="small-note">예약 상태: ${escapeHtml(scheduled.status)}${scheduled.scheduled_at ? ` · ${escapeHtml(new Date(scheduled.scheduled_at).toLocaleString(undefined, { timeZone: scheduled.timezone_name }))}` : ""}${scheduled.error ? ` · ${escapeHtml(scheduled.error)}` : ""}</p>` : "";
-    const scheduleForm = scheduled?.status === "scheduled" ? `<button class="button cancel-schedule" data-platform="${platform}" type="button">예약 취소</button>` : `<form class="schedule-form" data-platform="${platform}"><label>예약 시각<input name="scheduled_local" type="datetime-local" required></label><button class="button" type="submit" ${ready ? "" : "disabled"}>예약 설정</button></form>`;
+    const scheduleForm = scheduled?.status === "scheduled" ? `<button class="button cancel-schedule" data-platform="${platform}" type="button">예약 취소</button>` : `<form class="schedule-form" data-platform="${platform}"><label>로컬 예약 시각<input name="scheduled_local" type="datetime-local" required></label><button class="button" type="submit" ${ready ? "" : "disabled"}>예약 설정</button></form>`;
     return `<section class="publish-target"><div class="card-head publish-row"><label class="muted">${label}${privacy}${status}${scheduledText}</label><button class="button primary publish-button" data-platform="${platform}" ${ready && !scheduleBlocksImmediate ? "" : "disabled"}>지금 게시</button></div>${scheduleForm}${scheduleBlocksImmediate ? '<p class="small-note">예약 게시가 남아 있습니다. 즉시 게시하려면 먼저 예약을 취소하세요.</p>' : ""}</section>`;
   }).join("");
-  return `<section class="card panel"><h3>⑤ 게시</h3><p class="muted">채널별로 별도 게시합니다. 예약 시각에 이 로컬 앱이 실행 중이어야 합니다. YouTube 예약 게시에는 저장된 갱신 가능 OAuth 세션이 필요합니다.</p>${entries}<p class="small-note">불확실한 게시 결과와 앱 종료 중 처리된 예약은 자동 재시도하지 않습니다. 채널의 게시 상태를 확인한 뒤 다시 조치하세요.</p>${renderAnalytics(item)}</section>`;
+  return `<section class="card panel"><h3>⑤ 게시</h3><p class="muted">채널별로 별도 게시합니다. 로컬 예약 시각에는 이 앱이 실행 중이어야 합니다.</p>${entries}<p class="small-note">불확실한 게시 결과와 앱 종료 중 처리된 예약은 자동 재시도하지 않습니다. 채널의 게시 상태를 확인한 뒤 다시 조치하세요.</p>${renderAnalytics(item)}</section>`;
 }
 
 function renderItem(item) {
   const workspace = document.getElementById("workspace");
-  const jobMessage = item.active_job ? `<div class="success-banner">${escapeHtml(stageLabels[item.stage] || item.stage)} · 작업이 진행 중입니다. 완료될 때까지 이 PC에서 서버를 종료하지 마세요.</div>` : "";
+  const pct = Number(item.job_progress?.percent ?? 10);
+  const progressText = item.job_progress?.message ? ` · ${escapeHtml(item.job_progress.message)}` : "";
+  const jobMessage = item.active_job ? `<div class="success-banner"><div class="card-head"><span>${escapeHtml(stageLabels[item.stage] || item.stage)}${progressText}</span><button id="cancel-job-button" class="button danger" type="button" ${item.cancel_requested ? "disabled" : ""}>${item.cancel_requested ? "취소 요청됨" : "작업 취소 요청"}</button></div><div class="progress-bar"><span style="width:${Math.max(5, Math.min(100, pct))}%"></span></div></div>` : "";
   const errorMessage = item.error ? `<div class="error-banner">${escapeHtml(item.error)}<br>오류가 난 생성·게시 작업은 자동 재시도하지 않았습니다.</div>` : "";
   const published = item.stage === "published" ? '<div class="success-banner">선택한 모든 플랫폼에 게시되었습니다.</div>' : "";
   const seriesName = item.series_template_snapshot?.name ? ` · ${escapeHtml(item.series_template_snapshot.name)}` : "";
-  workspace.innerHTML = `<div class="content-detail"><header class="detail-header panel"><div><p class="eyebrow">CONTENT WORKFLOW · ${escapeHtml(item.id.slice(0, 8))}</p><h2>${escapeHtml(item.plan?.title || item.topic)}</h2><p>${escapeHtml(item.audience)} · ${escapeHtml(item.language)} · ${(item.platforms || []).map(escapeHtml).join(" + ")}${seriesName}</p></div><span class="badge ${item.stage === "failed" ? "bad" : item.stage === "approved" || item.stage === "published" ? "good" : ""}">${escapeHtml(stageLabels[item.stage] || item.stage)}</span></header>${renderStages(item)}${jobMessage}${errorMessage}${published}<div class="detail-grid"><div class="content-column">${renderPlan(item)}${renderProduction(item)}</div><div class="review-column">${renderReview(item)}${renderPublish(item)}</div></div><section class="small-note">작업 파일 위치: ${escapeHtml(state.settings.app_home || "사용자 데이터 폴더")}</section></div>`;
+  const isPublishedOrLocked = Boolean(item.active_job) || Object.values(item.publications || {}).some(post => ["publishing", "published", "uncertain"].includes(post.status));
+  workspace.innerHTML = `<div class="content-detail"><header class="detail-header panel"><div><p class="eyebrow">CONTENT WORKFLOW · ${escapeHtml(item.id.slice(0, 8))}</p><h2>${escapeHtml(item.plan?.title || item.topic)}</h2><p>${escapeHtml(item.audience)} · ${escapeHtml(item.language)} · ${(item.platforms || []).map(escapeHtml).join(" + ")}${seriesName}</p></div><div class="header-controls"><span class="badge ${item.stage === "failed" ? "bad" : item.stage === "approved" || item.stage === "published" ? "good" : ""}">${escapeHtml(stageLabels[item.stage] || item.stage)}</span><button id="duplicate-item-button" class="button" type="button">복제</button><button id="archive-item-button" class="button" type="button">${item.archived ? "보관 해제" : "보관"}</button><button id="delete-item-button" class="button danger" type="button" ${isPublishedOrLocked ? "disabled" : ""}>삭제</button></div></header>${renderStages(item)}${jobMessage}${errorMessage}${published}<div class="detail-grid"><div class="content-column">${renderPlan(item)}${renderProduction(item)}</div><div class="review-column">${renderReview(item)}${renderPublish(item)}</div></div><section class="small-note">작업 파일 위치: ${escapeHtml(state.settings.app_home || "사용자 데이터 폴더")}</section></div>`;
   wireItemActions(item);
 }
 
 function wireItemActions(item) {
+  document.getElementById("duplicate-item-button")?.addEventListener("click", () => duplicateItem(item.id));
+  document.getElementById("archive-item-button")?.addEventListener("click", () => toggleArchiveItem(item.id, !item.archived));
+  document.getElementById("delete-item-button")?.addEventListener("click", () => deleteItem(item.id));
+  document.getElementById("cancel-job-button")?.addEventListener("click", () => cancelItemJob(item.id));
+  document.getElementById("direct-url-button")?.addEventListener("click", () => addDirectUrlResearch(item.id));
+  document.querySelectorAll(".research-source-include").forEach(box => box.addEventListener("change", () => toggleResearchSourceInclusion(item.id, box.dataset.sourceId, box.checked)));
+  document.getElementById("yt-update-privacy-btn")?.addEventListener("click", () => updateYouTubePrivacy(item.id));
+  document.getElementById("cleanup-r2-btn")?.addEventListener("click", () => cleanupR2Object(item.id));
+  document.querySelector('.plan-form textarea[name="script"]')?.addEventListener("input", event => {
+    const meter = document.getElementById("script-pace-meter");
+    if (meter) meter.outerHTML = renderPaceMeterMarkup(event.target.value, item.language, item.plan?.duration_seconds || item.duration_seconds);
+  });
+  document.querySelectorAll(".safezone-select").forEach(select => select.addEventListener("change", event => {
+    state.safeZone = event.target.value;
+    document.querySelectorAll(".safezone-select").forEach(other => { other.value = state.safeZone; });
+    const label = state.safeZone === "youtube" ? "YouTube" : state.safeZone === "instagram" ? "Instagram" : "";
+    document.querySelectorAll(".safezone-overlay").forEach(overlay => {
+      overlay.hidden = state.safeZone === "none";
+      if (label) {
+        overlay.querySelector(".safezone-top").textContent = `${label} 상단 UI 영역`;
+        overlay.querySelector(".safezone-bottom").textContent = `${label} 제목·설명 영역`;
+      }
+    });
+  }));
+  document.getElementById("load-subtitles-button")?.addEventListener("click", () => loadItemSubtitles(item.id));
+  const subtitleForm = document.getElementById("subtitle-editor-form");
+  if (subtitleForm) {
+    subtitleForm.elements.namedItem("preset")?.addEventListener("change", event => {
+      const preset = SUBTITLE_PRESETS[event.target.value];
+      if (!preset) return;
+      subtitleForm.elements.namedItem("font_size").value = String(preset.font_size);
+      subtitleForm.elements.namedItem("margin_v").value = String(preset.margin_v);
+      subtitleForm.elements.namedItem("alignment").value = String(preset.alignment);
+    });
+    subtitleForm.addEventListener("submit", event => saveItemSubtitles(event, item.id));
+  }
   document.getElementById("research-button")?.addEventListener("click", () => runAction(`/api/items/${item.id}/research`, "POST", "웹 출처 조사를 시작했습니다."));
   document.getElementById("plan-button")?.addEventListener("click", () => runAction(`/api/items/${item.id}/plan`, "POST", "기획 작업을 시작했습니다."));
   document.getElementById("materials-button")?.addEventListener("click", () => runAction(`/api/items/${item.id}/materials`, "POST", "장면별 영상 소재 검색을 시작했습니다."));
@@ -724,6 +932,22 @@ function wireItemActions(item) {
   });
   document.getElementById("review-button")?.addEventListener("click", () => runAction(`/api/items/${item.id}/review`, "POST", "검수를 시작했습니다."));
   document.getElementById("save-plan-button")?.addEventListener("click", savePlan);
+  document.getElementById("suggest-hooks-button")?.addEventListener("click", () => suggestHooksForItem(item.id));
+  document.querySelectorAll(".hook-suggestion-chip").forEach(button => button.addEventListener("click", () => {
+    const input = document.querySelector('.plan-form input[name="hook"]');
+    if (input) input.value = button.dataset.hook || "";
+    toast("추천 첫 문장을 적용했습니다. 수정 저장을 눌러 확정하세요.");
+  }));
+  document.getElementById("add-scene-row")?.addEventListener("click", addSceneEditorRow);
+  document.querySelectorAll(".remove-scene-row").forEach(button => button.addEventListener("click", () => button.closest(".scene-editor-row")?.remove()));
+  document.getElementById("autofix-plan-button")?.addEventListener("click", () => autofixPlanForItem(item.id));
+  document.querySelectorAll(".download-material-clip").forEach(button => button.addEventListener("click", () => downloadMaterialClip(item.id, button.dataset.candidateId)));
+  document.getElementById("scene-clip-upload")?.addEventListener("change", event => uploadSceneClip(event, item.id));
+  document.getElementById("bgm-upload")?.addEventListener("change", event => uploadBgmFile(event, item.id));
+  document.getElementById("assemble-scenes-button")?.addEventListener("click", () => assembleScenesForItem(item.id));
+  document.getElementById("postprocess-video-button")?.addEventListener("click", () => postprocessItemVideo(item.id));
+  document.getElementById("extract-thumbnail-button")?.addEventListener("click", () => extractItemThumbnail(item.id));
+  document.getElementById("thumbnail-upload")?.addEventListener("change", event => uploadItemThumbnail(event, item.id));
   document.getElementById("video-upload")?.addEventListener("change", uploadVideo);
   document.getElementById("approve-button")?.addEventListener("click", approveItem);
   document.querySelectorAll(".publish-button").forEach(button => button.addEventListener("click", () => publishItem(button.dataset.platform)));
@@ -991,11 +1215,151 @@ async function savePlan() {
   try {
     const form = document.querySelector(".plan-form");
     const body = Object.fromEntries(new FormData(form).entries());
-    body.hashtags = body.hashtags.split(/\s+/).filter(Boolean).map(tag => tag.startsWith("#") ? tag : `#${tag}`);
+    body.hashtags = String(body.hashtags || "").split(/\s+/).filter(Boolean).map(tag => tag.startsWith("#") ? tag : `#${tag}`);
+    const sceneRows = [...document.querySelectorAll(".scene-editor-row")];
+    if (sceneRows.length) {
+      body.scenes = sceneRows.map(row => {
+        const durRaw = row.querySelector('[data-scene-field="duration_seconds"]')?.value;
+        return {
+          id: row.dataset.sceneId || "",
+          narration: row.querySelector('[data-scene-field="narration"]')?.value.trim() || "",
+          visual_query: row.querySelector('[data-scene-field="visual_query"]')?.value.trim() || "",
+          duration_seconds: durRaw ? Number(durRaw) : null
+        };
+      });
+    }
     const item = await api(`/api/items/${state.selectedId}/plan`, { method: "PUT", body: JSON.stringify(body) });
     toast("수정 내용을 저장했습니다. 기존 검수 결과는 초기화되었습니다.");
     await refresh(item.id);
   } catch (error) { toast(error.message); }
+}
+
+function addSceneEditorRow() {
+  const list = document.querySelector(".scene-editor-list");
+  if (!list) return;
+  const count = list.querySelectorAll(".scene-editor-row").length;
+  if (count >= 8) return toast("장면은 최대 8개까지 구성할 수 있습니다.");
+  const row = document.createElement("div");
+  row.className = "scene-editor-row";
+  row.dataset.sceneId = `scene-${count + 1}`;
+  row.innerHTML = `<div class="card-head"><strong>장면 ${count + 1}</strong><button type="button" class="button danger remove-scene-row">삭제</button></div><label>장면 나레이션<textarea data-scene-field="narration" rows="2" maxlength="800"></textarea></label><div class="form-row"><label>영상 검색어(영문 권장)<input data-scene-field="visual_query" maxlength="200"></label><label>길이(초)<input data-scene-field="duration_seconds" type="number" min="1" max="30" step="0.5" placeholder="자동"></label></div>`;
+  row.querySelector(".remove-scene-row").addEventListener("click", () => row.remove());
+  list.appendChild(row);
+}
+
+async function suggestHooksForItem(itemId) {
+  try {
+    await api(`/api/items/${itemId}/plan/hooks`, { method: "POST" });
+    toast("첫 문장 후보를 생성했습니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+}
+
+async function autofixPlanForItem(itemId) {
+  try {
+    await api(`/api/items/${itemId}/plan/autofix`, { method: "POST" });
+    toast("검수 의견을 반영해 초안을 보완했습니다. 내용을 확인한 뒤 다시 제작·검수하세요.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+}
+
+async function downloadMaterialClip(itemId, providerId) {
+  try {
+    await api(`/api/items/${itemId}/materials/${encodeURIComponent(providerId)}/download`, { method: "POST" });
+    toast("Pexels 클립을 로컬에 저장하고 권리 기록에 추가했습니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+}
+
+async function uploadSceneClip(event, itemId) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("clip", file);
+  try {
+    await api(`/api/items/${itemId}/clips`, { method: "POST", body: form });
+    toast("장면 클립을 업로드했습니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+  finally { event.target.value = ""; }
+}
+
+async function uploadBgmFile(event, itemId) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("audio", file);
+  try {
+    await api(`/api/items/${itemId}/bgm`, { method: "POST", body: form });
+    toast("BGM을 업로드하고 권리 기록에 추가했습니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+  finally { event.target.value = ""; }
+}
+
+async function assembleScenesForItem(itemId) {
+  const rows = [...document.querySelectorAll(".assembly-scene-row")];
+  const scenes = rows.map(row => {
+    const val = row.querySelector(".assembly-scene-source")?.value || "";
+    const dur = Number(row.querySelector(".assembly-scene-duration")?.value || 5);
+    const [kind, rest] = val.split(":");
+    if (kind === "pexels") return { source_kind: "pexels", provider_id: rest, duration_seconds: dur };
+    if (kind === "uploaded") return { source_kind: "uploaded", filename: rest, duration_seconds: dur };
+    if (kind === "source") return { source_kind: "source", duration_seconds: dur };
+    return null;
+  }).filter(Boolean);
+  if (!scenes.length) return toast("조립할 장면 클립을 하나 이상 선택하세요.");
+  const body = {
+    scenes,
+    transition: document.getElementById("assembly-transition")?.value || "cut",
+    tts_provider: document.getElementById("assembly-tts")?.value || "auto",
+    bgm_volume: Number(document.getElementById("bgm-volume")?.value || 0.18),
+    ducking: Boolean(document.getElementById("bgm-ducking")?.checked),
+    loudnorm: Boolean(document.getElementById("audio-loudnorm")?.checked)
+  };
+  try {
+    await api(`/api/items/${itemId}/assemble`, { method: "POST", body: JSON.stringify(body) });
+    toast("멀티 씬 영상 조립을 시작했습니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+}
+
+async function postprocessItemVideo(itemId) {
+  const body = {
+    apply_subtitles: true,
+    apply_bgm: true,
+    bgm_volume: Number(document.getElementById("bgm-volume")?.value || 0.18),
+    ducking: Boolean(document.getElementById("bgm-ducking")?.checked),
+    loudnorm: Boolean(document.getElementById("audio-loudnorm")?.checked),
+    tts_provider: document.getElementById("assembly-tts")?.value || "none"
+  };
+  try {
+    await api(`/api/items/${itemId}/postprocess`, { method: "POST", body: JSON.stringify(body) });
+    toast("MP4 후처리를 완료했습니다. 재검수 후 승인하세요.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+}
+
+async function extractItemThumbnail(itemId) {
+  const ts = Number(document.getElementById("thumbnail-timestamp")?.value || 0.5);
+  try {
+    await api(`/api/items/${itemId}/thumbnail/extract`, { method: "POST", body: JSON.stringify({ timestamp_seconds: ts }) });
+    toast("커버 썸네일을 추출했습니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+}
+
+async function uploadItemThumbnail(event, itemId) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("image", file);
+  try {
+    await api(`/api/items/${itemId}/thumbnail`, { method: "POST", body: form });
+    toast("커버 썸네일을 업로드했습니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+  finally { event.target.value = ""; }
 }
 
 async function uploadVideo(event) {
@@ -1023,8 +1387,14 @@ async function approveItem() {
 }
 
 async function publishItem(platform) {
-  const privacy = platform === "youtube" ? document.querySelector(".youtube-privacy")?.value || "private" : "private";
-  const target = platform === "youtube" ? `YouTube (${privacy})` : "Instagram Reels";
+  const privacy = platform === "youtube"
+    ? document.querySelector(".youtube-privacy")?.value || "private"
+    : platform === "tiktok"
+      ? document.querySelector(".tiktok-privacy")?.value || "SELF_ONLY"
+      : "private";
+  const nativePublishRaw = platform === "youtube" ? document.getElementById("youtube-native-publish-at")?.value : "";
+  const publishAt = nativePublishRaw ? new Date(nativePublishRaw).toISOString() : null;
+  const target = platform === "youtube" ? `YouTube (${publishAt ? "예약 공개" : privacy})` : platform === "tiktok" ? `TikTok (${privacy})` : "Instagram Reels";
   if (!confirm(`${target}에 실제 게시를 요청합니다. 되돌릴 수 있는 삭제 기능은 제공되지 않습니다. 계속할까요?`)) return;
   const authTab = platform === "youtube" ? window.open("about:blank", "_blank") : null;
   if (authTab) {
@@ -1032,7 +1402,7 @@ async function publishItem(platform) {
     state.oauthTabs.youtube = authTab;
   }
   try {
-    await api(`/api/items/${state.selectedId}/publish`, { method: "POST", body: JSON.stringify({ platform, confirm: true, privacy_status: privacy }) });
+    await api(`/api/items/${state.selectedId}/publish`, { method: "POST", body: JSON.stringify({ platform, confirm: true, privacy_status: privacy, publish_at: publishAt }) });
     toast(`${target} 게시 작업을 시작했습니다.`);
     await refresh(state.selectedId);
   } catch (error) {
@@ -1040,6 +1410,208 @@ async function publishItem(platform) {
     if (platform === "youtube") delete state.oauthTabs.youtube;
     toast(error.message);
   }
+}
+
+async function addDirectUrlResearch(itemId) {
+  const input = document.getElementById("direct-url-input");
+  const url = String(input?.value || "").trim();
+  if (!url) return toast("추출할 공개 HTTPS URL을 입력하세요.");
+  try {
+    await api(`/api/items/${itemId}/research/url`, { method: "POST", body: JSON.stringify({ url }) });
+    toast("URL 본문을 추출해 출처에 추가했습니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+}
+
+async function toggleResearchSourceInclusion(itemId, sourceId, included) {
+  try {
+    await api(`/api/items/${itemId}/research/sources/${encodeURIComponent(sourceId)}`, { method: "PUT", body: JSON.stringify({ included }) });
+    toast(included ? "출처를 기획 근거에 포함했습니다." : "출처를 기획 근거에서 제외했습니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+}
+
+async function cancelItemJob(itemId) {
+  try {
+    await api(`/api/items/${itemId}/cancel`, { method: "POST" });
+    toast("작업 취소를 요청했습니다. 현재 단계 종료 후 중단됩니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+}
+
+async function updateYouTubePrivacy(itemId) {
+  const privacy = document.getElementById("yt-post-privacy")?.value || "private";
+  try {
+    await api(`/api/items/${itemId}/youtube/privacy`, { method: "PATCH", body: JSON.stringify({ privacy_status: privacy }) });
+    toast(`YouTube 공개 범위를 ${privacy}로 변경했습니다.`);
+  } catch (error) { toast(error.message); }
+}
+
+async function cleanupR2Object(itemId) {
+  try {
+    await api(`/api/items/${itemId}/r2/cleanup`, { method: "POST" });
+    toast("R2 임시 스테이징 파일을 정리했습니다.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
+}
+
+async function openAnalyticsDashboard() {
+  try {
+    const data = await api("/api/analytics/dashboard");
+    state.dashboard = data;
+    renderAnalyticsDashboard(data);
+    document.getElementById("analytics-dashboard-dialog").showModal();
+  } catch (error) { toast(error.message); }
+}
+
+function renderAnalyticsDashboard(data) {
+  const container = document.getElementById("analytics-dashboard-content");
+  if (!container) return;
+  const platforms = Object.entries(data.platforms || {}).map(([name, info]) => `<div class="analytics-summary"><strong>${escapeHtml(name.toUpperCase())} · 게시 ${info.published_count}건</strong><span>총 조회수 ${escapeHtml(info.total_views)}</span><span>중앙 반응률 ${info.median_engagement_rate === null ? "—" : `${(info.median_engagement_rate * 100).toFixed(1)}%`}</span><span>조회당 시청 ${info.median_watch_seconds_per_view ?? "—"}초</span></div>`).join("");
+  const seriesRows = (data.series || []).map(row => `<tr><td>${escapeHtml(row.series_name)}</td><td>${row.posts}</td><td>${row.total_views}</td><td>${row.median_engagement_rate === null ? "—" : `${(row.median_engagement_rate * 100).toFixed(1)}%`}</td></tr>`).join("");
+  const postRows = (data.recent_posts || []).map(row => `<tr><td>${escapeHtml(row.title)}</td><td>${escapeHtml(row.platform)}</td><td>${escapeHtml(row.series_name)}</td><td>${row.views ?? "—"}</td><td>${row.engagement_rate === null ? "—" : `${(row.engagement_rate * 100).toFixed(1)}%`}</td></tr>`).join("");
+  container.innerHTML = `<div class="analytics-summary-list">${platforms}</div><h4>시리즈별 성과</h4><table class="dashboard-table"><thead><tr><th>시리즈</th><th>게시</th><th>총 조회</th><th>중앙 반응률</th></tr></thead><tbody>${seriesRows || '<tr><td colspan="4">기록된 게시물이 없습니다.</td></tr>'}</tbody></table><h4>최근 게시물</h4><table class="dashboard-table"><thead><tr><th>제목</th><th>채널</th><th>시리즈</th><th>조회</th><th>반응률</th></tr></thead><tbody>${postRows || '<tr><td colspan="5">기록된 게시물이 없습니다.</td></tr>'}</tbody></table>`;
+}
+
+async function importAnalyticsCsv(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append("csv_file", file);
+  try {
+    const res = await api("/api/analytics/import", { method: "POST", body: form });
+    toast(`CSV 가져오기 완료: ${res.imported}건 반영, ${res.skipped}건 건너뜀`);
+    await openAnalyticsDashboard();
+    await refresh(state.selectedId);
+  } catch (error) { toast(error.message); }
+  finally { event.target.value = ""; }
+}
+
+const SECRET_FIELD_DEFS = [
+  ["OPENAI_API_KEY", "OpenAI API Key", "openai"],
+  ["OPENAI_MODEL", "OpenAI 기본 모델 (예: gpt-4.1-mini)", null],
+  ["ANTHROPIC_API_KEY", "Anthropic Claude API Key", "anthropic"],
+  ["TAVILY_API_KEY", "Tavily 웹 조사 API Key", "tavily"],
+  ["PEXELS_API_KEY", "Pexels 스톡 영상 API Key", "pexels"],
+  ["RUNWAY_API_KEY", "Runway 영상 생성 API Key", "runway"],
+  ["RUNWAY_MODEL", "Runway 모델 (기본 seedance2_5)", null],
+  ["ELEVENLABS_API_KEY", "ElevenLabs TTS API Key", "elevenlabs"],
+  ["ELEVENLABS_VOICE_ID", "ElevenLabs Voice ID", null],
+  ["YOUTUBE_CLIENT_SECRETS_FILE", "YouTube OAuth JSON 파일 경로", null],
+  ["INSTAGRAM_ACCESS_TOKEN", "Instagram Access Token", null],
+  ["INSTAGRAM_USER_ID", "Instagram User ID", null],
+  ["R2_ACCOUNT_ID", "Cloudflare R2 Account ID", null],
+  ["R2_ACCESS_KEY_ID", "Cloudflare R2 Access Key ID", null],
+  ["R2_SECRET_ACCESS_KEY", "Cloudflare R2 Secret Access Key", null],
+  ["R2_BUCKET", "Cloudflare R2 Bucket 이름", null],
+  ["R2_PUBLIC_BASE_URL", "Cloudflare R2 공개 버킷 URL", null],
+  ["TIKTOK_ACCESS_TOKEN", "TikTok Access Token", "tiktok"]
+];
+
+async function openSecretsSettings() {
+  try {
+    state.secretsStatus = await api("/api/settings/secrets");
+    const container = document.getElementById("secrets-fields-container");
+    container.innerHTML = SECRET_FIELD_DEFS.map(([key, label, testProvider]) => {
+      const configured = Boolean(state.secretsStatus[key]);
+      const isSecret = key.includes("KEY") || key.includes("TOKEN") || key.includes("SECRET");
+      const testBtn = testProvider ? `<button class="button test-provider-btn" type="button" data-provider="${testProvider}">연결 테스트</button>` : "";
+      return `<div class="secret-row"><label>${escapeHtml(label)} <span class="badge ${configured ? "good" : ""}">${configured ? "설정됨" : "미설정"}</span><input name="${key}" type="${isSecret ? "password" : "text"}" autocomplete="off" placeholder="${configured ? "변경 시에만 새 값 입력" : "값 입력"}"></label>${testBtn}</div>`;
+    }).join("");
+    container.querySelectorAll(".test-provider-btn").forEach(btn => btn.addEventListener("click", async () => {
+      try {
+        const res = await api(`/api/settings/test/${btn.dataset.provider}`, { method: "POST" });
+        toast(res.message || (res.ok ? "연결 성공" : "연결 실패"));
+      } catch (error) { toast(error.message); }
+    }));
+    document.getElementById("secrets-settings-dialog").showModal();
+  } catch (error) { toast(error.message); }
+}
+
+async function saveSecretsSettings(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const updates = {};
+  SECRET_FIELD_DEFS.forEach(([key]) => {
+    const val = String(form.elements.namedItem(key)?.value || "").trim();
+    if (val) updates[key] = val;
+  });
+  try {
+    state.secretsStatus = await api("/api/settings/secrets", { method: "PUT", body: JSON.stringify({ updates, clear_keys: [] }) });
+    document.getElementById("secrets-settings-dialog").close();
+    toast(".env 설정을 저장했습니다.");
+    await refresh(state.selectedId);
+  } catch (error) { toast(error.message); }
+}
+
+async function duplicateItem(itemId) {
+  try {
+    const duplicated = await api(`/api/items/${itemId}/duplicate`, { method: "POST" });
+    state.selectedId = duplicated.id;
+    toast("콘텐츠 작업을 복제했습니다.");
+    await refresh(duplicated.id);
+  } catch (error) { toast(error.message); }
+}
+
+async function toggleArchiveItem(itemId, archived) {
+  try {
+    await api(`/api/items/${itemId}/archive`, { method: "POST", body: JSON.stringify({ archived }) });
+    toast(archived ? "작업을 보관함으로 이동했습니다." : "작업을 보관함에서 복구했습니다.");
+    await refresh(archived ? null : itemId);
+  } catch (error) { toast(error.message); }
+}
+
+async function deleteItem(itemId) {
+  if (!confirm("이 콘텐츠 작업과 로컬 미디어 파일을 삭제합니다. 되돌릴 수 없습니다. 계속할까요?")) return;
+  try {
+    await api(`/api/items/${itemId}`, { method: "DELETE" });
+    delete state.subtitlesCache[itemId];
+    toast("콘텐츠 작업을 삭제했습니다.");
+    await refresh(null);
+  } catch (error) { toast(error.message); }
+}
+
+async function loadItemSubtitles(itemId) {
+  try {
+    const data = await api(`/api/items/${itemId}/subtitles`);
+    state.subtitlesCache[itemId] = data;
+    const form = document.getElementById("subtitle-editor-form");
+    if (form) {
+      form.elements.namedItem("srt").value = data.srt || "";
+      form.elements.namedItem("preset").value = data.style?.preset || "clean_bottom";
+      form.elements.namedItem("font_size").value = String(data.style?.font_size ?? 42);
+      form.elements.namedItem("margin_v").value = String(data.style?.margin_v ?? 170);
+      form.elements.namedItem("alignment").value = String(data.style?.alignment ?? 2);
+    }
+    toast(data.srt ? "저장된 자막을 불러왔습니다." : "저장된 SRT 자막이 아직 없습니다. 직접 입력해 적용할 수 있습니다.");
+  } catch (error) { toast(error.message); }
+}
+
+async function saveItemSubtitles(event, itemId) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const data = new FormData(form);
+  const presetKey = String(data.get("preset") || "clean_bottom");
+  const preset = SUBTITLE_PRESETS[presetKey] || SUBTITLE_PRESETS.clean_bottom;
+  const style = {
+    preset: presetKey,
+    font_size: Number(data.get("font_size") || preset.font_size),
+    margin_v: Number(data.get("margin_v") || preset.margin_v),
+    alignment: Number(data.get("alignment") || preset.alignment),
+    outline: preset.outline,
+    shadow: preset.shadow,
+    primary_colour: preset.primary_colour,
+    outline_colour: preset.outline_colour
+  };
+  try {
+    await api(`/api/items/${itemId}/subtitles`, {
+      method: "PUT",
+      body: JSON.stringify({ srt: String(data.get("srt") || ""), style, rerender: true })
+    });
+    state.subtitlesCache[itemId] = { srt: String(data.get("srt") || ""), style };
+    toast("자막과 스타일을 적용해 영상을 다시 렌더링했습니다. 재검수 후 승인하세요.");
+    await refresh(itemId);
+  } catch (error) { toast(error.message); }
 }
 
 async function runAction(path, method, message) {
@@ -1111,6 +1683,9 @@ async function selectItem(itemId) {
 }
 
 document.querySelectorAll(".mobile-nav [data-mobile-view]").forEach(button => button.addEventListener("click", () => setMobileView(button.dataset.mobileView)));
+document.getElementById("item-search")?.addEventListener("input", event => { state.filters.query = event.target.value; renderList(); });
+document.getElementById("item-stage-filter")?.addEventListener("change", event => { state.filters.stage = event.target.value; renderList(); });
+document.getElementById("item-platform-filter")?.addEventListener("change", event => { state.filters.platform = event.target.value; renderList(); });
 document.getElementById("new-item-form").addEventListener("submit", createItem);
 document.getElementById("series-template-select").addEventListener("change", applySelectedSeriesTemplate);
 document.getElementById("refresh-button").addEventListener("click", () => refresh().catch(error => toast(error.message)));

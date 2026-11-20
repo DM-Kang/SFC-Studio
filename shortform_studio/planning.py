@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from .ai import generate_json
@@ -20,8 +21,8 @@ def _bounded_text(value: Any, name: str, maximum: int) -> str:
 
 def make_template_plan(brief: dict[str, Any]) -> dict[str, Any]:
     """@brief Create a clearly labeled local preview when no text model is configured."""
-    topic = brief["topic"].strip()
-    language = brief.get("language", "Korean")
+    topic = str(brief.get("topic") or "").strip()
+    language = str(brief.get("language") or "Korean")
     korean = language.lower() in {"korean", "ko", "한국어"}
     if korean:
         hook = f"{topic}에서 놓치기 쉬운 핵심 한 가지"
@@ -191,3 +192,130 @@ def review_plan(brief: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
         "safety_check": result.get("safety_check", "not_verified"),
         "reviewed_by": model,
     }
+
+
+def normalize_editable_scenes(scenes: Any, fallback_script: str, topic: str) -> list[dict[str, Any]]:
+    """@brief Validate user-edited scenes with optional per-scene duration bounds."""
+    normalized: list[dict[str, Any]] = []
+    if isinstance(scenes, list):
+        for scene in scenes[:8]:
+            if not isinstance(scene, dict):
+                continue
+            narration = str(scene.get("narration") or "").strip()
+            visual_query = str(scene.get("visual_query") or "").strip()
+            if not narration and not visual_query:
+                continue
+            entry: dict[str, Any] = {
+                "id": f"scene-{len(normalized) + 1}",
+                "narration": (narration or fallback_script)[:800],
+                "visual_query": (visual_query or f"{topic} vertical background")[:200],
+            }
+            duration = scene.get("duration_seconds")
+            if isinstance(duration, (int, float)) and not isinstance(duration, bool) and 1 <= float(duration) <= 30:
+                entry["duration_seconds"] = round(float(duration), 1)
+            normalized.append(entry)
+    if not normalized:
+        normalized.append({"id": "scene-1", "narration": fallback_script[:800], "visual_query": f"{topic} vertical background"[:200]})
+    return normalized
+
+
+def suggest_hooks(brief: dict[str, Any], plan: dict[str, Any], use_ai: bool, count: int = 5) -> list[str]:
+    """@brief Propose multiple opening hooks for an existing brief and plan."""
+    topic = str(brief.get("topic") or plan.get("title") or "").strip()
+    language = str(brief.get("language") or "Korean").strip()
+    bounded_count = max(1, min(int(count), 8))
+    if not use_ai:
+        if language.lower() in {"korean", "ko", "한국어"}:
+            candidates = [
+                f"{topic}, 아직도 이렇게 하고 계신가요?",
+                f"딱 30초만 투자하면 {topic} 보는 눈이 달라집니다.",
+                f"{topic}에서 90%가 놓치는 결정적 포인트 한 가지",
+                f"지금 바로 확인해야 할 {topic} 핵심 정리",
+                f"왜 전문가들은 {topic}을 볼 때 이것부터 확인할까요?",
+            ]
+        else:
+            candidates = [
+                f"Are you still overlooking this about {topic}?",
+                f"Here is what most people miss about {topic}.",
+                f"Three seconds to rethink how you approach {topic}.",
+                f"The one detail that changes everything in {topic}.",
+                f"Before you try {topic}, check this first.",
+            ]
+        return [item[:240] for item in candidates[:bounded_count]]
+    system_prompt = (
+        "You are a short-form video hook specialist. Return exactly one JSON object with key 'hooks' containing "
+        f"an array of {bounded_count} distinct, concise, curiosity-driven opening sentences in {language}. "
+        "Do not invent unsupported factual claims."
+    )
+    user_prompt = (
+        f"Topic: {topic}\nAudience: {brief.get('audience', '')}\nTone: {brief.get('tone', '')}\n"
+        f"Current hook: {plan.get('hook', '')}\nCurrent script: {plan.get('script', '')[:1500]}"
+    )
+    result, _model = generate_json(system_prompt, user_prompt, stage="planning")
+    raw_hooks = result.get("hooks")
+    if not isinstance(raw_hooks, list) or not raw_hooks:
+        raise ValueError("AI hook response must include a non-empty hooks list.")
+    cleaned = [str(entry).strip()[:240] for entry in raw_hooks if isinstance(entry, str) and entry.strip()]
+    if not cleaned:
+        raise ValueError("AI hook response contained no valid hook text.")
+    return cleaned[:bounded_count]
+
+
+def autofix_plan_with_review(brief: dict[str, Any], plan: dict[str, Any], review: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """@brief Ask the planning model to revise a draft to address review issues."""
+    issues = review.get("editorial", {}).get("issues", []) if isinstance(review.get("editorial"), dict) else []
+    unverified = review.get("unverified_claims", [])
+    preflight_blocked = [
+        check.get("message")
+        for check in (review.get("preflight", {}) or {}).get("checks", [])
+        if isinstance(check, dict) and check.get("status") == "blocked"
+    ]
+    user_prompt = (
+        f"Original brief: {json.dumps(brief, ensure_ascii=False)}\n"
+        f"Current draft: {json.dumps({k: plan.get(k) for k in ('title', 'hook', 'script', 'caption', 'hashtags', 'video_prompt', 'duration_seconds', 'scenes')}, ensure_ascii=False)}\n"
+        f"Editorial issues to fix: {json.dumps(issues, ensure_ascii=False)}\n"
+        f"Unverified claims to soften or remove unless supported by sources: {json.dumps(unverified, ensure_ascii=False)}\n"
+        f"Preflight blockers to resolve: {json.dumps(preflight_blocked, ensure_ascii=False)}\n"
+        f"Available fetched sources: {json.dumps(plan.get('sources', []), ensure_ascii=False)}\n"
+        "Revise the plan to resolve these issues while keeping the requested language, tone, and factual caution."
+    )
+    result, model = generate_json(PLANNER_SYSTEM_PROMPT, user_prompt, stage="planning")
+    hashtags = result.get("hashtags", [])
+    claims = result.get("claims", [])
+    duration = result.get("duration_seconds", plan.get("duration_seconds", 30))
+    if not isinstance(hashtags, list) or not all(isinstance(tag, str) for tag in hashtags):
+        raise ValueError("Revised hashtags must be a list of text values.")
+    if not isinstance(claims, list) or not all(isinstance(claim, dict) for claim in claims):
+        raise ValueError("Revised claims must be a list of objects.")
+    if isinstance(duration, bool) or not isinstance(duration, int) or not 4 <= duration <= 30:
+        duration = int(plan.get("duration_seconds") or 30)
+    sources = plan.get("sources", [])
+    source_ids = {source["id"] for source in sources if isinstance(source, dict) and isinstance(source.get("id"), str)}
+    revised = {
+        **plan,
+        "title": _bounded_text(result.get("title"), "title", 100),
+        "hook": _bounded_text(result.get("hook"), "hook", 240),
+        "script": _bounded_text(result.get("script"), "script", 6000),
+        "caption": _bounded_text(result.get("caption"), "caption", 5000),
+        "hashtags": [tag.strip()[:80] for tag in hashtags[:20] if tag.strip()],
+        "video_prompt": _bounded_text(result.get("video_prompt"), "video_prompt", 1000),
+        "duration_seconds": duration,
+        "claims": _normalize_claims(claims, source_ids),
+        "scenes": _normalize_scenes(result.get("scenes"), str(result.get("script") or ""), str(brief.get("topic") or "")),
+        "generated_by": f"{model} (autofix)",
+    }
+    return revised, model
+
+
+def estimate_speaking_duration(script: str, language: str = "Korean") -> dict[str, Any]:
+    """@brief Estimate spoken narration duration from script length and language pace."""
+    cleaned = str(script or "").strip()
+    if not cleaned:
+        return {"estimated_seconds": 0.0, "unit_count": 0, "unit_label": "chars"}
+    lang = str(language or "").strip().lower()
+    if lang in {"korean", "ko", "한국어", "japanese", "ja", "日本語"}:
+        syllables = len(re.sub(r"[\s\.,!?;:\"'()\[\]{}\-_/\\~`]+", "", cleaned))
+        rate = 5.5 if lang in {"japanese", "ja", "日本語"} else 5.2
+        return {"estimated_seconds": round(syllables / rate, 1), "unit_count": syllables, "unit_label": "chars"}
+    words = len(re.findall(r"\S+", cleaned))
+    return {"estimated_seconds": round(words / 2.4, 1), "unit_count": words, "unit_label": "words"}

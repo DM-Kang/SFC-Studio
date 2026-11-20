@@ -18,7 +18,7 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -27,11 +27,14 @@ from .config import (
     PROJECT_ROOT,
     get_app_home,
     get_database_path,
+    get_managed_secrets_status,
     get_projects_dir,
     get_secret,
+    is_allowed_request_origin,
     load_local_environment,
+    update_local_env_secrets,
 )
-from .analytics import summarize_analytics, summarize_experiment
+from .analytics import build_analytics_dashboard, export_analytics_csv, parse_analytics_csv, summarize_analytics, summarize_experiment
 from .ai import ai_status
 from .ai_config import save_ai_settings
 from .ai_providers import disconnect_chatgpt_oauth, disconnect_gemini_oauth, start_oauth_login
@@ -39,22 +42,35 @@ from .brand import default_brand_settings, find_series_template, normalize_brand
 from .oauth_callbacks import get_authorization_urls
 from .preflight import build_publish_preflight, combine_review_status, rights_assets_fingerprint
 from .backups import MAX_BACKUP_BYTES, create_backup_archive, restore_backup_archive
-from .publishing import PublicationError, instagram_ready, youtube_ready, youtube_scheduling_ready
+from .publishing import PublicationError, instagram_ready, tiktok_ready, youtube_ready, youtube_scheduling_ready
 from .platform_content import copy_fingerprint, platform_plan
-from .resources import validate_external_url
+from .resources import test_provider_connection, validate_external_url
 from .store import Store
 from .workflow import (
+    add_direct_url_research,
     can_reuse_video_for_plan,
+    change_youtube_privacy,
+    cleanup_instagram_r2_object,
+    delete_item_media,
+    download_stock_material_clip,
+    get_subtitles_state,
     item_directory,
     revise_plan,
     run_content_review,
+    run_hook_suggestions,
+    run_plan_autofix,
     run_planning,
+    run_postprocess_video,
     run_publication,
+    run_scene_assembly,
     run_stock_material_search,
     run_video_generation,
     run_web_research,
     replace_final_video_rights_record,
+    save_subtitles_and_rerender,
+    save_thumbnail_from_video,
     sha256_file,
+    toggle_research_source_inclusion,
 )
 
 load_local_environment()
@@ -77,11 +93,20 @@ class NewItem(BaseModel):
     audience: str = Field(default="General audience", max_length=300)
     tone: str = Field(default="Clear and engaging", max_length=200)
     language: str = Field(default="Korean", max_length=50)
-    platforms: list[str] = Field(default_factory=lambda: ["youtube"], min_length=1, max_length=2)
+    platforms: list[str] = Field(default_factory=lambda: ["youtube"], min_length=1, max_length=3)
     duration_seconds: int = Field(default=30, ge=4, le=30)
     source_notes: str = Field(default="", max_length=12000)
     synthetic_media: bool = True
     series_template_id: str | None = Field(default=None, max_length=36)
+
+
+class SceneEditInput(BaseModel):
+    """Validate one editable chronological scene inside a plan."""
+
+    id: str = Field(default="", max_length=24)
+    narration: str = Field(default="", max_length=800)
+    visual_query: str = Field(default="", max_length=200)
+    duration_seconds: float | None = Field(default=None, ge=1.0, le=30.0)
 
 
 class PlanEdit(BaseModel):
@@ -93,6 +118,48 @@ class PlanEdit(BaseModel):
     caption: str = Field(min_length=1, max_length=5000)
     video_prompt: str = Field(min_length=1, max_length=1000)
     hashtags: list[str] = Field(default_factory=list, max_length=20)
+    scenes: list[SceneEditInput] | None = Field(default=None, max_length=8)
+
+
+class SceneAssemblyClipInput(BaseModel):
+    """Validate one scene clip assignment for FFmpeg multi-scene assembly."""
+
+    source_kind: Literal["pexels", "uploaded", "source"]
+    provider_id: str = Field(default="", max_length=80)
+    filename: str = Field(default="", max_length=180)
+    duration_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
+
+
+class SceneAssemblyRequest(BaseModel):
+    """Validate multi-scene assembly options."""
+
+    scenes: list[SceneAssemblyClipInput] = Field(min_length=1, max_length=8)
+    transition: Literal["cut", "fade"] = "cut"
+    tts_provider: Literal["auto", "elevenlabs", "openai_tts", "none"] = "auto"
+    tts_voice: str = Field(default="", max_length=80)
+    bgm_volume: float = Field(default=0.18, ge=0.02, le=1.0)
+    ducking: bool = True
+    loudnorm: bool = False
+    subtitle_style: SubtitleStyleInput | None = None
+
+
+class PostprocessRequest(BaseModel):
+    """Validate post-processing options for an uploaded or generated MP4."""
+
+    apply_subtitles: bool = True
+    apply_bgm: bool = True
+    bgm_volume: float = Field(default=0.18, ge=0.02, le=1.0)
+    ducking: bool = True
+    loudnorm: bool = True
+    tts_provider: Literal["none", "auto", "elevenlabs", "openai_tts"] = "none"
+    tts_voice: str = Field(default="", max_length=80)
+    subtitle_style: SubtitleStyleInput | None = None
+
+
+class ThumbnailExtractRequest(BaseModel):
+    """Validate extracting a cover frame timestamp from the current video."""
+
+    timestamp_seconds: float = Field(default=0.5, ge=0.0, le=180.0)
 
 
 class ApprovalRequest(BaseModel):
@@ -108,6 +175,32 @@ class PublishRequest(BaseModel):
     platform: str
     confirm: bool
     privacy_status: str = "private"
+    publish_at: datetime | None = None
+
+
+class YouTubePrivacyUpdateRequest(BaseModel):
+    """Validate updating a published YouTube video's visibility."""
+
+    privacy_status: Literal["private", "unlisted", "public"]
+
+
+class SecretsUpdateRequest(BaseModel):
+    """Validate updating local .env secrets without returning raw secret values."""
+
+    updates: dict[str, str] = Field(default_factory=dict)
+    clear_keys: list[str] = Field(default_factory=list)
+
+
+class DirectUrlResearchRequest(BaseModel):
+    """Validate a public HTTPS URL for direct evidence extraction."""
+
+    url: str = Field(min_length=10, max_length=2048)
+
+
+class SourceInclusionRequest(BaseModel):
+    """Validate toggling whether a collected source is included in planning prompts."""
+
+    included: bool
 
 
 class AIStageSelection(BaseModel):
@@ -150,7 +243,7 @@ class SeriesTemplateInput(BaseModel):
     tone: str = Field(default="", max_length=200)
     language: str = Field(default="", max_length=50)
     duration_seconds: int = Field(default=30, ge=4, le=30)
-    platforms: list[Literal["youtube", "instagram"]] = Field(default_factory=lambda: ["youtube"], min_length=1, max_length=2)
+    platforms: list[Literal["youtube", "instagram", "tiktok"]] = Field(default_factory=lambda: ["youtube"], min_length=1, max_length=3)
     call_to_action: str = Field(default="", max_length=300)
     key_points: list[str] = Field(default_factory=list, max_length=15)
 
@@ -237,7 +330,7 @@ class ExperimentInput(BaseModel):
 
     name: str = Field(min_length=1, max_length=160)
     hypothesis: str = Field(default="", max_length=1000)
-    platform: Literal["youtube", "instagram"]
+    platform: Literal["youtube", "instagram", "tiktok"]
     item_a: str = Field(min_length=36, max_length=36)
     item_b: str = Field(min_length=36, max_length=36)
     label_a: str = Field(default="A", min_length=1, max_length=40)
@@ -248,6 +341,34 @@ class ExperimentStatusInput(BaseModel):
     """Validate an explicit active/completed state transition for an experiment."""
 
     status: Literal["active", "completed"]
+
+
+class ArchiveRequest(BaseModel):
+    """Validate an item archive toggle."""
+
+    archived: bool
+
+
+class SubtitleStyleInput(BaseModel):
+    """Validate subtitle rendering style options."""
+
+    preset: Literal["clean_bottom", "bold_center", "yellow_pop", "top_news"] = "clean_bottom"
+    font_name: str = Field(default="", max_length=64)
+    font_size: int = Field(default=42, ge=18, le=96)
+    margin_v: int = Field(default=170, ge=10, le=600)
+    outline: int = Field(default=3, ge=0, le=10)
+    shadow: int = Field(default=1, ge=0, le=6)
+    alignment: Literal[2, 5, 8] = 2
+    primary_colour: str = Field(default="&H00FFFFFF", max_length=10)
+    outline_colour: str = Field(default="&H00000000", max_length=10)
+
+
+class SubtitleUpdateRequest(BaseModel):
+    """Validate edited SRT captions and optional FFmpeg rerendering."""
+
+    srt: str = Field(min_length=1, max_length=200000)
+    style: SubtitleStyleInput = Field(default_factory=SubtitleStyleInput)
+    rerender: bool = True
 
 
 def _get_item(item_id: str) -> dict[str, Any]:
@@ -368,6 +489,8 @@ def _dispatch_due_schedules() -> None:
                 raise HTTPException(status_code=503, detail="Scheduled YouTube publishing needs a saved refreshable OAuth session.")
             if platform == "instagram" and not instagram_ready():
                 raise HTTPException(status_code=503, detail="Instagram credentials or public media storage are no longer ready.")
+            if platform == "tiktok" and not tiktok_ready():
+                raise HTTPException(status_code=503, detail="TIKTOK_ACCESS_TOKEN is no longer configured.")
             _schedule(
                 item_id,
                 "publishing",
@@ -458,16 +581,14 @@ def _schedule(item_id: str, stage: str, action: Any, platform: str | None = None
 
 @app.middleware("http")
 async def restrict_to_local_browser(request: Any, call_next: Any) -> Any:
-    """@brief Restrict host and browser-origin headers to this local instance."""
-    allowed_hosts = {"localhost", "127.0.0.1", "::1"}
-    host = urlsplit(f"//{request.headers.get('host', '')}").hostname
-    if host not in allowed_hosts:
-        return JSONResponse(status_code=403, content={"detail": "This application is available only on the local computer."})
-    origin = request.headers.get("origin")
-    if origin:
-        parsed = urlsplit(origin)
-        if parsed.scheme != "http" or parsed.hostname not in allowed_hosts or parsed.port not in {None, 8765}:
-            return JSONResponse(status_code=403, content={"detail": "Cross-origin browser requests are not allowed."})
+    """@brief Restrict host and browser-origin headers to local and configured Tailscale hosts."""
+    allowed, detail = is_allowed_request_origin(
+        request.headers.get("host", ""),
+        request.headers.get("origin"),
+        get_secret("SHORTFORM_STUDIO_ALLOWED_HOSTS"),
+    )
+    if not allowed:
+        return JSONResponse(status_code=403, content={"detail": detail})
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
@@ -517,12 +638,40 @@ def settings() -> dict[str, Any]:
         "runway_ready": bool(get_secret("RUNWAY_API_KEY")),
         "runway_model": get_secret("RUNWAY_MODEL", "seedance2_5"),
         "elevenlabs_ready": bool(get_secret("ELEVENLABS_API_KEY") and get_secret("ELEVENLABS_VOICE_ID")),
+        "openai_tts_ready": bool(get_secret("OPENAI_API_KEY")),
         "youtube_ready": youtube_ready(),
         "instagram_ready": instagram_ready(),
+        "tiktok_ready": tiktok_ready(),
         "ffmpeg_ready": bool(shutil.which("ffmpeg")),
         "app_home": str(get_app_home()),
         "oauth_authorization_urls": get_authorization_urls(),
     }
+
+
+@app.get("/api/settings/secrets")
+def get_secrets_status() -> dict[str, bool]:
+    """@brief Return configured status flags for managed .env keys without exposing secret values."""
+    return get_managed_secrets_status()
+
+
+@app.put("/api/settings/secrets")
+def save_secrets_status(request: SecretsUpdateRequest) -> dict[str, bool]:
+    """@brief Atomically merge updated API keys into the local .env file."""
+    try:
+        return update_local_env_secrets(request.updates, clear_keys=request.clear_keys)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+
+@app.post("/api/settings/test/{provider}")
+def test_provider_endpoint(provider: str) -> dict[str, Any]:
+    """@brief Run a lightweight connectivity check for an external API provider."""
+    try:
+        return test_provider_connection(provider)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from None
+    except RuntimeError as error:
+        return {"ok": False, "message": str(error)}
 
 
 @app.get("/api/brand")
@@ -550,6 +699,47 @@ def update_brand_settings(request: BrandSettingsUpdate) -> dict[str, Any]:
 def get_analytics_summary() -> dict[str, Any]:
     """@brief Aggregate only locally recorded metrics from successfully published items."""
     return summarize_analytics(store.list_items())
+
+
+@app.get("/api/analytics/dashboard")
+def get_analytics_dashboard() -> dict[str, Any]:
+    """@brief Return platform totals, per-series summaries, and recent post rows."""
+    return build_analytics_dashboard(store.list_items())
+
+
+@app.get("/api/analytics/export.csv")
+def export_analytics_csv_endpoint() -> PlainTextResponse:
+    """@brief Export manually recorded platform metrics as a UTF-8 CSV download."""
+    csv_body = export_analytics_csv(store.list_items())
+    return PlainTextResponse(
+        csv_body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="shortform-analytics.csv"'},
+    )
+
+
+@app.post("/api/analytics/import")
+async def import_analytics_csv_endpoint(csv_file: UploadFile = File(...)) -> dict[str, Any]:
+    """@brief Import validated analytics snapshots from a CSV file for published posts."""
+    raw = await csv_file.read(5_000_001)
+    await csv_file.close()
+    if len(raw) > 5_000_000:
+        raise HTTPException(status_code=413, detail="CSV upload exceeds 5 MB limit.")
+    try:
+        rows = parse_analytics_csv(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    imported = 0
+    skipped = 0
+    for row in rows:
+        item_id = row.pop("item_id")
+        platform = row.pop("platform")
+        try:
+            store.append_analytics_snapshot(item_id, platform, row)
+            imported += 1
+        except (KeyError, RuntimeError, ValueError):
+            skipped += 1
+    return {"imported": imported, "skipped": skipped}
 
 
 @app.get("/api/experiments")
@@ -683,17 +873,22 @@ def disconnect_chatgpt_provider() -> dict[str, Any]:
 
 
 @app.get("/api/items")
-def list_items() -> list[dict[str, Any]]:
-    """@brief Return recent content items for the local dashboard."""
-    return store.list_items()
+def list_items(
+    q: str = "",
+    stage: str = "",
+    platform: str = "",
+    include_archived: bool = True,
+) -> list[dict[str, Any]]:
+    """@brief Return recent content items for the local dashboard with optional filters."""
+    return store.list_items(query=q, stage=stage, platform=platform, include_archived=include_archived)
 
 
 @app.post("/api/items", status_code=201)
 def create_item(request: NewItem) -> dict[str, Any]:
     """@brief Validate and persist a new content brief."""
     values = request.model_dump()
-    if any(platform not in {"youtube", "instagram"} for platform in values["platforms"]):
-        raise HTTPException(status_code=422, detail="Platforms must be youtube and/or instagram.")
+    if any(platform not in {"youtube", "instagram", "tiktok"} for platform in values["platforms"]):
+        raise HTTPException(status_code=422, detail="Platforms must be youtube, instagram, and/or tiktok.")
     if len(set(values["platforms"])) != len(values["platforms"]):
         raise HTTPException(status_code=422, detail="Duplicate platform selections are not allowed.")
     values["topic"] = values["topic"].strip()
@@ -715,13 +910,82 @@ def get_item(item_id: str) -> dict[str, Any]:
     return _get_item(item_id)
 
 
+@app.post("/api/items/{item_id}/duplicate", status_code=201)
+def duplicate_item(item_id: str) -> dict[str, Any]:
+    """@brief Clone an existing item's brief and plan into a fresh unapproved draft."""
+    try:
+        return store.duplicate_item(item_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content item not found.") from None
+
+
+@app.post("/api/items/{item_id}/archive")
+def archive_item(item_id: str, request: ArchiveRequest) -> dict[str, Any]:
+    """@brief Archive or unarchive an item in the local workspace."""
+    try:
+        return store.set_item_archived(item_id, request.archived)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content item not found.") from None
+
+
+@app.delete("/api/items/{item_id}", status_code=204)
+def delete_item(item_id: str) -> None:
+    """@brief Delete an unpublished, idle item and remove its local media files."""
+    if not _worker_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Wait for the active workflow operation before deleting.")
+    try:
+        try:
+            deleted = store.delete_item(item_id)
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from None
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Content item not found.")
+        delete_item_media(item_id)
+    finally:
+        _worker_lock.release()
+
+
+@app.get("/api/items/{item_id}/subtitles")
+def get_item_subtitles(item_id: str) -> dict[str, Any]:
+    """@brief Return the item's saved SRT captions and subtitle style configuration."""
+    try:
+        return get_subtitles_state(store, item_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content item not found.") from None
+
+
+@app.put("/api/items/{item_id}/subtitles")
+def update_item_subtitles(item_id: str, request: SubtitleUpdateRequest) -> dict[str, Any]:
+    """@brief Save edited SRT subtitles, optionally rerender MP4, and reset approval."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    if item.get("active_job"):
+        raise HTTPException(status_code=409, detail="Wait for the active operation before updating subtitles.")
+    if not _worker_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Wait for the active workflow operation before rendering subtitles.")
+    try:
+        return save_subtitles_and_rerender(
+            store,
+            item_id,
+            request.srt,
+            request.style.model_dump(),
+            rerender=request.rerender,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    finally:
+        _worker_lock.release()
+
+
 @app.put("/api/items/{item_id}/platform-copy/{platform}")
 def update_platform_copy(item_id: str, platform: str, request: PlatformVariantInput) -> dict[str, Any]:
     """@brief Save channel-specific copy and invalidate any approval of older text."""
     item = _get_item(item_id)
     _ensure_mutable(item)
-    if platform not in {"youtube", "instagram"} or platform not in item.get("platforms", []):
-        raise HTTPException(status_code=422, detail="Select YouTube or Instagram for this content item first.")
+    if platform not in {"youtube", "instagram", "tiktok"} or platform not in item.get("platforms", []):
+        raise HTTPException(status_code=422, detail="Select YouTube, Instagram, or TikTok for this content item first.")
     if item.get("active_job"):
         raise HTTPException(status_code=409, detail="Wait for the active operation before editing platform copy.")
     title = request.title.strip()
@@ -850,7 +1114,7 @@ def update_item_rights(item_id: str, request: RightsAssetsUpdate) -> dict[str, A
 def record_analytics(item_id: str, platform: str, request: AnalyticsSnapshotInput) -> dict[str, Any]:
     """@brief Append a manually measured snapshot for a successfully published target."""
     item = _get_item(item_id)
-    if platform not in {"youtube", "instagram"}:
+    if platform not in {"youtube", "instagram", "tiktok"}:
         raise HTTPException(status_code=404, detail="Unsupported analytics platform.")
     publication = item.get("publications", {}).get(platform)
     if not publication or publication.get("status") != "published":
@@ -898,6 +1162,54 @@ def start_web_research(item_id: str) -> dict[str, str]:
     return {"job_id": job_id, "status": "researching"}
 
 
+@app.post("/api/items/{item_id}/research/url")
+def add_url_to_research(item_id: str, request: DirectUrlResearchRequest) -> dict[str, Any]:
+    """@brief Fetch a single public HTTPS URL directly into the item's citable sources."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    try:
+        return add_direct_url_research(store, item_id, request.url)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+
+
+@app.put("/api/items/{item_id}/research/sources/{source_id}")
+def update_research_source_inclusion(item_id: str, source_id: str, request: SourceInclusionRequest) -> dict[str, Any]:
+    """@brief Include or exclude a collected research source from planning prompts."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    try:
+        return toggle_research_source_inclusion(store, item_id, source_id, request.included)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Research source not found.") from None
+
+
+@app.get("/api/items/{item_id}/progress")
+def get_item_progress(item_id: str) -> dict[str, Any]:
+    """@brief Return active job progress and cooperative cancellation state."""
+    item = _get_item(item_id)
+    return {
+        "stage": item.get("stage"),
+        "active_job": item.get("active_job"),
+        "progress": item.get("job_progress"),
+        "cancel_requested": bool(item.get("cancel_requested")),
+    }
+
+
+@app.post("/api/items/{item_id}/cancel")
+def cancel_item_job(item_id: str) -> dict[str, Any]:
+    """@brief Request cooperative cancellation for an in-progress workflow job."""
+    try:
+        updated = store.request_job_cancel(item_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content item not found.") from None
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    return {"cancel_requested": bool(updated.get("cancel_requested"))}
+
+
 @app.post("/api/items/{item_id}/materials", status_code=202)
 def start_material_search(item_id: str) -> dict[str, str]:
     """@brief Start explicit Pexels footage discovery for generated plan scenes."""
@@ -922,10 +1234,262 @@ def edit_plan(item_id: str, request: PlanEdit) -> dict[str, Any]:
     if not isinstance(item.get("plan"), dict):
         raise HTTPException(status_code=409, detail="Generate a plan before editing it.")
     try:
-        revise_plan(store, item_id, request.model_dump())
+        payload = request.model_dump()
+        if payload.get("scenes") is None:
+            payload.pop("scenes", None)
+        revise_plan(store, item_id, payload)
     except (KeyError, RuntimeError):
         raise HTTPException(status_code=409, detail="The plan changed while it was being edited; refresh and try again.") from None
     return _get_item(item_id)
+
+
+@app.post("/api/items/{item_id}/plan/hooks")
+def suggest_item_hooks(item_id: str) -> dict[str, Any]:
+    """@brief Generate alternative opening hook suggestions for the current plan."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    if not isinstance(item.get("plan"), dict):
+        raise HTTPException(status_code=409, detail="Generate a plan before requesting hook variations.")
+    try:
+        hooks = run_hook_suggestions(store, item_id)
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    return {"hooks": hooks}
+
+
+@app.post("/api/items/{item_id}/plan/autofix")
+def autofix_item_plan(item_id: str) -> dict[str, Any]:
+    """@brief Ask the planning model to revise the draft using latest review feedback."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    if item.get("active_job"):
+        raise HTTPException(status_code=409, detail="Wait for the active operation before auto-fixing.")
+    try:
+        return run_plan_autofix(store, item_id)
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+
+
+@app.post("/api/items/{item_id}/materials/{provider_id}/download")
+def download_material_clip(item_id: str, provider_id: str) -> dict[str, Any]:
+    """@brief Download one Pexels stock video candidate locally for multi-scene assembly."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    try:
+        return download_stock_material_clip(store, item_id, provider_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Stock video candidate not found.") from None
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+
+
+@app.post("/api/items/{item_id}/clips", status_code=201)
+async def upload_scene_clip(item_id: str, clip: UploadFile = File(...)) -> dict[str, Any]:
+    """@brief Upload a local MP4/MOV/image clip for multi-scene FFmpeg assembly."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    raw_name = Path(clip.filename or "clip.mp4").name
+    ext = Path(raw_name).suffix.lower()
+    if ext not in {".mp4", ".mov", ".jpg", ".jpeg", ".png", ".webp"}:
+        await clip.close()
+        raise HTTPException(status_code=415, detail="Upload an MP4, MOV, JPG, PNG, or WEBP clip.")
+    clips_dir = item_directory(item_id) / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    safe_stem = "".join(ch for ch in Path(raw_name).stem if ch.isalnum() or ch in {"-", "_"})[:40] or "clip"
+    stored_name = f"{safe_stem}_{uuid4().hex[:8]}{ext}"
+    destination = clips_dir / stored_name
+    total = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := await clip.read(1024 * 1024):
+                total += len(chunk)
+                if total > 250_000_000:
+                    raise HTTPException(status_code=413, detail="Clip upload limit is 250 MB.")
+                output.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=422, detail="Uploaded clip is empty.")
+        assets = dict(item.get("assets") or {})
+        uploaded_clips = list(assets.get("uploaded_clips") or [])
+        uploaded_clips.append({"filename": stored_name, "original_name": raw_name, "media_type": "image" if ext in {".jpg", ".jpeg", ".png", ".webp"} else "video"})
+        assets["uploaded_clips"] = uploaded_clips[-30:]
+        return store.update_payload(item_id, {"assets": assets})
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await clip.close()
+
+
+@app.post("/api/items/{item_id}/bgm", status_code=201)
+async def upload_bgm(item_id: str, audio: UploadFile = File(...)) -> dict[str, Any]:
+    """@brief Upload a background music track and record an unverified rights ledger entry."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    raw_name = Path(audio.filename or "bgm.mp3").name
+    ext = Path(raw_name).suffix.lower()
+    if ext not in {".mp3", ".wav", ".m4a", ".aac"}:
+        await audio.close()
+        raise HTTPException(status_code=415, detail="Upload an MP3, WAV, M4A, or AAC audio file.")
+    folder = item_directory(item_id)
+    destination = folder / f"bgm{ext}"
+    total = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := await audio.read(1024 * 1024):
+                total += len(chunk)
+                if total > 100_000_000:
+                    raise HTTPException(status_code=413, detail="BGM upload limit is 100 MB.")
+                output.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=422, detail="Uploaded audio file is empty.")
+        assets = dict(item.get("assets") or {})
+        assets["bgm_path"] = str(destination)
+        assets["bgm_name"] = raw_name
+        rights_assets = list(item.get("rights_assets") or [])
+        rights_assets.append(
+            {
+                "id": str(uuid4()),
+                "asset_name": f"BGM: {raw_name}"[:160],
+                "asset_type": "music",
+                "source_description": f"Operator-uploaded BGM ({raw_name})"[:300],
+                "source_url": "",
+                "license_name": "",
+                "license_url": "",
+                "rights_basis": "",
+                "attribution": "",
+                "included": True,
+                "rights_status": "unverified",
+            }
+        )
+        return store.update_payload(item_id, {"assets": assets, "rights_assets": rights_assets, "approved_at": None, "approval_record": None})
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await audio.close()
+
+
+@app.post("/api/items/{item_id}/assemble", status_code=202)
+def start_scene_assembly(item_id: str, request: SceneAssemblyRequest) -> dict[str, str]:
+    """@brief Start FFmpeg multi-scene video assembly across selected clips and audio."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    if not isinstance(item.get("plan"), dict):
+        raise HTTPException(status_code=409, detail="Generate a plan before assembling scenes.")
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(status_code=503, detail="FFmpeg is required for multi-scene assembly.")
+    scene_dicts = [entry.model_dump() for entry in request.scenes]
+    style_dict = request.subtitle_style.model_dump() if request.subtitle_style else None
+    job_id = _schedule(
+        item_id,
+        "generating",
+        lambda: run_scene_assembly(
+            store,
+            item_id,
+            scene_dicts,
+            transition=request.transition,
+            tts_provider=request.tts_provider,
+            tts_voice=request.tts_voice,
+            bgm_volume=request.bgm_volume,
+            ducking=request.ducking,
+            loudnorm=request.loudnorm,
+            subtitle_style=style_dict,
+        ),
+    )
+    return {"job_id": job_id, "status": "generating"}
+
+
+@app.post("/api/items/{item_id}/postprocess")
+def postprocess_video(item_id: str, request: PostprocessRequest) -> dict[str, Any]:
+    """@brief Apply narration, BGM ducking, loudness normalization, and subtitles to an existing MP4."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    if item.get("active_job"):
+        raise HTTPException(status_code=409, detail="Wait for the active operation before post-processing.")
+    if not _worker_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Wait for the active workflow operation before post-processing.")
+    try:
+        return run_postprocess_video(
+            store,
+            item_id,
+            apply_subtitles=request.apply_subtitles,
+            apply_bgm=request.apply_bgm,
+            bgm_volume=request.bgm_volume,
+            ducking=request.ducking,
+            loudnorm=request.loudnorm,
+            tts_provider=request.tts_provider,
+            tts_voice=request.tts_voice,
+            subtitle_style=request.subtitle_style.model_dump() if request.subtitle_style else None,
+        )
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
+    finally:
+        _worker_lock.release()
+
+
+@app.post("/api/items/{item_id}/thumbnail/extract")
+def extract_item_thumbnail(item_id: str, request: ThumbnailExtractRequest) -> dict[str, Any]:
+    """@brief Extract a cover thumbnail frame from the item's saved MP4."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    try:
+        return save_thumbnail_from_video(store, item_id, request.timestamp_seconds)
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+
+
+@app.post("/api/items/{item_id}/thumbnail", status_code=201)
+async def upload_item_thumbnail(item_id: str, image: UploadFile = File(...)) -> dict[str, Any]:
+    """@brief Upload a custom JPG or PNG cover thumbnail for the item."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    raw_name = Path(image.filename or "thumbnail.jpg").name
+    ext = Path(raw_name).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png"}:
+        await image.close()
+        raise HTTPException(status_code=415, detail="Upload a JPG or PNG thumbnail image.")
+    folder = item_directory(item_id)
+    destination = folder / f"thumbnail{'.png' if ext == '.png' else '.jpg'}"
+    total = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := await image.read(1024 * 1024):
+                total += len(chunk)
+                if total > 10_000_000:
+                    raise HTTPException(status_code=413, detail="Thumbnail upload limit is 10 MB.")
+                output.write(chunk)
+        if total == 0:
+            raise HTTPException(status_code=422, detail="Uploaded thumbnail is empty.")
+        assets = dict(item.get("assets") or {})
+        assets["thumbnail_path"] = str(destination)
+        return store.update_payload(item_id, {"assets": assets})
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        await image.close()
+
+
+@app.get("/api/items/{item_id}/thumbnail")
+def get_item_thumbnail(item_id: str) -> FileResponse:
+    """@brief Serve the saved cover thumbnail image from the item directory."""
+    item = _get_item(item_id)
+    thumb_path = Path(str((item.get("assets") or {}).get("thumbnail_path") or ""))
+    try:
+        resolved = thumb_path.resolve(strict=True)
+        resolved.relative_to(item_directory(item_id).resolve())
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="Saved thumbnail not found.") from None
+    media_type = "image/png" if resolved.suffix.lower() == ".png" else "image/jpeg"
+    return FileResponse(resolved, media_type=media_type)
 
 
 @app.post("/api/items/{item_id}/generate", status_code=202)
@@ -1064,15 +1628,49 @@ def start_publish(item_id: str, request: PublishRequest) -> dict[str, str]:
         raise HTTPException(status_code=503, detail="Configure a YouTube OAuth Desktop client before publishing.")
     if request.platform == "instagram" and not instagram_ready():
         raise HTTPException(status_code=503, detail="Configure Instagram publishing and public R2 storage first.")
+    if request.platform == "tiktok" and not tiktok_ready():
+        raise HTTPException(status_code=503, detail="Configure TIKTOK_ACCESS_TOKEN before publishing to TikTok.")
     if request.platform == "youtube" and request.privacy_status not in {"private", "unlisted", "public"}:
         raise HTTPException(status_code=422, detail="Invalid YouTube privacy selection.")
+    publish_at_iso: str | None = None
+    if request.publish_at is not None:
+        if request.platform != "youtube":
+            raise HTTPException(status_code=422, detail="Native publish_at is supported only for YouTube.")
+        if request.publish_at.tzinfo is None or request.publish_at.utcoffset() is None:
+            raise HTTPException(status_code=422, detail="YouTube publish_at must include a time zone.")
+        publish_at_utc = request.publish_at.astimezone(timezone.utc)
+        if publish_at_utc <= datetime.now(timezone.utc) + timedelta(minutes=1):
+            raise HTTPException(status_code=422, detail="YouTube publish_at must be in the future.")
+        publish_at_iso = publish_at_utc.isoformat(timespec="seconds")
     job_id = _schedule(
         item_id,
         "publishing",
-        lambda: run_publication(store, item_id, request.platform, request.privacy_status),
+        lambda: run_publication(store, item_id, request.platform, request.privacy_status, publish_at=publish_at_iso),
         platform=request.platform,
     )
     return {"job_id": job_id, "status": "publishing"}
+
+
+@app.patch("/api/items/{item_id}/youtube/privacy")
+def patch_youtube_privacy(item_id: str, request: YouTubePrivacyUpdateRequest) -> dict[str, Any]:
+    """@brief Change visibility for an already-published YouTube video."""
+    try:
+        return change_youtube_privacy(store, item_id, request.privacy_status)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content item not found.") from None
+    except (RuntimeError, PublicationError) as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
+
+
+@app.post("/api/items/{item_id}/r2/cleanup")
+def cleanup_item_r2(item_id: str) -> dict[str, Any]:
+    """@brief Manually remove a staged R2 MP4 left over after Instagram upload."""
+    try:
+        return cleanup_instagram_r2_object(store, item_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Content item not found.") from None
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from None
 
 
 @app.get("/api/schedules")
@@ -1089,7 +1687,7 @@ def schedule_publication(item_id: str, platform: str, request: ScheduleRequest) 
         raise HTTPException(status_code=422, detail="Explicit confirmation is required to schedule a post.")
     if item.get("active_job"):
         raise HTTPException(status_code=409, detail="Wait for the active operation before scheduling publication.")
-    if platform not in {"youtube", "instagram"}:
+    if platform not in {"youtube", "instagram", "tiktok"}:
         raise HTTPException(status_code=422, detail="Unsupported publishing platform.")
     _validate_publish_candidate(item, platform)
     try:
@@ -1107,6 +1705,8 @@ def schedule_publication(item_id: str, platform: str, request: ScheduleRequest) 
         raise HTTPException(status_code=503, detail="Save a refreshable YouTube OAuth session before scheduling unattended publication.")
     if platform == "instagram" and not instagram_ready():
         raise HTTPException(status_code=503, detail="Configure Instagram publishing and public media storage before scheduling.")
+    if platform == "tiktok" and not tiktok_ready():
+        raise HTTPException(status_code=503, detail="Configure TIKTOK_ACCESS_TOKEN before scheduling TikTok publication.")
     privacy_status = request.privacy_status if platform == "youtube" else "private"
     try:
         return store.schedule_publication(item_id, platform, scheduled_utc.isoformat(timespec="seconds"), request.timezone_name, privacy_status)

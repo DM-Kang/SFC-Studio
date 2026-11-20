@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import sqlite3
 import threading
@@ -116,7 +117,7 @@ class Store:
         """@brief Create a draft item and return its display representation."""
         item_id = str(uuid4())
         now = _now()
-        payload = {**values, "publications": {}, "assets": {}, "review": None, "plan": None, "research": None, "materials": [], "approved_at": None, "platform_variants": {}, "version_history": [], "approval_history": []}
+        payload = {**values, "publications": {}, "assets": {}, "review": None, "plan": None, "research": None, "materials": [], "approved_at": None, "platform_variants": {}, "version_history": [], "approval_history": [], "archived": False}
         with self._connect() as connection:
             connection.execute(
                 "INSERT INTO content_items(id, topic, payload, stage, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)",
@@ -142,11 +143,116 @@ class Store:
             }
             return item
 
-    def list_items(self) -> list[dict[str, Any]]:
-        """@brief Return recent items in reverse creation order for the dashboard."""
+    def list_items(
+        self,
+        *,
+        query: str = "",
+        stage: str = "",
+        platform: str = "",
+        include_archived: bool = True,
+    ) -> list[dict[str, Any]]:
+        """@brief Return recent items in reverse creation order with optional filters."""
         with self._connect() as connection:
             rows = connection.execute("SELECT id FROM content_items ORDER BY created_at DESC").fetchall()
-        return [item for row in rows if (item := self.get_item(row["id"])) is not None]
+        items = [item for row in rows if (item := self.get_item(row["id"])) is not None]
+        needle = query.strip().casefold()
+        filtered: list[dict[str, Any]] = []
+        for item in items:
+            if not include_archived and item.get("archived"):
+                continue
+            if stage and item.get("stage") != stage:
+                continue
+            if platform and platform not in (item.get("platforms") or []):
+                continue
+            if needle:
+                title = str((item.get("plan") or {}).get("title") or "")
+                topic = str(item.get("topic") or "")
+                if needle not in title.casefold() and needle not in topic.casefold():
+                    continue
+            filtered.append(item)
+        return filtered
+
+    def set_item_archived(self, item_id: str, archived: bool) -> dict[str, Any]:
+        """@brief Toggle archive state for an item without altering audit or publication history."""
+        return self.update_payload(item_id, {"archived": bool(archived)})
+
+    def delete_item(self, item_id: str) -> bool:
+        """@brief Delete an unpublished, idle content item and cascade its local schedule rows."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT stage, active_job FROM content_items WHERE id = ?", (item_id,)).fetchone()
+            if row is None:
+                return False
+            if row["active_job"] or row["stage"] in BUSY_STATES:
+                raise RuntimeError("Wait for the active workflow operation to finish before deleting this item.")
+            publications = connection.execute("SELECT status FROM publications WHERE item_id = ?", (item_id,)).fetchall()
+            if any(pub["status"] in {"publishing", "published", "uncertain"} for pub in publications):
+                raise RuntimeError("Published or uncertain items cannot be deleted; archive them instead.")
+            schedules = connection.execute("SELECT status FROM scheduled_publications WHERE item_id = ?", (item_id,)).fetchall()
+            if any(sched["status"] in {"dispatching", "running"} for sched in schedules):
+                raise RuntimeError("Wait for the active scheduled dispatch to finish before deleting this item.")
+            connection.execute("DELETE FROM experiments WHERE item_a = ? OR item_b = ?", (item_id, item_id))
+            cursor = connection.execute("DELETE FROM content_items WHERE id = ?", (item_id,))
+            return cursor.rowcount == 1
+
+    def duplicate_item(self, item_id: str) -> dict[str, Any]:
+        """@brief Clone an item's brief, plan, and platform copy into a fresh unapproved draft."""
+        source = self.get_item(item_id)
+        if source is None:
+            raise KeyError(item_id)
+        topic = str(source.get("topic") or "").strip()
+        suffix = " (복사본)"
+        if not topic.endswith(suffix):
+            new_topic = f"{topic[: 500 - len(suffix)]}{suffix}"
+        else:
+            new_topic = topic[:500]
+        new_id = str(uuid4())
+        now = _now()
+        source_plan = copy.deepcopy(source.get("plan")) if isinstance(source.get("plan"), dict) else None
+        stage = "draft"
+        plan_revision = 0
+        if source_plan is not None:
+            source_plan["revision"] = 1
+            generated_by = str(source_plan.get("generated_by") or "local_template")
+            if "(duplicated)" not in generated_by:
+                source_plan["generated_by"] = f"{generated_by} (duplicated)"
+            stage = "planned"
+            plan_revision = 1
+        payload = {
+            "topic": new_topic,
+            "audience": source.get("audience", "General audience"),
+            "tone": source.get("tone", "Clear and engaging"),
+            "language": source.get("language", "Korean"),
+            "platforms": list(source.get("platforms") or ["youtube"]),
+            "duration_seconds": int(source.get("duration_seconds") or 30),
+            "source_notes": source.get("source_notes", ""),
+            "synthetic_media": bool(source.get("synthetic_media", True)),
+            "series_template_id": source.get("series_template_id"),
+            "brand_profile_snapshot": copy.deepcopy(source.get("brand_profile_snapshot") or {}),
+            "series_template_snapshot": copy.deepcopy(source.get("series_template_snapshot")),
+            "publications": {},
+            "assets": {},
+            "review": None,
+            "plan": source_plan,
+            "plan_revision": plan_revision,
+            "research": copy.deepcopy(source.get("research")),
+            "materials": [],
+            "rights_assets": [],
+            "approved_at": None,
+            "approved_asset_sha256": None,
+            "reviewed_asset_sha256": None,
+            "approval_record": None,
+            "platform_variants": copy.deepcopy(source.get("platform_variants") or {}),
+            "version_history": [],
+            "approval_history": [],
+            "archived": False,
+        }
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO content_items(id, topic, payload, stage, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)",
+                (new_id, new_topic, json.dumps(payload, ensure_ascii=False), stage, now, now),
+            )
+        return self.get_item(new_id)
 
     def update_payload(self, item_id: str, changes: dict[str, Any]) -> dict[str, Any]:
         """@brief Merge project data and return the updated item."""
@@ -412,7 +518,7 @@ class Store:
 
     def append_analytics_snapshot(self, item_id: str, platform: str, snapshot: dict[str, Any]) -> dict[str, Any]:
         """@brief Append a bounded metrics snapshot only to a successfully published target."""
-        if platform not in {"youtube", "instagram"}:
+        if platform not in {"youtube", "instagram", "tiktok"}:
             raise ValueError("Unsupported analytics platform.")
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -445,6 +551,27 @@ class Store:
                 (stage, error, _now(), item_id),
             )
 
+    def set_job_progress(self, item_id: str, message: str, percent: int | None = None) -> None:
+        """@brief Record non-critical progress details for an active background job."""
+        progress: dict[str, Any] = {"message": str(message)[:240], "updated_at": _now()}
+        if percent is not None:
+            progress["percent"] = max(0, min(100, int(percent)))
+        self.update_payload(item_id, {"job_progress": progress})
+
+    def request_job_cancel(self, item_id: str) -> dict[str, Any]:
+        """@brief Mark an active job as cancellation-requested without killing external state abruptly."""
+        item = self.get_item(item_id)
+        if item is None:
+            raise KeyError(item_id)
+        if not item.get("active_job"):
+            raise RuntimeError("No active job is running for this item.")
+        return self.update_payload(item_id, {"cancel_requested": True})
+
+    def is_cancel_requested(self, item_id: str) -> bool:
+        """@brief Check whether an operator requested cooperative cancellation for this item."""
+        item = self.get_item(item_id)
+        return bool(item and item.get("cancel_requested"))
+
     def claim_job(self, item_id: str, stage: str) -> str:
         """@brief Atomically claim an item for a costly or long-running stage."""
         job_id = str(uuid4())
@@ -459,6 +586,7 @@ class Store:
                 "UPDATE content_items SET stage = ?, active_job = ?, error = NULL, updated_at = ? WHERE id = ?",
                 (stage, job_id, _now(), item_id),
             )
+        self.update_payload(item_id, {"cancel_requested": False, "job_progress": {"message": f"{stage} 시작됨", "percent": 5, "updated_at": _now()}})
         return job_id
 
     def finish_job(self, item_id: str, job_id: str, stage: str, error: str | None = None) -> None:
@@ -468,6 +596,10 @@ class Store:
                 "UPDATE content_items SET stage = ?, active_job = NULL, error = ?, updated_at = ? WHERE id = ? AND active_job = ?",
                 (stage, error, _now(), item_id, job_id),
             )
+        try:
+            self.update_payload(item_id, {"cancel_requested": False, "job_progress": None})
+        except KeyError:
+            pass
 
     def recover_interrupted_jobs(self) -> int:
         """@brief Mark interrupted jobs without silently retrying provider costs."""
