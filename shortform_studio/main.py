@@ -37,7 +37,14 @@ from .config import (
 from .analytics import build_analytics_dashboard, export_analytics_csv, parse_analytics_csv, summarize_analytics, summarize_experiment
 from .ai import ai_status
 from .ai_config import save_ai_settings
-from .ai_providers import disconnect_chatgpt_oauth, disconnect_gemini_oauth, start_oauth_login
+from .ai_providers import (
+    clear_model_list_cache,
+    disconnect_chatgpt_oauth,
+    disconnect_gemini_oauth,
+    list_all_provider_models,
+    list_provider_models,
+    start_oauth_login,
+)
 from .brand import default_brand_settings, find_series_template, normalize_brand_settings
 from .oauth_callbacks import get_authorization_urls
 from .preflight import build_publish_preflight, combine_review_status, rights_assets_fingerprint
@@ -842,7 +849,19 @@ def update_ai_settings(request: AISettingsUpdate) -> dict[str, Any]:
         save_ai_settings(request.model_dump())
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
+    clear_model_list_cache()
     return ai_status()
+
+
+@app.get("/api/ai/models")
+def get_ai_models(provider: str = "", refresh: bool = False) -> dict[str, Any]:
+    """@brief Fetch live supported models from provider APIs without hardcoded catalogs."""
+    if provider:
+        try:
+            return {"providers": {provider: list_provider_models(provider, force_refresh=refresh)}}
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from None
+    return {"providers": list_all_provider_models(force_refresh=refresh)}
 
 
 @app.post("/api/ai/auth/{provider}/connect", status_code=202)

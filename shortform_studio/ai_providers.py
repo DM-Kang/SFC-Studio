@@ -31,6 +31,7 @@ CHATGPT_RESPONSES_URL = "https://api.openai.com/v1/responses"
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 _CHATGPT_CLIENT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,200}\Z")
 _STATUS_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_MODEL_LIST_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _STATUS_LOCK = threading.RLock()
 _LOGIN_LOCK = threading.RLock()
 _CHATGPT_REFRESH_LOCK = threading.RLock()
@@ -248,6 +249,177 @@ def get_provider_statuses() -> dict[str, dict[str, Any]]:
             if state.get("state") == "error":
                 statuses[target]["message"] = state.get("message", "OAuth 연결에 실패했습니다.")
     return statuses
+
+
+def _is_openai_text_model(model_id: str) -> bool:
+    """@brief Filter OpenAI /v1/models entries down to text/reasoning generation models."""
+    lowered = model_id.lower()
+    excluded = ("whisper", "tts", "dall-e", "embedding", "moderation", "sora", "image", "realtime", "audio", "transcribe", "babbage", "davinci")
+    if any(token in lowered for token in excluded):
+        return False
+    return lowered.startswith(("gpt-", "chatgpt-", "o1", "o3", "o4", "o5", "codex"))
+
+
+def _fetch_openai_models_with_bearer(token: str) -> list[dict[str, str]]:
+    """@brief Fetch live text-capable model IDs from OpenAI's /v1/models endpoint."""
+    payload = _request_json(
+        "https://api.openai.com/v1/models",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=15,
+    )
+    entries = payload.get("data", []) if isinstance(payload, dict) else []
+    filtered = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str) and _is_openai_text_model(entry["id"])
+    ]
+    filtered.sort(key=lambda item: (int(item.get("created") or 0), item["id"]), reverse=True)
+    return [{"id": entry["id"], "label": entry["id"]} for entry in filtered]
+
+
+def _is_gemini_text_model(model_id: str) -> bool:
+    """@brief Keep Gemini/Gemma text-JSON generation models and exclude image/audio/robotics modalities."""
+    lowered = model_id.lower()
+    excluded = (
+        "embedding",
+        "lyria",
+        "imagen",
+        "veo",
+        "nano-banana",
+        "-image",
+        "-tts",
+        "transcribe",
+        "robotics",
+        "computer-use",
+        "deep-research",
+        "antigravity",
+        "aqa",
+        "customtools",
+    )
+    return not any(token in lowered for token in excluded)
+
+
+def _fetch_gemini_models() -> list[dict[str, str]]:
+    """@brief Fetch live generateContent-capable models from Google Generative Language API."""
+    settings = load_ai_settings()
+    project_id = str(settings.get("gemini_google_cloud_project") or "").strip()
+    if not project_id:
+        raise RuntimeError("Enter the Google Cloud project ID first.")
+    credentials = _load_gemini_credentials()
+    payload = _request_json(
+        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+        headers={"Authorization": f"Bearer {credentials.token}", "x-goog-user-project": project_id, "Accept": "application/json"},
+        timeout=15,
+    )
+    entries = payload.get("models", []) if isinstance(payload, dict) else []
+    models: list[dict[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        methods = entry.get("supportedGenerationMethods")
+        if not isinstance(methods, list) or "generateContent" not in methods:
+            continue
+        raw_name = str(entry.get("name") or "")
+        model_id = raw_name.removeprefix("models/").strip()
+        if not model_id or not _is_gemini_text_model(model_id):
+            continue
+        display_name = str(entry.get("displayName") or "").strip()
+        label = f"{model_id} ({display_name})" if display_name and display_name != model_id else model_id
+        models.append({"id": model_id, "label": label})
+    models.sort(key=lambda item: (1 if item["id"].startswith("gemini-") else 0, item["id"]), reverse=True)
+    return models
+
+
+def _fetch_anthropic_models() -> list[dict[str, str]]:
+    """@brief Fetch live Claude models from Anthropic's /v1/models endpoint."""
+    from .config import get_secret
+
+    api_key = get_secret("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY 설정이 필요합니다.")
+    payload = _request_json(
+        "https://api.anthropic.com/v1/models?limit=100",
+        headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "Accept": "application/json"},
+        timeout=15,
+    )
+    entries = payload.get("data", []) if isinstance(payload, dict) else []
+    models: list[dict[str, str]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            continue
+        model_id = entry["id"].strip()
+        display_name = str(entry.get("display_name") or "").strip()
+        label = f"{model_id} ({display_name})" if display_name and display_name != model_id else model_id
+        models.append({"id": model_id, "label": label})
+    return models
+
+
+def list_provider_models(provider: str, *, force_refresh: bool = False) -> dict[str, Any]:
+    """@brief Fetch live supported models from the provider API without hardcoded model lists."""
+    from .ai_config import AI_PROVIDERS
+    from .config import get_secret
+
+    if provider not in AI_PROVIDERS:
+        raise ValueError(f"Unsupported AI provider: {provider}")
+    now = time.monotonic()
+    if not force_refresh:
+        with _STATUS_LOCK:
+            cached = _MODEL_LIST_CACHE.get(provider)
+            if cached and cached[0] > now:
+                return dict(cached[1])
+
+    models: list[dict[str, str]] = []
+    error_message: str | None = None
+    try:
+        if provider == "openai_api":
+            api_key = get_secret("OPENAI_API_KEY")
+            if not api_key:
+                raise RuntimeError("OPENAI_API_KEY 설정이 필요합니다.")
+            models = _fetch_openai_models_with_bearer(api_key)
+        elif provider == "chatgpt_oauth":
+            models = _fetch_openai_models_with_bearer(_chatgpt_access_token())
+        elif provider == "gemini_oauth":
+            models = _fetch_gemini_models()
+        elif provider == "anthropic_api":
+            models = _fetch_anthropic_models()
+        elif provider == "ollama":
+            settings = load_ai_settings()
+            if force_refresh:
+                with _STATUS_LOCK:
+                    _STATUS_CACHE.pop(f"ollama:{settings['ollama_base_url']}", None)
+            raw_models = _ollama_models(str(settings["ollama_base_url"]))
+            models = [{"id": name, "label": name} for name in raw_models]
+            if not models:
+                error_message = "설치된 Ollama 모델을 찾지 못했습니다. Ollama 서버 실행 상태를 확인하세요."
+    except Exception as error:
+        error_message = str(error) if isinstance(error, RuntimeError) else f"모델 목록 조회 실패 ({type(error).__name__})."
+
+    result = {
+        "provider": provider,
+        "models": models,
+        "error": error_message,
+        "synced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    if not error_message:
+        with _STATUS_LOCK:
+            _MODEL_LIST_CACHE[provider] = (now + 60, result)
+    return result
+
+
+def list_all_provider_models(*, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    """@brief Return live model lists across all supported AI providers."""
+    from .ai_config import AI_PROVIDERS
+
+    return {provider: list_provider_models(provider, force_refresh=force_refresh) for provider in sorted(AI_PROVIDERS)}
+
+
+def clear_model_list_cache(provider: str | None = None) -> None:
+    """@brief Invalidate cached live model catalogs after OAuth or settings updates."""
+    with _STATUS_LOCK:
+        if provider:
+            _MODEL_LIST_CACHE.pop(provider, None)
+        else:
+            _MODEL_LIST_CACHE.clear()
 
 
 def provider_ready(provider: str, model: str) -> bool:
@@ -490,6 +662,7 @@ def _login_worker(provider: str) -> None:
         else:
             raise RuntimeError("Unsupported OAuth provider.")
         _set_login_state(provider, "connected", "로그인 연결이 완료되었습니다.")
+        clear_model_list_cache("gemini_oauth" if provider == "gemini" else "chatgpt_oauth")
     except Exception as error:
         message = str(error) if isinstance(error, RuntimeError) else f"OAuth 처리 실패 ({type(error).__name__})."
         _set_login_state(provider, "error", message[:240])
@@ -513,6 +686,7 @@ def start_oauth_login(provider: str) -> dict[str, str]:
 def disconnect_gemini_oauth() -> None:
     """@brief Remove only this app's Gemini OAuth token."""
     gemini_oauth_token_path().unlink(missing_ok=True)
+    clear_model_list_cache("gemini_oauth")
     _set_login_state("gemini", "disconnected", "Google OAuth 연결을 해제했습니다.")
 
 
@@ -534,6 +708,7 @@ def disconnect_chatgpt_oauth() -> bool:
     except (OSError, urllib.error.URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError, RuntimeError):
         revocation_confirmed = False
     token_path.unlink(missing_ok=True)
+    clear_model_list_cache("chatgpt_oauth")
     message = "ChatGPT 연결을 해제하고 토큰 폐기를 확인했습니다." if revocation_confirmed else "이 앱의 토큰을 삭제했습니다. 원격 폐기는 확인되지 않아 ChatGPT 설정에서도 앱 접근을 해제하세요."
     _set_login_state("chatgpt_oauth", "disconnected", message)
     return revocation_confirmed

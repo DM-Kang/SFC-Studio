@@ -1,4 +1,4 @@
-const state = { items: [], selectedId: null, settings: {}, brand: { profile: {}, series_templates: [] }, analytics: {}, dashboard: null, secretsStatus: {}, assetLibrary: [], schedules: [], experiments: [], assetLibraryMode: "manage", filters: { query: "", stage: "", platform: "" }, calendarView: "grid", calendarMonth: new Date(), safeZone: "none", subtitlesCache: {}, toastTimer: null, refreshTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
+const state = { items: [], selectedId: null, settings: {}, aiModels: {}, brand: { profile: {}, series_templates: [] }, analytics: {}, dashboard: null, secretsStatus: {}, assetLibrary: [], schedules: [], experiments: [], assetLibraryMode: "manage", filters: { query: "", stage: "", platform: "" }, calendarView: "grid", calendarMonth: new Date(), safeZone: "none", subtitlesCache: {}, toastTimer: null, refreshTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
 const stageLabels = { draft: "초안", researching: "웹 자료 조사 중", planning: "조사·기획 중", collecting_materials: "영상 소재 검색 중", planned: "기획 완료", generating: "영상 제작 중", generated: "영상 제작 완료", reviewing: "검수 중", reviewed: "검수 완료", approved: "게시 승인", publishing: "게시 중", published: "게시 완료", failed: "작업 오류" };
 const SUBTITLE_PRESETS = {
   clean_bottom: { label: "깔끔한 하단 자막", font_size: 42, margin_v: 170, alignment: 2, outline: 3, shadow: 1, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" },
@@ -70,6 +70,9 @@ function renderAIAuthStatus() {
     const button = document.getElementById(buttonId);
     if (status) status.textContent = provider.message || "상태를 확인할 수 없습니다.";
     if (button) button.disabled = Boolean(provider.connecting);
+    if (provider.ready && state.aiModels?.[key]?.error) {
+      syncAIModels(true, key).catch(() => {});
+    }
   });
   const disconnect = document.getElementById("disconnect-gemini");
   if (disconnect) disconnect.hidden = !providers.gemini_oauth?.ready;
@@ -511,12 +514,88 @@ function bindManagementDialogs() {
   document.getElementById("secrets-settings-form")?.addEventListener("submit", saveSecretsSettings);
 }
 
+function renderStageModelDropdown(stage, preferredModel = null) {
+  const form = document.getElementById("ai-settings-form");
+  if (!form) return;
+  const providerSelect = form.elements.namedItem(`${stage}.provider`);
+  const modelSelect = form.elements.namedItem(`${stage}.model_select`);
+  const modelInput = form.elements.namedItem(`${stage}.model`);
+  const hint = document.getElementById(`${stage}-model-hint`);
+  if (!providerSelect || !modelSelect || !modelInput) return;
+
+  const provider = providerSelect.value;
+  const catalog = state.aiModels?.[provider] || { models: [], error: null };
+  const liveModels = Array.isArray(catalog.models) ? catalog.models : [];
+  const currentSaved = preferredModel !== null ? preferredModel : modelInput.value.trim();
+
+  const options = [];
+  liveModels.forEach(entry => {
+    options.push(`<option value="${escapeHtml(entry.id)}">${escapeHtml(entry.label || entry.id)}</option>`);
+  });
+  const inLive = liveModels.some(entry => entry.id === currentSaved);
+  if (!liveModels.length && currentSaved) {
+    options.push(`<option value="${escapeHtml(currentSaved)}">${escapeHtml(currentSaved)} (현재 저장값)</option>`);
+  }
+  options.push('<option value="__custom__">직접 입력…</option>');
+  modelSelect.innerHTML = options.join("");
+
+  if (inLive) {
+    modelSelect.value = currentSaved;
+    modelInput.value = currentSaved;
+    modelInput.hidden = true;
+    modelInput.required = false;
+  } else if (liveModels.length) {
+    modelSelect.value = liveModels[0].id;
+    modelInput.value = liveModels[0].id;
+    modelInput.hidden = true;
+    modelInput.required = false;
+  } else if (currentSaved) {
+    modelSelect.value = currentSaved;
+    modelInput.value = currentSaved;
+    modelInput.hidden = true;
+    modelInput.required = false;
+  } else {
+    modelSelect.value = "__custom__";
+    modelInput.value = "";
+    modelInput.hidden = false;
+    modelInput.required = true;
+  }
+
+  if (hint) {
+    if (catalog.error) {
+      hint.textContent = `${catalog.error} (목록을 불러오지 못해 직접 입력하거나 연결 후 동기화하세요)`;
+    } else if (liveModels.length) {
+      hint.textContent = `실시간 동기화됨 · ${liveModels.length}개 모델 (${catalog.synced_at ? new Date(catalog.synced_at).toLocaleTimeString() : ""})`;
+    } else {
+      hint.textContent = "연결 후 '목록 동기화'를 누르면 지원 모델 목록을 자동으로 가져옵니다.";
+    }
+  }
+}
+
+async function syncAIModels(forceRefresh = true, provider = "") {
+  const query = new URLSearchParams();
+  if (provider) query.set("provider", provider);
+  if (forceRefresh) query.set("refresh", "true");
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  const result = await api(`/api/ai/models${suffix}`);
+  Object.assign(state.aiModels, result.providers || {});
+  const config = state.settings.ai?.config || {};
+  ["planning", "review"].forEach(stage => {
+    const form = document.getElementById("ai-settings-form");
+    const selectedProvider = form?.elements.namedItem(`${stage}.provider`)?.value;
+    if (!provider || selectedProvider === provider) {
+      const preferred = selectedProvider === config[stage]?.provider ? (config[stage]?.model || "") : null;
+      renderStageModelDropdown(stage, preferred);
+    }
+  });
+}
+
 function populateAISettings() {
   const config = state.settings.ai?.config || {};
   const form = document.getElementById("ai-settings-form");
   ["planning", "review"].forEach(stage => {
     form.elements.namedItem(`${stage}.provider`).value = config[stage]?.provider || "openai_api";
-    form.elements.namedItem(`${stage}.model`).value = config[stage]?.model || "";
+    renderStageModelDropdown(stage, config[stage]?.model || "");
   });
   form.elements.namedItem("gemini_client_secrets_file").value = config.gemini_client_secrets_file || "";
   form.elements.namedItem("gemini_google_cloud_project").value = config.gemini_google_cloud_project || "";
@@ -525,9 +604,14 @@ function populateAISettings() {
 
 function readAISettingsForm() {
   const form = document.getElementById("ai-settings-form");
+  const modelFor = stage => {
+    const selectVal = form.elements.namedItem(`${stage}.model_select`).value;
+    if (selectVal === "__custom__") return form.elements.namedItem(`${stage}.model`).value.trim();
+    return selectVal.trim();
+  };
   return {
-    planning: { provider: form.elements.namedItem("planning.provider").value, model: form.elements.namedItem("planning.model").value.trim() },
-    review: { provider: form.elements.namedItem("review.provider").value, model: form.elements.namedItem("review.model").value.trim() },
+    planning: { provider: form.elements.namedItem("planning.provider").value, model: modelFor("planning") },
+    review: { provider: form.elements.namedItem("review.provider").value, model: modelFor("review") },
     gemini_client_secrets_file: form.elements.namedItem("gemini_client_secrets_file").value.trim(),
     gemini_google_cloud_project: form.elements.namedItem("gemini_google_cloud_project").value.trim(),
     ollama_base_url: form.elements.namedItem("ollama_base_url").value.trim()
@@ -548,6 +632,7 @@ async function openAISettings() {
     populateAISettings();
     renderProviders();
     document.getElementById("ai-settings-dialog").showModal();
+    syncAIModels(true).catch(() => {});
   } catch (error) { toast(error.message); }
 }
 
@@ -1720,6 +1805,32 @@ document.getElementById("ai-settings-form").addEventListener("submit", async eve
     await refresh(state.selectedId);
   } catch (error) { toast(error.message); }
 });
+["planning", "review"].forEach(stage => {
+  const form = document.getElementById("ai-settings-form");
+  form.elements.namedItem(`${stage}.provider`).addEventListener("change", async event => {
+    const provider = event.target.value;
+    const saved = state.settings.ai?.config?.[stage];
+    const preferred = saved?.provider === provider ? saved.model : "";
+    renderStageModelDropdown(stage, preferred);
+    try { await syncAIModels(false, provider); } catch { /* Error hint shown inside card. */ }
+  });
+  form.elements.namedItem(`${stage}.model_select`).addEventListener("change", event => {
+    const input = form.elements.namedItem(`${stage}.model`);
+    const isCustom = event.target.value === "__custom__";
+    input.hidden = !isCustom;
+    input.required = isCustom;
+    if (!isCustom) input.value = event.target.value;
+    else input.focus();
+  });
+});
+document.querySelectorAll(".sync-models-btn").forEach(btn => btn.addEventListener("click", async () => {
+  const stage = btn.dataset.stage;
+  const provider = document.getElementById("ai-settings-form")?.elements.namedItem(`${stage}.provider`)?.value || "";
+  try {
+    await syncAIModels(true, provider);
+    toast("지원 모델 목록을 최신 상태로 동기화했습니다.");
+  } catch (error) { toast(error.message); }
+}));
 bindManagementDialogs();
 document.getElementById("connect-gemini").addEventListener("click", () => connectAIProvider("gemini"));
 document.getElementById("connect-chatgpt").addEventListener("click", () => connectAIProvider("chatgpt_oauth"));
