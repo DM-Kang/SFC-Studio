@@ -1,0 +1,8 @@
+[project]
+name = "shortform-content-studio"
+version = "0.1.0"
+description = "Cross-platform local-first, approval-gated Shorts and Reels production workflow."
+requires-python = ">=3.11"
+
+[tool.unittest]
+start-directory = "tests"

@@ -1,0 +1,253 @@
+"""Bounded web research and stock-footage discovery adapters."""
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import re
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from typing import Any
+
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
+TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
+PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/v1/videos/search"
+MAX_PROVIDER_RESPONSE_BYTES = 4_000_000
+MAX_RESEARCH_SOURCES = 5
+MAX_EXTRACTED_SOURCES = 4
+MAX_SOURCE_CONTENT_CHARS = 8_000
+MAX_SCENE_SEARCHES = 5
+MAX_VIDEOS_PER_SCENE = 3
+
+
+def _request_json(url: str, *, headers: dict[str, str], body: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
+    """@brief Send a bounded JSON request to a fixed external provider endpoint."""
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={**headers, "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            encoded = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"Resource provider returned HTTP {error.code}.") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise RuntimeError(f"Resource provider request failed: {type(error).__name__}.") from None
+    return _decode_json_response(encoded)
+
+
+def _get_json(url: str, *, headers: dict[str, str], timeout: int = 30) -> dict[str, Any]:
+    """@brief Read a bounded JSON response from a fixed provider API endpoint."""
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            encoded = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"Resource provider returned HTTP {error.code}.") from None
+    except (urllib.error.URLError, TimeoutError, OSError) as error:
+        raise RuntimeError(f"Resource provider request failed: {type(error).__name__}.") from None
+    return _decode_json_response(encoded)
+
+
+def _decode_json_response(encoded: bytes) -> dict[str, Any]:
+    """@brief Enforce response-size and JSON-object contracts for provider results."""
+    if len(encoded) > MAX_PROVIDER_RESPONSE_BYTES:
+        raise RuntimeError("Resource provider response exceeded the local size limit.")
+    try:
+        result = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise RuntimeError("Resource provider returned invalid JSON.") from None
+    if not isinstance(result, dict):
+        raise RuntimeError("Resource provider returned an unexpected response shape.")
+    return result
+
+
+def _safe_public_url(value: Any) -> str | None:
+    """@brief Accept public HTTPS links without credentials or local-network hosts."""
+    if not isinstance(value, str) or len(value) > 2_048:
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(value.strip())
+        hostname = parsed.hostname
+        if parsed.scheme.lower() != "https" or not hostname or parsed.username or parsed.password:
+            return None
+        normalized_host = hostname.rstrip(".").lower()
+        if normalized_host in {"localhost", "localhost.localdomain"} or normalized_host.endswith((".localhost", ".local", ".internal")):
+            return None
+        try:
+            address = ipaddress.ip_address(normalized_host)
+        except ValueError:
+            address = None
+        if address and (not address.is_global):
+            return None
+        return urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path or "/", parsed.query, ""))
+    except ValueError:
+        return None
+
+
+def validate_external_url(value: Any) -> str | None:
+    """@brief Validate an optional public HTTPS source or license URL for display."""
+    return _safe_public_url(value)
+
+
+def _urls_in_notes(notes: str) -> list[str]:
+    """@brief Extract a small set of explicitly supplied HTTPS source URLs."""
+    candidates = re.findall(r"https?://[^\s<>\"'`]+", notes or "", flags=re.IGNORECASE)
+    urls: list[str] = []
+    for candidate in candidates:
+        safe_url = _safe_public_url(candidate.rstrip(".,;:!?)]}"))
+        if safe_url and safe_url not in urls:
+            urls.append(safe_url)
+        if len(urls) >= 2:
+            break
+    return urls
+
+
+def collect_web_research(brief: dict[str, Any], api_key: str) -> dict[str, Any]:
+    """@brief Search a topic and extract a bounded set of source pages for evidence."""
+    if not api_key:
+        raise ValueError("Configure TAVILY_API_KEY before collecting web research.")
+    topic = str(brief.get("topic", "")).strip()[:500]
+    if len(topic) < 3:
+        raise ValueError("A topic with at least three characters is required for web research.")
+    language = "ko" if str(brief.get("language", "")).lower() in {"ko", "korean", "한국어"} else "en"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    search = _request_json(
+        TAVILY_SEARCH_URL,
+        headers=headers,
+        body={
+            "query": topic,
+            "search_depth": "basic",
+            "max_results": MAX_RESEARCH_SOURCES,
+            "topic": "general",
+            "language": language,
+            "include_answer": False,
+            "include_raw_content": False,
+            "include_published_date": True,
+        },
+    )
+    candidates: list[dict[str, Any]] = []
+    for result in search.get("results", []) if isinstance(search.get("results"), list) else []:
+        if not isinstance(result, dict):
+            continue
+        url = _safe_public_url(result.get("url"))
+        if not url:
+            continue
+        candidates.append(
+            {
+                "url": url,
+                "title": str(result.get("title") or url)[:300],
+                "snippet": str(result.get("content") or "")[:1_200],
+                "published_at": str(result.get("published_date") or "")[:80],
+                "score": result.get("score") if isinstance(result.get("score"), (float, int)) else None,
+            }
+        )
+    by_url = {entry["url"]: entry for entry in candidates}
+    supplied_urls = _urls_in_notes(str(brief.get("source_notes", "")))
+    ordered_urls = list(supplied_urls)
+    ordered_urls.extend(url for url in by_url if url not in ordered_urls)
+    ordered_urls = ordered_urls[:MAX_RESEARCH_SOURCES]
+    if not ordered_urls:
+        raise RuntimeError("The web search returned no usable public HTTPS sources.")
+
+    extracted_by_url: dict[str, str] = {}
+    extraction_error: str | None = None
+    extraction_urls = ordered_urls[:MAX_EXTRACTED_SOURCES]
+    try:
+        extracted = _request_json(
+            TAVILY_EXTRACT_URL,
+            headers=headers,
+            body={"urls": extraction_urls, "extract_depth": "basic", "format": "markdown", "include_published_date": True},
+        )
+        for result in extracted.get("results", []) if isinstance(extracted.get("results"), list) else []:
+            if not isinstance(result, dict):
+                continue
+            url = _safe_public_url(result.get("url"))
+            content = result.get("raw_content")
+            if url in extraction_urls and isinstance(content, str) and content.strip():
+                extracted_by_url[url] = content.strip()[:MAX_SOURCE_CONTENT_CHARS]
+    except RuntimeError as error:
+        # Search results remain visible, but snippets are intentionally not promoted to evidence.
+        extraction_error = str(error)
+
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    sources: list[dict[str, Any]] = []
+    for index, url in enumerate(ordered_urls, 1):
+        candidate = by_url.get(url, {"title": url, "snippet": "", "published_at": "", "score": None})
+        content = extracted_by_url.get(url, "")
+        hostname = urllib.parse.urlsplit(url).hostname or ""
+        sources.append(
+            {
+                "id": f"S{index}",
+                "title": candidate["title"],
+                "url": url,
+                "domain": hostname,
+                "snippet": candidate["snippet"],
+                "content": content,
+                "published_at": candidate["published_at"],
+                "score": candidate["score"],
+                "provider": "Tavily",
+                "status": "fetched" if content else "snippet_only",
+                "fetched_at": now if content else None,
+            }
+        )
+    return {
+        "status": "complete" if sources and all(source["status"] == "fetched" for source in sources) else "partial",
+        "provider": "Tavily",
+        "query": topic,
+        "collected_at": now,
+        "sources": sources,
+        "extraction_error": extraction_error,
+        "evidence_source_ids": [source["id"] for source in sources if source["status"] == "fetched"],
+    }
+
+
+def search_pexels_videos(scenes: list[dict[str, Any]], api_key: str) -> list[dict[str, Any]]:
+    """@brief Find a few portrait-friendly Pexels clips for each bounded scene query."""
+    if not api_key:
+        raise ValueError("Configure PEXELS_API_KEY before searching stock videos.")
+    if not isinstance(scenes, list) or not scenes:
+        raise ValueError("Generate a plan with scenes before searching for video materials.")
+    materials: list[dict[str, Any]] = []
+    for scene in scenes[:MAX_SCENE_SEARCHES]:
+        if not isinstance(scene, dict):
+            continue
+        query = str(scene.get("visual_query") or "").strip()[:200]
+        scene_id = str(scene.get("id") or "")[:20]
+        if not query:
+            continue
+        url = f"{PEXELS_VIDEO_SEARCH_URL}?{urllib.parse.urlencode({'query': query, 'orientation': 'portrait', 'per_page': MAX_VIDEOS_PER_SCENE, 'locale': 'ko-KR'})}"
+        response = _get_json(url, headers={"Authorization": api_key})
+        videos = response.get("videos", [])
+        for video in videos[:MAX_VIDEOS_PER_SCENE] if isinstance(videos, list) else []:
+            if not isinstance(video, dict):
+                continue
+            source_url = _safe_public_url(video.get("url"))
+            poster_url = _safe_public_url(video.get("image"))
+            if not source_url:
+                continue
+            user = video.get("user") if isinstance(video.get("user"), dict) else {}
+            materials.append(
+                {
+                    "scene_id": scene_id,
+                    "query": query,
+                    "provider": "Pexels",
+                    "provider_id": str(video.get("id") or "")[:80],
+                    "title": f"Pexels video {video.get('id', '')}"[:160],
+                    "source_url": source_url,
+                    "poster_url": poster_url,
+                    "author": str(user.get("name") or "Unknown contributor")[:160],
+                    "author_url": _safe_public_url(user.get("url")),
+                    "duration_seconds": video.get("duration") if isinstance(video.get("duration"), int) else None,
+                    "width": video.get("width") if isinstance(video.get("width"), int) else None,
+                    "height": video.get("height") if isinstance(video.get("height"), int) else None,
+                    "license_url": "https://www.pexels.com/license/",
+                    "rights_status": "human_verification_required",
+                    "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                }
+            )
+    return materials

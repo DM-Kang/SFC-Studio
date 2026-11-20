@@ -1,0 +1,38 @@
+services:
+  shortform-studio:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SHORTFORM_STUDIO_HOME: /data
+      SHORTFORM_STUDIO_OAUTH_BIND_HOST: 0.0.0.0
+      SHORTFORM_STUDIO_OAUTH_REDIRECT_HOST: 127.0.0.1
+      SHORTFORM_STUDIO_OAUTH_PORT: "8766"
+      SHORTFORM_STUDIO_ALLOW_HOST_OLLAMA: "1"
+      SHORTFORM_STUDIO_OLLAMA_BASE_URL: http://host.docker.internal:11434
+    ports:
+      - "127.0.0.1:8765:8765"
+      - "127.0.0.1:8766:8766"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - studio-data:/data
+      - ./secrets:/run/secrets:ro
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8765/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  studio-data:
