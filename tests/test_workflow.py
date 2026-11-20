@@ -91,6 +91,7 @@ class WorkflowTests(unittest.TestCase):
         with (
             patch("shortform_studio.workflow.get_secret", return_value="test-key"),
             patch("shortform_studio.workflow.collect_web_research", return_value=research_result),
+            patch("shortform_studio.workflow.search_pixabay_videos", return_value=[]),
             patch("shortform_studio.workflow.search_pexels_videos", return_value=material_result),
         ):
             self.assertEqual(run_web_research(self.store, self.item["id"], "draft"), "draft")

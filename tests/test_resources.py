@@ -5,7 +5,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from shortform_studio.planning import _normalize_claims, _source_snapshot
-from shortform_studio.resources import _safe_public_url, collect_web_research, search_pexels_videos
+from shortform_studio.resources import _safe_public_url, collect_web_research, search_pexels_videos, search_pixabay_videos, test_provider_connection
 
 
 class ResourceTests(unittest.TestCase):
@@ -108,12 +108,64 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual(materials[0]["rights_status"], "human_verification_required")
         self.assertEqual(materials[0]["author"], "Creator")
 
+    def test_pixabay_search_prefers_portrait_clips_and_truncates_query(self) -> None:
+        """@brief Search Pixabay free stock videos with per-scene metadata and safe bounds."""
+        response = {
+            "hits": [
+                {
+                    "id": 101,
+                    "pageURL": "https://pixabay.com/videos/id-101/",
+                    "tags": "sunset, ocean",
+                    "duration": 14,
+                    "picture_id": "abc-123",
+                    "user": "PixUser",
+                    "user_id": 88,
+                    "videos": {
+                        "large": {"url": "https://cdn.pixabay.com/v/101_l.mp4", "width": 1920, "height": 1080},
+                        "medium": {"url": "https://cdn.pixabay.com/v/101_m.mp4", "width": 720, "height": 1280},
+                    },
+                }
+            ]
+        }
+        with patch("shortform_studio.resources._get_json", return_value=response) as request:
+            materials = search_pixabay_videos([{"id": "scene-1", "visual_query": "x" * 150}], "pix-key")
+        query = parse_qs(urlsplit(request.call_args.args[0]).query)
+        self.assertEqual(query["key"], ["pix-key"])
+        self.assertEqual(len(query["q"][0]), 100)
+        self.assertEqual(materials[0]["provider"], "Pixabay")
+        self.assertEqual(materials[0]["provider_id"], "pixabay-101")
+        self.assertEqual(materials[0]["download_url"], "https://cdn.pixabay.com/v/101_m.mp4")
+        self.assertEqual(materials[0]["poster_url"], "https://i.vimeocdn.com/video/abc-123_640x360.jpg")
+
     def test_missing_provider_credentials_are_explicit(self) -> None:
         """@brief Require explicit provider setup before making external requests."""
         with self.assertRaisesRegex(ValueError, "TAVILY_API_KEY"):
             collect_web_research({"topic": "Coffee"}, "")
         with self.assertRaisesRegex(ValueError, "PEXELS_API_KEY"):
             search_pexels_videos([{"visual_query": "coffee"}], "")
+        with self.assertRaisesRegex(ValueError, "PIXABAY_API_KEY"):
+            search_pixabay_videos([{"visual_query": "coffee"}], "")
+
+    def test_pixabay_connection_test_handles_default_headers(self) -> None:
+        """@brief Verify test_provider_connection('pixabay') works through _get_json without explicit headers."""
+        fake_response = type(
+            "_FakeResp",
+            (),
+            {
+                "__enter__": lambda self: self,
+                "__exit__": lambda self, *a: None,
+                "read": lambda self, n=-1: b'{"hits":[]}',
+            },
+        )()
+        with (
+            patch("shortform_studio.config.get_secret", side_effect=lambda k, d="": "pix-test-key" if k == "PIXABAY_API_KEY" else d),
+            patch("shortform_studio.resources.urllib.request.urlopen", return_value=fake_response) as mock_open,
+        ):
+            result = test_provider_connection("pixabay")
+        self.assertTrue(result["ok"])
+        self.assertIn("Pixabay", result["message"])
+        req = mock_open.call_args.args[0]
+        self.assertEqual(req.get_header("Accept"), "application/json")
 
 
 if __name__ == "__main__":

@@ -277,6 +277,63 @@ class Phase2MediaAndAssemblyTests(unittest.TestCase):
             self.assertEqual(assembled_item["assets"]["video_provider"]["provider"], "multiscene_ffmpeg")
             self.assertEqual(assembled_item["assets"]["video_provider"]["transition"], "fade")
 
+    def test_pixabay_search_download_and_stock_multiscene_assembly(self) -> None:
+        """@brief Search Pixabay free stock videos, download locally, and assemble via stock source_kind."""
+        from shortform_studio.resources import search_pixabay_videos
+
+        fake_pixabay_api = {
+            "hits": [
+                {
+                    "id": 777,
+                    "pageURL": "https://pixabay.com/videos/id-777/",
+                    "tags": "coffee, cafe",
+                    "duration": 10,
+                    "picture_id": "pic-777",
+                    "user": "PixCreator",
+                    "user_id": 55,
+                    "videos": {
+                        "large": {"url": "https://cdn.pixabay.com/video/777_large.mp4", "width": 1080, "height": 1920},
+                        "medium": {"url": "https://cdn.pixabay.com/video/777_med.mp4", "width": 720, "height": 1280, "thumbnail": "https://cdn.pixabay.com/video/777_640x360.jpg"},
+                    },
+                }
+            ]
+        }
+        with patch("shortform_studio.resources._get_json", return_value=fake_pixabay_api):
+            materials = search_pixabay_videos([{"id": "scene-1", "visual_query": "coffee"}], "pix-key")
+
+        self.assertEqual(materials[0]["provider"], "Pixabay")
+        self.assertEqual(materials[0]["provider_id"], "pixabay-777")
+        self.assertEqual(materials[0]["download_url"], "https://cdn.pixabay.com/video/777_large.mp4")
+        self.assertEqual(materials[0]["poster_url"], "https://cdn.pixabay.com/video/777_640x360.jpg")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = Store(root / "studio.sqlite3")
+            projects_dir = root / "projects"
+            item = store.create_item({"topic": "Pixabay assembly", "platforms": ["youtube"]})
+            store.update_payload(
+                item["id"],
+                {
+                    "plan_revision": 1,
+                    "plan": {"revision": 1, "script": "Coffee narration", "scenes": [{"id": "scene-1", "visual_query": "coffee"}]},
+                    "materials": materials,
+                },
+            )
+            fake_stream = io.BytesIO(b"\x00\x00\x00\x18ftypmp42")
+            fake_stream.__enter__ = lambda self: self
+            fake_stream.__exit__ = lambda self, *args: None
+            with (
+                patch("shortform_studio.workflow.get_projects_dir", return_value=projects_dir),
+                patch("shortform_studio.resources.urllib.request.urlopen", return_value=fake_stream),
+                patch("shortform_studio.workflow.generate_voiceover", return_value=None),
+                patch("shortform_studio.workflow.assemble_multiscene_video", side_effect=lambda wd, clips, op, **kw: op.write_bytes(b"m") or op),
+                patch("shortform_studio.workflow.render_video", side_effect=lambda s, op, **kw: op.write_bytes(b"f") or op),
+            ):
+                stage = run_scene_assembly(store, item["id"], [{"source_kind": "stock", "provider_id": "pixabay-777", "duration_seconds": 4}], transition="cut")
+            self.assertEqual(stage, "generated")
+            assembled = store.get_item(item["id"])
+            self.assertTrue(any("Pixabay" in r.get("source_description", "") for r in assembled["rights_assets"]))
+
     def test_postprocess_and_thumbnail_extract_and_publish_hooks(self) -> None:
         """@brief Extract thumbnails, postprocess uploaded MP4s, and pass thumbnails to publishers."""
         with tempfile.TemporaryDirectory() as directory:

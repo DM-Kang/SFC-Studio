@@ -40,7 +40,14 @@ from .publishing import (
     publish_youtube,
     update_youtube_privacy,
 )
-from .resources import collect_web_research, download_pexels_clip, fetch_direct_url_source, search_pexels_videos
+from .resources import (
+    collect_web_research,
+    download_pexels_clip,
+    download_stock_clip,
+    fetch_direct_url_source,
+    search_pexels_videos,
+    search_pixabay_videos,
+)
 from .store import Store
 
 
@@ -165,14 +172,23 @@ def run_web_research(store: Store, item_id: str, return_stage: str) -> str:
 
 
 def run_stock_material_search(store: Store, item_id: str, return_stage: str) -> str:
-    """@brief Search Pexels for scene-matched footage and retain review metadata."""
+    """@brief Search configured stock footage providers (Pixabay/Pexels) for scene-matched clips."""
     item = store.get_item(item_id)
     if item is None:
         raise KeyError(item_id)
     plan = item.get("plan")
     if not isinstance(plan, dict):
         raise RuntimeError("Generate a plan with scene descriptions before searching for video materials.")
-    materials = search_pexels_videos(plan.get("scenes", []), get_secret("PEXELS_API_KEY"))
+    scenes = plan.get("scenes", [])
+    pixabay_key = get_secret("PIXABAY_API_KEY")
+    pexels_key = get_secret("PEXELS_API_KEY")
+    if not pixabay_key and not pexels_key:
+        raise ValueError("Configure PIXABAY_API_KEY or PEXELS_API_KEY before searching stock videos.")
+    materials: list[dict[str, Any]] = []
+    if pixabay_key:
+        materials.extend(search_pixabay_videos(scenes, pixabay_key))
+    if pexels_key:
+        materials.extend(search_pexels_videos(scenes, pexels_key))
     store.update_payload(item_id, {"materials": materials, "materials_collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
     return return_stage
 
@@ -621,8 +637,26 @@ def _merge_supporting_rights_record(existing: Any, candidate: dict[str, Any]) ->
     return records
 
 
+def _material_rights_record(candidate: dict[str, Any], fallback_id: str) -> dict[str, Any]:
+    """@brief Build a normalized unverified rights-ledger entry for a stock material clip."""
+    provider_name = str(candidate.get("provider") or "Stock").strip() or "Stock"
+    default_license_url = "https://pixabay.com/service/license-summary/" if provider_name.lower() == "pixabay" else "https://www.pexels.com/license/"
+    return {
+        "asset_name": candidate.get("title") or f"{provider_name} {fallback_id}",
+        "asset_type": "video",
+        "source_description": f"{candidate.get('author') or 'Unknown'} · {provider_name}",
+        "source_url": candidate.get("source_url") or "",
+        "license_name": f"{provider_name} License · verify current terms",
+        "license_url": candidate.get("license_url") or default_license_url,
+        "rights_basis": "",
+        "attribution": candidate.get("author") or "",
+        "included": True,
+        "rights_status": "unverified",
+    }
+
+
 def download_stock_material_clip(store: Store, item_id: str, provider_id: str) -> dict[str, Any]:
-    """@brief Download a Pexels candidate video locally for multi-scene assembly."""
+    """@brief Download a stock candidate video locally for multi-scene assembly."""
     item = store.get_item(item_id)
     if item is None:
         raise KeyError(item_id)
@@ -632,28 +666,19 @@ def download_stock_material_clip(store: Store, item_id: str, provider_id: str) -
         raise KeyError(provider_id)
     download_url = candidate.get("download_url")
     if not isinstance(download_url, str) or not download_url:
-        raise RuntimeError("This Pexels result does not include a downloadable MP4 link.")
+        raise RuntimeError("This stock result does not include a downloadable MP4 link.")
+    provider_name = str(candidate.get("provider") or "Pexels")
+    provider_slug = "".join(ch for ch in provider_name.lower() if ch.isalnum()) or "stock"
     safe_id = "".join(ch for ch in str(provider_id) if ch.isalnum() or ch in {"-", "_"})[:40] or str(uuid4())[:8]
     folder = item_directory(item_id) / "clips"
-    destination = folder / f"pexels_{safe_id}.mp4"
-    download_pexels_clip(download_url, destination)
+    destination = folder / f"{provider_slug}_{safe_id}.mp4"
+    download_stock_clip(download_url, destination, provider_name=provider_name)
     for entry in materials:
         if isinstance(entry, dict) and str(entry.get("provider_id")) == str(provider_id):
             entry["local_path"] = str(destination)
     rights_assets = _merge_supporting_rights_record(
         item.get("rights_assets"),
-        {
-            "asset_name": candidate.get("title") or f"Pexels {safe_id}",
-            "asset_type": "video",
-            "source_description": f"{candidate.get('author') or 'Unknown'} · Pexels",
-            "source_url": candidate.get("source_url") or "",
-            "license_name": "Pexels License · verify current terms",
-            "license_url": candidate.get("license_url") or "https://www.pexels.com/license/",
-            "rights_basis": "",
-            "attribution": candidate.get("author") or "",
-            "included": True,
-            "rights_status": "unverified",
-        },
+        _material_rights_record(candidate, safe_id),
     )
     return store.update_payload(item_id, {"materials": materials, "rights_assets": rights_assets})
 
@@ -689,34 +714,25 @@ def run_scene_assembly(
     for index, scene_req in enumerate(scene_inputs[:8]):
         source_kind = str(scene_req.get("source_kind") or "")
         duration = float(scene_req.get("duration_seconds") or 5.0)
-        if source_kind == "pexels":
+        if source_kind in {"pexels", "pixabay", "stock"}:
             provider_id = str(scene_req.get("provider_id") or "")
             candidate = next((m for m in materials if isinstance(m, dict) and str(m.get("provider_id")) == provider_id), None)
             if not candidate:
-                raise RuntimeError(f"Scene {index + 1}: Pexels candidate '{provider_id}' was not found.")
+                raise RuntimeError(f"Scene {index + 1}: stock candidate '{provider_id}' was not found.")
             local_path = Path(str(candidate.get("local_path") or ""))
             if not local_path.is_file():
                 download_url = candidate.get("download_url")
                 if not isinstance(download_url, str) or not download_url:
-                    raise RuntimeError(f"Scene {index + 1}: Pexels clip has no download URL.")
+                    raise RuntimeError(f"Scene {index + 1}: stock clip has no download URL.")
+                provider_name = str(candidate.get("provider") or source_kind)
+                provider_slug = "".join(ch for ch in provider_name.lower() if ch.isalnum()) or "stock"
                 safe_id = "".join(ch for ch in provider_id if ch.isalnum() or ch in {"-", "_"})[:40] or f"clip_{index}"
-                local_path = folder / "clips" / f"pexels_{safe_id}.mp4"
-                download_pexels_clip(download_url, local_path)
+                local_path = folder / "clips" / f"{provider_slug}_{safe_id}.mp4"
+                download_stock_clip(download_url, local_path, provider_name=provider_name)
                 candidate["local_path"] = str(local_path)
             rights_assets = _merge_supporting_rights_record(
                 rights_assets,
-                {
-                    "asset_name": candidate.get("title") or f"Pexels {provider_id}",
-                    "asset_type": "video",
-                    "source_description": f"{candidate.get('author') or 'Unknown'} · Pexels",
-                    "source_url": candidate.get("source_url") or "",
-                    "license_name": "Pexels License · verify current terms",
-                    "license_url": candidate.get("license_url") or "https://www.pexels.com/license/",
-                    "rights_basis": "",
-                    "attribution": candidate.get("author") or "",
-                    "included": True,
-                    "rights_status": "unverified",
-                },
+                _material_rights_record(candidate, provider_id),
             )
             media_type = "video"
         elif source_kind == "uploaded":

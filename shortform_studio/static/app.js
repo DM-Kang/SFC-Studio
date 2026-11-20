@@ -14,6 +14,9 @@ function escapeHtml(value) {
 
 function toast(message) {
   const element = document.getElementById("toast");
+  const openDialog = [...document.querySelectorAll("dialog[open]")].pop();
+  const host = openDialog || document.body;
+  if (element.parentElement !== host) host.appendChild(element);
   element.textContent = message;
   element.classList.add("visible");
   clearTimeout(state.toastTimer);
@@ -47,7 +50,7 @@ function renderProviders() {
     [`기획 AI · ${providerNames[aiStages.planning?.provider] || "미설정"}`, aiStages.planning?.ready],
     [`검수 AI · ${providerNames[aiStages.review?.provider] || "미설정"}`, aiStages.review?.ready],
     ["웹 출처 조사", state.settings.research_ready],
-    ["Pexels 소재 검색", state.settings.stock_video_ready],
+    ["스톡 영상 검색", state.settings.stock_video_ready],
     ["Runway 영상", state.settings.runway_ready],
     ["음성·자막", state.settings.elevenlabs_ready],
     ["FFmpeg", state.settings.ffmpeg_ready],
@@ -749,12 +752,15 @@ function renderMaterials(item) {
   const materials = item.materials || [];
   const sceneCards = (plan.scenes || []).map(scene => {
     const candidates = materials.filter(candidate => candidate.scene_id === scene.id);
-    const candidateCards = candidates.map(candidate => `<article class="material-card">${candidate.poster_url ? `<img src="${escapeHtml(candidate.poster_url)}" alt="${escapeHtml(candidate.title)}" loading="lazy">` : ""}<div><strong>${escapeHtml(candidate.title)}</strong><small>${escapeHtml(candidate.width || "?")}×${escapeHtml(candidate.height || "?")} · ${escapeHtml(candidate.duration_seconds ?? "?")}초 · <a href="${escapeHtml(candidate.author_url || candidate.source_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(candidate.author)} · Pexels</a></small><a href="${escapeHtml(candidate.source_url)}" target="_blank" rel="noopener noreferrer">Pexels 영상 페이지 ↗</a><a href="${escapeHtml(candidate.license_url)}" target="_blank" rel="noopener noreferrer">사용 조건 확인</a><span class="badge warn">권리·인물·상표 직접 확인 필요</span><div class="actions"><button class="button add-rights-candidate" type="button" data-candidate-id="${escapeHtml(candidate.provider_id)}" ${item.active_job ? "disabled" : ""}>권리 기록에 추가</button>${candidate.download_url ? `<button class="button download-material-clip" type="button" data-candidate-id="${escapeHtml(candidate.provider_id)}" ${item.active_job ? "disabled" : ""}>${candidate.local_path ? "클립 재다운로드" : "로컬 클립 저장"}</button>` : ""}</div>${candidate.local_path ? '<span class="badge good">조립용 클립 저장됨</span>' : ""}</div></article>`).join("");
+    const candidateCards = candidates.map(candidate => {
+      const providerName = candidate.provider || "Stock";
+      return `<article class="material-card">${candidate.poster_url ? `<img src="${escapeHtml(candidate.poster_url)}" alt="${escapeHtml(candidate.title)}" loading="lazy">` : ""}<div><strong>${escapeHtml(candidate.title)}</strong><small>${escapeHtml(candidate.width || "?")}×${escapeHtml(candidate.height || "?")} · ${escapeHtml(candidate.duration_seconds ?? "?")}초 · <a href="${escapeHtml(candidate.author_url || candidate.source_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(candidate.author)} · ${escapeHtml(providerName)}</a></small><a href="${escapeHtml(candidate.source_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(providerName)} 영상 페이지 ↗</a><a href="${escapeHtml(candidate.license_url)}" target="_blank" rel="noopener noreferrer">사용 조건 확인</a><span class="badge warn">권리·인물·상표 직접 확인 필요</span><div class="actions"><button class="button add-rights-candidate" type="button" data-candidate-id="${escapeHtml(candidate.provider_id)}" ${item.active_job ? "disabled" : ""}>권리 기록에 추가</button>${candidate.download_url ? `<button class="button download-material-clip" type="button" data-candidate-id="${escapeHtml(candidate.provider_id)}" ${item.active_job ? "disabled" : ""}>${candidate.local_path ? "클립 재다운로드" : "로컬 클립 저장"}</button>` : ""}</div>${candidate.local_path ? '<span class="badge good">조립용 클립 저장됨</span>' : ""}</div></article>`;
+    }).join("");
     return `<div class="scene-material"><strong>${escapeHtml(scene.id)} · ${escapeHtml(scene.visual_query)}</strong><p class="muted">${escapeHtml(scene.narration)}</p>${candidateCards || `<p class="small-note">아직 검색된 소재가 없습니다.</p>`}</div>`;
   }).join("");
-  const button = `<button id="materials-button" class="button" ${state.settings.stock_video_ready && !item.active_job ? "" : "disabled"}>${materials.length ? "장면별 소재 다시 검색" : "장면별 Pexels 영상 소재 검색"}</button>`;
-  const configNote = state.settings.stock_video_ready ? "장면별 검색어로 세로 영상을 찾습니다. 소재는 후보로만 저장되며 현재 MP4에 자동 합성되지 않습니다." : "사용하려면 사용자 데이터 폴더의 .env에 PEXELS_API_KEY를 설정하세요.";
-  return `<section class="resource-panel"><div class="card-head"><h4>장면별 영상 소재</h4>${item.materials_collected_at ? `<span class="muted">${escapeHtml(new Date(item.materials_collected_at).toLocaleString())}</span>` : ""}</div>${sceneCards}<div class="actions">${button}</div><p class="small-note">${configNote} Pexels 제공 자료도 개별 권리·초상권·상표를 게시 전에 확인해야 합니다.</p></section>`;
+  const button = `<button id="materials-button" class="button" ${state.settings.stock_video_ready && !item.active_job ? "" : "disabled"}>${materials.length ? "장면별 소재 다시 검색" : "장면별 스톡 영상 소재 검색"}</button>`;
+  const configNote = state.settings.stock_video_ready ? "장면별 검색어로 무료 스톡 영상을 찾습니다. 소재는 후보로만 저장되며 현재 MP4에 자동 합성되지 않습니다." : "사용하려면 'API 키 · .env 설정'에서 PIXABAY_API_KEY 또는 PEXELS_API_KEY를 설정하세요.";
+  return `<section class="resource-panel"><div class="card-head"><h4>장면별 영상 소재</h4>${item.materials_collected_at ? `<span class="muted">${escapeHtml(new Date(item.materials_collected_at).toLocaleString())}</span>` : ""}</div>${sceneCards}<div class="actions">${button}</div><p class="small-note">${configNote} 외부 스톡 자료도 개별 권리·초상권·상표를 게시 전에 확인해야 합니다.</p></section>`;
 }
 
 function estimateSpeakingDuration(script, language = "Korean") {
@@ -874,18 +880,18 @@ function renderAssemblyAndAudioPanel(item) {
   const plan = item.plan;
   if (!plan) return "";
   const disabled = item.active_job || Object.values(item.publications || {}).some(post => post.status === "published");
-  const downloadedPexels = (item.materials || []).filter(m => m.local_path);
+  const downloadedStock = (item.materials || []).filter(m => m.local_path);
   const uploadedClips = item.assets?.uploaded_clips || [];
   const hasSource = Boolean(item.assets?.source_video);
   const optionItems = [
-    ...downloadedPexels.map(m => ({ value: `pexels:${m.provider_id}`, label: `Pexels · ${m.title || m.provider_id}` })),
+    ...downloadedStock.map(m => ({ value: `stock:${m.provider_id}`, label: `${m.provider || "Stock"} · ${m.title || m.provider_id}` })),
     ...uploadedClips.map(c => ({ value: `uploaded:${c.filename}`, label: `업로드 · ${c.original_name || c.filename}` })),
     ...(hasSource ? [{ value: "source:", label: "현재 원본 영상" }] : [])
   ];
   const scenes = plan.scenes || [];
   const defaultDuration = Math.max(2, Math.round(((plan.duration_seconds || 20) / Math.max(1, scenes.length)) * 10) / 10);
   const sceneRows = scenes.map((scene, idx) => {
-    const opts = optionItems.length ? optionItems.map(opt => `<option value="${escapeHtml(opt.value)}">${escapeHtml(opt.label)}</option>`).join("") : '<option value="">클립을 먼저 업로드하거나 Pexels에서 저장하세요</option>';
+    const opts = optionItems.length ? optionItems.map(opt => `<option value="${escapeHtml(opt.value)}">${escapeHtml(opt.label)}</option>`).join("") : '<option value="">클립을 먼저 업로드하거나 스톡 영상을 저장하세요</option>';
     return `<div class="assembly-scene-row"><label>장면 ${idx + 1} (${escapeHtml(scene.visual_query || "")})<select class="assembly-scene-source" data-scene-idx="${idx}">${opts}</select></label><label>길이(초)<input class="assembly-scene-duration" type="number" min="1" max="30" step="0.5" value="${escapeHtml(scene.duration_seconds ?? defaultDuration)}"></label></div>`;
   }).join("");
   const bgmInfo = item.assets?.bgm_name ? `<span class="badge good">BGM: ${escapeHtml(item.assets.bgm_name)}</span>` : '<span class="small-note">BGM 미등록</span>';
@@ -1258,7 +1264,8 @@ async function addCandidateRightsAsset(item, providerId) {
   if (!candidate) return toast("소재 후보를 다시 불러온 뒤 시도해 주세요.");
   const saved = item.rights_assets || [];
   if (saved.some(asset => asset.source_url === candidate.source_url)) return toast("이미 권리 기록에 추가된 소재입니다.");
-  const assets = [...saved, { id: crypto.randomUUID(), asset_name: candidate.title || `Pexels ${providerId}`, asset_type: "video", source_description: `${candidate.author || "Unknown author"} · Pexels`, source_url: candidate.source_url || "", license_name: "Pexels License · verify current terms", license_url: candidate.license_url || "", rights_basis: "", attribution: candidate.author || "", included: true, rights_status: "unverified" }];
+  const providerName = candidate.provider || "Stock";
+  const assets = [...saved, { id: crypto.randomUUID(), asset_name: candidate.title || `${providerName} ${providerId}`, asset_type: "video", source_description: `${candidate.author || "Unknown author"} · ${providerName}`, source_url: candidate.source_url || "", license_name: `${providerName} License · verify current terms`, license_url: candidate.license_url || "", rights_basis: "", attribution: candidate.author || "", included: true, rights_status: "unverified" }];
   try {
     await api(`/api/items/${item.id}/rights`, { method: "PUT", body: JSON.stringify({ assets }) });
     toast("소재를 권리 기록에 추가했습니다. 사용 조건을 확인해 주세요.");
@@ -1363,7 +1370,7 @@ async function autofixPlanForItem(itemId) {
 async function downloadMaterialClip(itemId, providerId) {
   try {
     await api(`/api/items/${itemId}/materials/${encodeURIComponent(providerId)}/download`, { method: "POST" });
-    toast("Pexels 클립을 로컬에 저장하고 권리 기록에 추가했습니다.");
+    toast("스톡 영상 클립을 로컬에 저장하고 권리 기록에 추가했습니다.");
     await refresh(itemId);
   } catch (error) { toast(error.message); }
 }
@@ -1399,8 +1406,10 @@ async function assembleScenesForItem(itemId) {
   const scenes = rows.map(row => {
     const val = row.querySelector(".assembly-scene-source")?.value || "";
     const dur = Number(row.querySelector(".assembly-scene-duration")?.value || 5);
-    const [kind, rest] = val.split(":");
-    if (kind === "pexels") return { source_kind: "pexels", provider_id: rest, duration_seconds: dur };
+    const colonIdx = val.indexOf(":");
+    const kind = colonIdx >= 0 ? val.slice(0, colonIdx) : val;
+    const rest = colonIdx >= 0 ? val.slice(colonIdx + 1) : "";
+    if (kind === "pexels" || kind === "pixabay" || kind === "stock") return { source_kind: kind, provider_id: rest, duration_seconds: dur };
     if (kind === "uploaded") return { source_kind: "uploaded", filename: rest, duration_seconds: dur };
     if (kind === "source") return { source_kind: "source", duration_seconds: dur };
     return null;
@@ -1589,6 +1598,7 @@ const SECRET_FIELD_DEFS = [
   ["OPENAI_MODEL", "OpenAI 기본 모델 (예: gpt-4.1-mini)", null],
   ["ANTHROPIC_API_KEY", "Anthropic Claude API Key", "anthropic"],
   ["TAVILY_API_KEY", "Tavily 웹 조사 API Key", "tavily"],
+  ["PIXABAY_API_KEY", "Pixabay 무료 스톡 영상 API Key", "pixabay"],
   ["PEXELS_API_KEY", "Pexels 스톡 영상 API Key", "pexels"],
   ["RUNWAY_API_KEY", "Runway 영상 생성 API Key", "runway"],
   ["RUNWAY_MODEL", "Runway 모델 (기본 seedance2_5)", null],
@@ -1612,14 +1622,28 @@ async function openSecretsSettings() {
     container.innerHTML = SECRET_FIELD_DEFS.map(([key, label, testProvider]) => {
       const configured = Boolean(state.secretsStatus[key]);
       const isSecret = key.includes("KEY") || key.includes("TOKEN") || key.includes("SECRET");
-      const testBtn = testProvider ? `<button class="button test-provider-btn" type="button" data-provider="${testProvider}">연결 테스트</button>` : "";
-      return `<div class="secret-row"><label>${escapeHtml(label)} <span class="badge ${configured ? "good" : ""}">${configured ? "설정됨" : "미설정"}</span><input name="${key}" type="${isSecret ? "password" : "text"}" autocomplete="off" placeholder="${configured ? "변경 시에만 새 값 입력" : "값 입력"}"></label>${testBtn}</div>`;
+      const testBtn = testProvider ? `<button class="button test-provider-btn" type="button" data-provider="${testProvider}" data-secret-key="${key}">연결 테스트</button>` : "";
+      return `<div class="secret-row"><label>${escapeHtml(label)} <span class="badge ${configured ? "good" : ""}">${configured ? "설정됨" : "미설정"}</span><input name="${key}" type="${isSecret ? "password" : "text"}" autocomplete="off" placeholder="${configured ? "변경 시에만 새 값 입력" : "값 입력"}"></label>${testBtn}<small class="small-note secret-test-result" hidden></small></div>`;
     }).join("");
     container.querySelectorAll(".test-provider-btn").forEach(btn => btn.addEventListener("click", async () => {
+      const row = btn.closest(".secret-row");
+      const resultEl = row?.querySelector(".secret-test-result");
+      btn.disabled = true;
+      if (resultEl) {
+        resultEl.hidden = false;
+        resultEl.textContent = "연결 확인 중…";
+      }
       try {
         const res = await api(`/api/settings/test/${btn.dataset.provider}`, { method: "POST" });
-        toast(res.message || (res.ok ? "연결 성공" : "연결 실패"));
-      } catch (error) { toast(error.message); }
+        const msg = res.message || (res.ok ? "연결 성공" : "연결 실패");
+        if (resultEl) resultEl.textContent = res.ok ? `✓ ${msg}` : `✗ ${msg}`;
+        toast(msg);
+      } catch (error) {
+        if (resultEl) resultEl.textContent = `✗ ${error.message}`;
+        toast(error.message);
+      } finally {
+        btn.disabled = false;
+      }
     }));
     document.getElementById("secrets-settings-dialog").showModal();
   } catch (error) { toast(error.message); }

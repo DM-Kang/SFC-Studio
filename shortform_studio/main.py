@@ -135,7 +135,7 @@ class PlanEdit(BaseModel):
 class SceneAssemblyClipInput(BaseModel):
     """Validate one scene clip assignment for FFmpeg multi-scene assembly."""
 
-    source_kind: Literal["pexels", "uploaded", "source"]
+    source_kind: Literal["stock", "pexels", "pixabay", "uploaded", "source"]
     provider_id: str = Field(default="", max_length=80)
     filename: str = Field(default="", max_length=180)
     duration_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
@@ -611,7 +611,7 @@ async def restrict_to_local_browser(request: Any, call_next: Any) -> Any:
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; media-src 'self'; img-src 'self' data: https://images.pexels.com; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self'; media-src 'self'; img-src 'self' data: https://images.pexels.com https://cdn.pixabay.com https://i.vimeocdn.com; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     return response
 
 
@@ -653,7 +653,9 @@ def settings() -> dict[str, Any]:
         "openai_ready": bool(get_secret("OPENAI_API_KEY") and get_secret("OPENAI_MODEL")),
         "openai_model": get_secret("OPENAI_MODEL"),
         "research_ready": bool(get_secret("TAVILY_API_KEY")),
-        "stock_video_ready": bool(get_secret("PEXELS_API_KEY")),
+        "stock_video_ready": bool(get_secret("PEXELS_API_KEY") or get_secret("PIXABAY_API_KEY")),
+        "pexels_ready": bool(get_secret("PEXELS_API_KEY")),
+        "pixabay_ready": bool(get_secret("PIXABAY_API_KEY")),
         "runway_ready": bool(get_secret("RUNWAY_API_KEY")),
         "runway_model": get_secret("RUNWAY_MODEL", "seedance2_5"),
         "elevenlabs_ready": bool(get_secret("ELEVENLABS_API_KEY") and get_secret("ELEVENLABS_VOICE_ID")),
@@ -691,6 +693,8 @@ def test_provider_endpoint(provider: str) -> dict[str, Any]:
         return test_provider_connection(provider)
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from None
+    except RuntimeError as error:
+        return {"ok": False, "message": str(error)}
     except RuntimeError as error:
         return {"ok": False, "message": str(error)}
 
@@ -1245,13 +1249,13 @@ def cancel_item_job(item_id: str) -> dict[str, Any]:
 
 @app.post("/api/items/{item_id}/materials", status_code=202)
 def start_material_search(item_id: str) -> dict[str, str]:
-    """@brief Start explicit Pexels footage discovery for generated plan scenes."""
+    """@brief Start explicit stock-footage discovery for generated plan scenes."""
     item = _get_item(item_id)
     _ensure_mutable(item)
     if not isinstance(item.get("plan"), dict):
         raise HTTPException(status_code=409, detail="Generate a plan with scenes before searching for video materials.")
-    if not get_secret("PEXELS_API_KEY"):
-        raise HTTPException(status_code=503, detail="Configure PEXELS_API_KEY before searching stock videos.")
+    if not (get_secret("PIXABAY_API_KEY") or get_secret("PEXELS_API_KEY")):
+        raise HTTPException(status_code=503, detail="Configure PIXABAY_API_KEY or PEXELS_API_KEY before searching stock videos.")
     prior_stage = str(item.get("stage") or "planned")
     job_id = _schedule(item_id, "collecting_materials", lambda: run_stock_material_search(store, item_id, prior_stage))
     return {"job_id": job_id, "status": "collecting_materials"}

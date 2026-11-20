@@ -16,6 +16,7 @@ from typing import Any
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 TAVILY_EXTRACT_URL = "https://api.tavily.com/extract"
 PEXELS_VIDEO_SEARCH_URL = "https://api.pexels.com/v1/videos/search"
+PIXABAY_VIDEO_SEARCH_URL = "https://pixabay.com/api/videos/"
 MAX_PROVIDER_RESPONSE_BYTES = 4_000_000
 MAX_RESEARCH_SOURCES = 5
 MAX_EXTRACTED_SOURCES = 4
@@ -42,9 +43,10 @@ def _request_json(url: str, *, headers: dict[str, str], body: dict[str, Any], ti
     return _decode_json_response(encoded)
 
 
-def _get_json(url: str, *, headers: dict[str, str], timeout: int = 30) -> dict[str, Any]:
+def _get_json(url: str, *, headers: dict[str, str] | None = None, timeout: int = 30) -> dict[str, Any]:
     """@brief Read a bounded JSON response from a fixed provider API endpoint."""
-    request = urllib.request.Request(url, headers=headers, method="GET")
+    merged_headers = {"User-Agent": "ShortformContentStudio/0.1", "Accept": "application/json", **(headers or {})}
+    request = urllib.request.Request(url, headers=merged_headers, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             encoded = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
@@ -280,8 +282,103 @@ def _select_pexels_download_url(video_files: list[Any]) -> str | None:
     return candidates[0][1]
 
 
-def download_pexels_clip(download_url: str, destination: Path, *, max_bytes: int = 250_000_000) -> int:
-    """@brief Safely download a validated HTTPS Pexels MP4 clip to local storage."""
+def _select_pixabay_video_entry(videos_obj: Any) -> dict[str, Any] | None:
+    """@brief Pick a bounded portrait or HD MP4 rendition from Pixabay video metadata."""
+    if not isinstance(videos_obj, dict):
+        return None
+    candidates: list[tuple[int, dict[str, Any]]] = []
+    fallback_thumbnail: str | None = None
+    for size_rank, size_key in enumerate(("medium", "large", "small", "tiny")):
+        entry = videos_obj.get(size_key)
+        if not isinstance(entry, dict):
+            continue
+        thumb = _safe_public_url(entry.get("thumbnail"))
+        if thumb and not fallback_thumbnail:
+            fallback_thumbnail = thumb
+        link = _safe_public_url(entry.get("url"))
+        if not link:
+            continue
+        width = int(entry.get("width") or 0) if isinstance(entry.get("width"), int) else 0
+        height = int(entry.get("height") or 0) if isinstance(entry.get("height"), int) else 0
+        portrait_bonus = 10_000 if height > width else 0
+        hd_score = min(height or 720, 1920)
+        candidates.append((portrait_bonus + hd_score - size_rank, {"url": link, "width": width, "height": height, "thumbnail": thumb}))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    chosen = candidates[0][1]
+    if not chosen.get("thumbnail") and fallback_thumbnail:
+        chosen["thumbnail"] = fallback_thumbnail
+    return chosen
+
+
+def search_pixabay_videos(scenes: list[dict[str, Any]], api_key: str) -> list[dict[str, Any]]:
+    """@brief Search Pixabay free stock videos per planned scene and retain provenance."""
+    if not api_key:
+        raise ValueError("Configure PIXABAY_API_KEY before searching stock videos.")
+    if not isinstance(scenes, list) or not scenes:
+        raise ValueError("Generate a plan with scenes before searching for video materials.")
+    materials: list[dict[str, Any]] = []
+    for scene in scenes[:MAX_SCENE_SEARCHES]:
+        if not isinstance(scene, dict):
+            continue
+        query = str(scene.get("visual_query") or "").strip()[:100]
+        scene_id = str(scene.get("id") or "")[:20]
+        if not query:
+            continue
+        url = f"{PIXABAY_VIDEO_SEARCH_URL}?{urllib.parse.urlencode({'key': api_key, 'q': query, 'per_page': max(3, min(10, MAX_VIDEOS_PER_SCENE * 3)), 'safesearch': 'true', 'video_type': 'all'})}"
+        response = _get_json(url)
+        hits = response.get("hits", [])
+        ranked_hits: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+        for hit in hits if isinstance(hits, list) else []:
+            if not isinstance(hit, dict):
+                continue
+            best = _select_pixabay_video_entry(hit.get("videos"))
+            source_url = _safe_public_url(hit.get("pageURL"))
+            if not best or not source_url:
+                continue
+            portrait_bonus = 10_000 if (best["height"] > best["width"]) else 0
+            ranked_hits.append((portrait_bonus + min(best["height"], 1920), hit, best))
+        ranked_hits.sort(key=lambda entry: entry[0], reverse=True)
+        for _, hit, best in ranked_hits[:MAX_VIDEOS_PER_SCENE]:
+            source_url = _safe_public_url(hit.get("pageURL"))
+            if not source_url:
+                continue
+            poster_url = _safe_public_url(best.get("thumbnail"))
+            picture_id = str(hit.get("picture_id") or "").strip()
+            if not poster_url and picture_id and all(ch.isalnum() or ch in {"-", "_"} for ch in picture_id):
+                poster_url = f"https://i.vimeocdn.com/video/{picture_id}_640x360.jpg"
+            author_name = str(hit.get("user") or "Unknown contributor")[:160]
+            user_id = hit.get("user_id")
+            author_url = None
+            if hit.get("user") and isinstance(user_id, int):
+                author_url = _safe_public_url(f"https://pixabay.com/users/{urllib.parse.quote(str(hit['user']))}-{user_id}/")
+            hit_id = str(hit.get("id") or "")
+            materials.append(
+                {
+                    "scene_id": scene_id,
+                    "query": query,
+                    "provider": "Pixabay",
+                    "provider_id": f"pixabay-{hit_id}"[:80],
+                    "title": (f"Pixabay · {str(hit.get('tags') or hit_id).split(',')[0].strip()}" if hit.get("tags") else f"Pixabay video {hit_id}")[:160],
+                    "source_url": source_url,
+                    "download_url": best["url"],
+                    "poster_url": poster_url,
+                    "author": author_name,
+                    "author_url": author_url,
+                    "duration_seconds": hit.get("duration") if isinstance(hit.get("duration"), int) else None,
+                    "width": best["width"] or None,
+                    "height": best["height"] or None,
+                    "license_url": "https://pixabay.com/service/license-summary/",
+                    "rights_status": "human_verification_required",
+                    "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                }
+            )
+    return materials
+
+
+def download_stock_clip(download_url: str, destination: Path, *, max_bytes: int = 250_000_000, provider_name: str = "Stock provider") -> int:
+    """@brief Safely download a validated HTTPS stock MP4 clip to local storage."""
     safe_url = _safe_public_url(download_url)
     if not safe_url:
         raise ValueError("Clip download URL must be a valid public HTTPS link.")
@@ -297,12 +394,17 @@ def download_pexels_clip(download_url: str, destination: Path, *, max_bytes: int
                     raise ValueError("Downloaded stock clip exceeds the 250 MB safety limit.")
                 output.write(chunk)
         if total == 0:
-            raise RuntimeError("Pexels returned an empty video clip.")
+            raise RuntimeError(f"{provider_name} returned an empty video clip.")
         temporary.replace(destination)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
     return total
+
+
+def download_pexels_clip(download_url: str, destination: Path, *, max_bytes: int = 250_000_000) -> int:
+    """@brief Backward-compatible wrapper around download_stock_clip for Pexels clips."""
+    return download_stock_clip(download_url, destination, max_bytes=max_bytes, provider_name="Pexels")
 
 
 def _resolve_and_verify_public_host(url: str) -> str:
@@ -378,6 +480,12 @@ def test_provider_connection(provider: str) -> dict[str, Any]:
             return {"ok": False, "message": "PEXELS_API_KEY is not set."}
         _get_json(f"{PEXELS_VIDEO_SEARCH_URL}?query=nature&per_page=1", headers={"Authorization": key}, timeout=15)
         return {"ok": True, "message": "Pexels API key verified."}
+    if name == "pixabay":
+        key = get_secret("PIXABAY_API_KEY")
+        if not key:
+            return {"ok": False, "message": "PIXABAY_API_KEY is not set."}
+        _get_json(f"{PIXABAY_VIDEO_SEARCH_URL}?{urllib.parse.urlencode({'key': key, 'q': 'nature', 'per_page': 3})}", timeout=15)
+        return {"ok": True, "message": "Pixabay API key verified."}
     if name == "elevenlabs":
         key = get_secret("ELEVENLABS_API_KEY")
         if not key:
