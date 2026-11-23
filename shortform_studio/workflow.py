@@ -1596,6 +1596,7 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
             scene_inputs,
             transition=active_transition if len(scene_inputs) > 1 else "cut",
             tts_provider=tts_mode,
+            tts_voice=str(item.get("tts_voice") or ""),
             tts_speed=tts_speed,
             loudnorm=True,
             subtitle_style=active_subtitle_style,

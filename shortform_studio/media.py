@@ -1383,21 +1383,91 @@ def generate_ai_scene_image(
     return None
 
 
+NARRATION_VOICE_PRESETS: dict[str, dict[str, str]] = {
+    "": {"label": "여성 · 밝고 또렷한 표준 (기본)", "gemini_voice": "Kore", "openai_voice": "alloy", "style_prompt": ""},
+    "female_standard": {"label": "여성 · 밝고 또렷한 표준 (기본)", "gemini_voice": "Kore", "openai_voice": "alloy", "style_prompt": ""},
+    "female_warm": {
+        "label": "여성 · 따뜻하고 차분한 감성",
+        "gemini_voice": "Aoede",
+        "openai_voice": "nova",
+        "style_prompt": "- Character: Warm, gentle young Korean adult woman\n- Style: Soft, soothing storytelling tone with calm pacing",
+    },
+    "female_energetic": {
+        "label": "여성 · 활기찬 쇼호스트·리뷰",
+        "gemini_voice": "Zephyr",
+        "openai_voice": "shimmer",
+        "style_prompt": "- Character: Lively, bright Korean female host\n- Style: Crisp, energetic, friendly emphasis",
+    },
+    "male_announcer": {
+        "label": "남성 · 힘 있는 스포츠·뉴스 해설",
+        "gemini_voice": "Fenrir",
+        "openai_voice": "onyx",
+        "style_prompt": "- Character: Charismatic Korean male sports caster / anchor\n- Style: Confident, punchy, articulate, dynamic broadcast energy",
+    },
+    "male_calm": {
+        "label": "남성 · 중저음 신뢰감 나레이션",
+        "gemini_voice": "Charon",
+        "openai_voice": "echo",
+        "style_prompt": "- Character: Calm, trustworthy Korean adult male narrator\n- Style: Deep warm baritone, steady documentary narration",
+    },
+    "male_young": {
+        "label": "남성 · 친근하고 밝은 청년",
+        "gemini_voice": "Puck",
+        "openai_voice": "fable",
+        "style_prompt": "- Character: Friendly, upbeat young Korean man\n- Style: Natural conversational rhythm, bright and engaging",
+    },
+    "child_bright": {
+        "label": "아이 · 맑고 명랑한 어린이",
+        "gemini_voice": "Leda",
+        "openai_voice": "nova",
+        "style_prompt": "- Character: Cheerful 8-year-old Korean child\n- Voice Profile: High-pitched, innocent, playful, bright youthful voice in native Seoul Korean",
+    },
+    "elder_grandfather": {
+        "label": "어르신 · 푸근한 할아버지",
+        "gemini_voice": "Charon",
+        "openai_voice": "onyx",
+        "style_prompt": "- Character: 75-year-old warm, gentle Korean grandfather\n- Voice Profile: Deep weathered elder male voice, comforting, nostalgic and wise cadence",
+    },
+    "elder_grandmother": {
+        "label": "어르신 · 다정한 할머니",
+        "gemini_voice": "Aoede",
+        "openai_voice": "sage",
+        "style_prompt": "- Character: 75-year-old affectionate Korean grandmother\n- Voice Profile: Gentle warm elder female voice, soft and caring cadence",
+    },
+}
+
+_GEMINI_TTS_VOICES = {"Kore", "Aoede", "Charon", "Fenrir", "Puck", "Zephyr", "Leda", "Autonoe", "Erinome"}
+
+
+def resolve_tts_voice_spec(voice: str, *, provider: str = "gemini_tts") -> tuple[str, str]:
+    """@brief Map semantic persona IDs or raw voice names into (provider_voice_name, style_director_prompt)."""
+    clean = str(voice or "").strip()
+    if clean in NARRATION_VOICE_PRESETS:
+        spec = NARRATION_VOICE_PRESETS[clean]
+        target = spec["gemini_voice"] if provider == "gemini_tts" else spec["openai_voice"]
+        return target, spec["style_prompt"]
+    if provider == "gemini_tts":
+        default_v = get_secret("GEMINI_TTS_VOICE", "Kore") or "Kore"
+        picked = clean if clean in _GEMINI_TTS_VOICES else default_v
+        return (picked if picked in _GEMINI_TTS_VOICES else "Kore"), ""
+    default_oa = get_secret("OPENAI_TTS_VOICE", "alloy") or "alloy"
+    return (clean or default_oa), ""
+
+
 def _generate_gemini_tts(text: str, output_dir: Path, *, voice: str = "", speed: float = 1.35) -> dict[str, Any]:
-    """@brief Synthesize native Korean/multilingual speech using Gemini TTS with crisp pace and word-aligned SRT."""
+    """@brief Synthesize native Korean/multilingual speech using Gemini TTS with persona direction, crisp pace, and word-aligned SRT."""
     api_key = get_secret("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is required for Gemini TTS.")
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("FFmpeg is required to encode Gemini TTS audio.")
-    chosen_voice = voice.strip() or get_secret("GEMINI_TTS_VOICE", "Kore") or "Kore"
-    if chosen_voice not in {"Kore", "Aoede", "Charon", "Fenrir", "Puck", "Zephyr"}:
-        chosen_voice = "Kore"
+    chosen_voice, style_prompt = resolve_tts_voice_spec(voice, provider="gemini_tts")
     spoken_text, display_text = _prepare_tts_and_caption_texts(text)
     spoken = spoken_text[:3000]
+    tts_input = f"# AUDIO PROFILE\n{style_prompt}\n#### TRANSCRIPT\n{spoken}" if style_prompt else spoken
     body = {
-        "contents": [{"parts": [{"text": spoken}]}],
+        "contents": [{"parts": [{"text": tts_input}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": chosen_voice}}},
@@ -1472,7 +1542,7 @@ def _generate_openai_tts(text: str, output_dir: Path, *, voice: str = "", speed:
     api_key = get_secret("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is required for OpenAI TTS.")
-    chosen_voice = voice.strip() or get_secret("OPENAI_TTS_VOICE", "alloy")
+    chosen_voice, _ = resolve_tts_voice_spec(voice, provider="openai_tts")
     if chosen_voice not in {"alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"}:
         chosen_voice = "alloy"
     spoken_text, display_text = _prepare_tts_and_caption_texts(text)

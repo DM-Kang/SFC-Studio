@@ -424,6 +424,70 @@ class KoreanNumbersTests(unittest.TestCase):
                 self.assertEqual(bgm_out, root / "bgm_auto.mp3")
                 self.assertEqual(bgm_out.read_bytes(), b"lyria-out")
 
+    def test_narration_voice_presets_support_male_female_child_elder_personas(self) -> None:
+        import base64 as _base64
+        import json as _json
+        from shortform_studio.media import resolve_tts_voice_spec
+
+        self.assertEqual(resolve_tts_voice_spec("", provider="gemini_tts")[0], "Kore")
+        self.assertEqual(resolve_tts_voice_spec("male_announcer", provider="gemini_tts")[0], "Fenrir")
+        self.assertEqual(resolve_tts_voice_spec("child_bright", provider="gemini_tts")[0], "Leda")
+        self.assertEqual(resolve_tts_voice_spec("elder_grandfather", provider="gemini_tts")[0], "Charon")
+        self.assertEqual(resolve_tts_voice_spec("male_announcer", provider="openai_tts")[0], "onyx")
+
+        captured: list[dict] = []
+
+        class _FakeResp:
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+        def _fake_urlopen(req, timeout=60):
+            captured.append(_json.loads(req.data.decode("utf-8")))
+            return _FakeResp(
+                _json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "content": {
+                                    "parts": [
+                                        {
+                                            "inlineData": {
+                                                "mimeType": "audio/wav",
+                                                "data": _base64.b64encode(b"RIFFdata").decode("ascii"),
+                                            }
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            with patch("shortform_studio.media.get_secret", side_effect=lambda k, d="": "fake-key" if k == "GEMINI_API_KEY" else d), patch(
+                "shortform_studio.media.shutil.which", return_value="/usr/bin/ffmpeg"
+            ), patch("shortform_studio.media.urllib.request.urlopen", side_effect=_fake_urlopen), patch(
+                "shortform_studio.media._run_ffmpeg",
+                side_effect=lambda cmd, cwd=None: ((cwd / "voiceover.mp3").write_bytes(b"mp3"), (0, ""))[1],
+            ), patch("shortform_studio.media.probe_audio_duration", return_value=3.0):
+                res = generate_voiceover("리버풀 4:0 맨유 대승!", out, tts_provider="gemini_tts", voice="male_announcer")
+        self.assertEqual(res["voice_id"], "Fenrir")
+        req_body = captured[0]
+        self.assertEqual(req_body["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"], "Fenrir")
+        self.assertIn("# AUDIO PROFILE", req_body["contents"][0]["parts"][0]["text"])
+        self.assertIn("리버풀 사 대 영 맨유 대승!", req_body["contents"][0]["parts"][0]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

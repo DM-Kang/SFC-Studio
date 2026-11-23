@@ -136,6 +136,7 @@ class NewItem(BaseModel):
     visual_mode: Literal["hybrid", "ai_images", "omni_video", "stock"] = "hybrid"
     use_attached_media: bool = True
     tts_speed: float = Field(default=1.35, ge=0.75, le=2.0)
+    tts_voice: str = Field(default="", max_length=64)
 
 
 class RetimeVideoRequest(BaseModel):
@@ -241,6 +242,7 @@ class RejectRequest(BaseModel):
     auto_reproduce: bool = True
     visual_mode: Literal["hybrid", "ai_images", "omni_video", "stock"] | None = None
     style_template_id: str | None = Field(default=None, max_length=64)
+    tts_voice: str | None = Field(default=None, max_length=64)
 
 
 class PublishRequest(BaseModel):
@@ -2082,6 +2084,8 @@ def reject_item(item_id: str, request: RejectRequest) -> Any:
         tpl_id = request.style_template_id.strip() if isinstance(request.style_template_id, str) and request.style_template_id.strip() else None
         updates["style_template_id"] = tpl_id
         updates["style_template_snapshot"] = find_style_template(store, tpl_id) if tpl_id else None
+    if "tts_voice" in request.model_fields_set and request.tts_voice is not None:
+        updates["tts_voice"] = request.tts_voice.strip()
     if updates:
         updated = store.update_payload(item_id, updates)
     if not request.auto_reproduce:

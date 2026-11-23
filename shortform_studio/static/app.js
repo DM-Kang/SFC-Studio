@@ -1171,8 +1171,20 @@ function renderDecisionCard(item) {
     : "";
   const curVisMode = item.visual_mode || "hybrid";
   const curTplId = item.style_template_id || item.style_template_snapshot?.id || "";
+  const curVoice = item.tts_voice || "";
   const tplList = state.styleTemplatesState?.templates || [];
   const rejectTplOpts = `<option value="">기본 스타일 유지</option>` + tplList.map(tpl => `<option value="${escapeHtml(tpl.id)}" ${tpl.id === curTplId ? "selected" : ""}>${escapeHtml(tpl.name)}</option>`).join("");
+  const voiceOpts = [
+    ["", "여성 · 밝고 또렷한 표준 (기본)"],
+    ["female_warm", "여성 · 따뜻하고 차분한 감성"],
+    ["female_energetic", "여성 · 활기찬 쇼호스트·리뷰"],
+    ["male_announcer", "남성 · 힘 있는 스포츠·뉴스 해설"],
+    ["male_calm", "남성 · 중저음 신뢰감 나레이션"],
+    ["male_young", "남성 · 친근하고 밝은 청년"],
+    ["child_bright", "아이 · 맑고 명랑한 어린이"],
+    ["elder_grandfather", "어르신 · 푸근한 할아버지"],
+    ["elder_grandmother", "어르신 · 다정한 할머니"],
+  ].map(([val, lbl]) => `<option value="${val}" ${curVoice === val ? "selected" : ""}>${lbl}</option>`).join("");
 
   return `<section class="decision-card panel">
     <div class="card-head"><div><p class="eyebrow">FINAL APPROVAL · HUMAN IN THE LOOP</p><h3>완성본 최종 확인 · 승인 또는 반려</h3></div><span class="badge ${techFailed ? "bad" : "good"}">revision ${escapeHtml(plan?.revision ?? 1)}</span></div>
@@ -1206,6 +1218,7 @@ function renderDecisionCard(item) {
               <label>재제작 화면 방식<select id="reject-visual-mode-select"><option value="hybrid" ${curVisMode === "hybrid" ? "selected" : ""}>하이브리드 (스톡 + AI 이미지)</option><option value="omni_video" ${curVisMode === "omni_video" ? "selected" : ""}>Google Omni AI 실제 동영상 (Flow급 · 유료 API)</option><option value="ai_images" ${curVisMode === "ai_images" ? "selected" : ""}>전 장면 Gemini AI 이미지 + 모션</option><option value="stock" ${curVisMode === "stock" ? "selected" : ""}>스톡 영상만 사용</option></select></label>
               <label>자막·편집 스타일 템플릿<select id="reject-style-template-select">${rejectTplOpts}</select></label>
             </div>
+            <label>나레이션 목소리<select id="reject-tts-voice-select">${voiceOpts}</select></label>
             <label>반려 의견 (수정·재제작 방향 입력)<textarea id="reject-feedback-input" rows="3" maxlength="2000" placeholder="예: 첫 문장이 너무 평범해요. 새로 추가한 사진을 첫 장면에 쓰고, 배경 음악을 더 밝게 바꿔서 다시 만들어 주세요.">${escapeHtml(rejectDraft)}</textarea></label>
             <div class="actions"><button id="decision-reject-submit" class="button danger" type="button">반려 의견 반영해 다시 제작</button></div>
           </div>
@@ -1875,9 +1888,11 @@ async function rejectAutopilotItem(itemId) {
   if (feedback.length < 2) return toast("반려 의견(수정 방향)을 2자 이상 입력하세요.");
   const visualMode = document.getElementById("reject-visual-mode-select")?.value || null;
   const styleTplRaw = document.getElementById("reject-style-template-select")?.value;
+  const ttsVoiceRaw = document.getElementById("reject-tts-voice-select")?.value;
   const payload = { feedback, auto_reproduce: true };
   if (visualMode) payload.visual_mode = visualMode;
   if (styleTplRaw !== undefined) payload.style_template_id = styleTplRaw || null;
+  if (ttsVoiceRaw !== undefined) payload.tts_voice = ttsVoiceRaw;
   try {
     await api(`/api/items/${itemId}/reject`, {
       method: "POST",
@@ -2423,6 +2438,7 @@ async function createItem(event) {
   const visualMode = body.visual_mode || "hybrid";
   const styleTemplateId = body.style_template_id || null;
   const ttsSpeed = Number(body.tts_speed || 1.35);
+  const ttsVoice = String(body.tts_voice || "");
   const useAttachedMedia = form.querySelector('input[name="use_attached_media"]')?.checked ?? true;
   const pendingFiles = [...state.pendingAttachments];
   body.platforms = [...form.querySelectorAll('input[name="platforms"]:checked')].map(input => input.value);
@@ -2452,6 +2468,8 @@ async function createItem(event) {
     if (visualSelect) visualSelect.value = visualMode;
     const styleSelect = document.getElementById("style-template-select");
     if (styleSelect && styleTemplateId) styleSelect.value = styleTemplateId;
+    const voiceSelect = document.getElementById("tts-voice-select");
+    if (voiceSelect) voiceSelect.value = ttsVoice;
     renderNewStyleTemplatePreview();
     syncWorkflowModeUI();
     state.selectedId = item.id;
