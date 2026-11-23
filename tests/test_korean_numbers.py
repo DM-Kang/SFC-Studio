@@ -9,7 +9,13 @@ from shortform_studio.korean_numbers import (
     korean_text_to_tts_speech,
     normalize_korean_display_text,
 )
-from shortform_studio.media import _prepare_tts_and_caption_texts, generate_voiceover
+from shortform_studio.media import (
+    _build_tts_audio_filter,
+    _prepare_tts_and_caption_texts,
+    format_shorts_banner_text,
+    generate_voiceover,
+    scale_srt_timestamps,
+)
 from shortform_studio.planning import generate_plan
 
 
@@ -149,6 +155,137 @@ class KoreanNumbersTests(unittest.TestCase):
         self.assertIn("12시간", plan["script"])
         self.assertIn("1:9", plan["hook"])
         self.assertIn("12시간", plan["scenes"][0]["narration"])
+
+    def test_tts_pace_filter_and_srt_scaling(self) -> None:
+        flt = _build_tts_audio_filter(1.5, trim_silence=True)
+        self.assertIn("silenceremove=", flt)
+        self.assertIn("atempo=1.500", flt)
+
+        base_srt = "1\n00:00:00,000 --> 00:00:03,000\n첫 자막\n\n2\n00:00:03,000 --> 00:00:06,000\n둘째 자막\n"
+        scaled = scale_srt_timestamps(base_srt, 1.5)
+        self.assertIn("00:00:00,000 --> 00:00:02,000", scaled)
+        self.assertIn("00:00:02,000 --> 00:00:04,000", scaled)
+
+    def test_banner_text_keeps_korean_compound_nouns_intact(self) -> None:
+        self.assertEqual(format_shorts_banner_text("목 뻐근할 땐 초승달 메밀베개"), r"목 뻐근할 땐\N초승달 메밀베개")
+        self.assertEqual(format_shorts_banner_text("아침마다 뻐근한 목 초승달 경추베개"), r"아침마다 뻐근한 목\N초승달 경추베개")
+        self.assertEqual(format_shorts_banner_text("텁텁함 없는 콜드브루 황금 비율"), r"텁텁함 없는\N콜드브루 황금 비율")
+        self.assertEqual(format_shorts_banner_text("한 줄 제목"), "한 줄 제목")
+
+    def test_two_tier_banner_and_keyword_highlighted_subtitles(self) -> None:
+        from shortform_studio.media import srt_to_shorts_ass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ass_path = srt_to_shorts_ass(
+                "1\n00:00:00,000 --> 00:00:01,500\n60cm 크기 천연 메밀 100% 국내 제조!\n",
+                Path(tmp) / "captions.ass",
+                style={"preset": "shorts_punch"},
+                hook_title="목 뻐근할 땐 초승달 메밀베개",
+            )
+            ass_text = ass_path.read_text(encoding="utf-8")
+        self.assertIn(r"{\fs55\c&H00FFFFFF&}목 뻐근할 땐\N{\fs85\c&H0000E5FF}", ass_text)
+        self.assertIn(r"{\c&H0000E5FF&}60cm{\c&H00FFFFFF&}", ass_text)
+        self.assertIn(r"{\c&H0000E5FF&}100%{\c&H00FFFFFF&}", ass_text)
+        self.assertIn(r"{\c&H0000E5FF&}국내 제조{\c&H00FFFFFF&}", ass_text)
+
+    def test_multiscene_blurred_card_and_varied_motions(self) -> None:
+        from shortform_studio.media import build_multiscene_ffmpeg_command
+
+        cmd = build_multiscene_ffmpeg_command(
+            "ffmpeg",
+            [
+                {"relative_path": "clips/img1.jpg", "duration_seconds": 4.0, "media_type": "image", "aspect_fit": "card"},
+                {"relative_path": "clips/img2.png", "duration_seconds": 4.0, "media_type": "image"},
+                {"relative_path": "clips/img3.png", "duration_seconds": 4.0, "media_type": "image"},
+                {"relative_path": "clips/img4.png", "duration_seconds": 4.0, "media_type": "image"},
+            ],
+            "out.mp4",
+            transition="fade",
+        )
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("boxblur=24:4", fc)
+        self.assertIn("overlay=(W-w)/2:(H-h)/2", fc)
+        # Distinct camera motions across scenes (zoom-in/pan L->R/zoom-out/pan R->L)
+        self.assertIn("if(eq(on,0),0", fc)
+        self.assertIn("1.12-0.12*on/", fc)
+        self.assertIn("if(eq(on,0),iw-iw/zoom", fc)
+
+    def test_generate_ai_scene_image_attaches_reference_product_photos(self) -> None:
+        import base64 as _base64
+        import json as _json
+        from shortform_studio.media import generate_ai_scene_image
+
+        captured_bodies: list[dict] = []
+
+        class _FakeResp:
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+
+            def read(self) -> bytes:
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args) -> None:
+                return None
+
+        def _fake_urlopen(req, timeout=60):
+            captured_bodies.append(_json.loads(req.data.decode("utf-8")))
+            return _FakeResp(
+                _json.dumps(
+                    {
+                        "candidates": [
+                            {"content": {"parts": [{"inlineData": {"mimeType": "image/png", "data": _base64.b64encode(b"fake-png").decode("ascii")}}]}}
+                        ]
+                    }
+                ).encode("utf-8")
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ref_img = root / "product.jpg"
+            ref_img.write_bytes(b"\xff\xd8\xff\xe0dummy-jpeg")
+            out_img = root / "ai_scene.png"
+            with patch("shortform_studio.media.get_secret", side_effect=lambda k, d="": "fake-gem-key" if k == "GEMINI_API_KEY" else d), patch(
+                "shortform_studio.media.urllib.request.urlopen", side_effect=_fake_urlopen
+            ):
+                saved = generate_ai_scene_image("bedroom pillow scene", out_img, reference_image_paths=[ref_img])
+
+            self.assertEqual(saved, out_img)
+            self.assertEqual(out_img.read_bytes(), b"fake-png")
+            parts = captured_bodies[0]["contents"][0]["parts"]
+            self.assertTrue(any("inlineData" in part for part in parts))
+            text_part = next(part["text"] for part in parts if "text" in part)
+            self.assertIn("reference photo", text_part)
+
+    def test_synthesize_sfx_and_mix_bgm_builds_amix_command(self) -> None:
+        from shortform_studio.media import synthesize_sfx_and_mix_bgm
+
+        commands: list[list[str]] = []
+
+        def _fake_ff(cmd: list[str], cwd=None):
+            commands.append(cmd)
+            Path(cmd[-1]).write_bytes(b"audio")
+            return 0, ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bgm = root / "bgm_auto.mp3"
+            bgm.write_bytes(b"mp3")
+            out_mix = root / "bgm_sfx.mp3"
+            with patch("shortform_studio.media.shutil.which", return_value="/usr/bin/ffmpeg"), patch(
+                "shortform_studio.media._run_ffmpeg", side_effect=_fake_ff
+            ):
+                res = synthesize_sfx_and_mix_bgm(bgm, [3.0, 4.0, 3.5], out_mix)
+            self.assertEqual(res, out_mix)
+            self.assertTrue(out_mix.is_file())
+            mix_cmd = commands[-1]
+            fc = mix_cmd[mix_cmd.index("-filter_complex") + 1]
+            self.assertIn("adelay=40|40", fc)
+            self.assertIn("adelay=3000|3000", fc)
+            self.assertIn("adelay=7000|7000", fc)
+            self.assertIn("normalize=0", fc)
 
 
 if __name__ == "__main__":

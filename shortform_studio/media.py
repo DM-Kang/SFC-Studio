@@ -355,22 +355,88 @@ def _parse_srt_cues(raw_srt: str) -> list[tuple[float, float, str]]:
     return cues
 
 
+_BANNER_CLAUSE_ENDINGS = (
+    "!",
+    "?",
+    ",",
+    ":",
+    "·",
+    "땐",
+    "때",
+    "면",
+    "요",
+    "까",
+    "죠",
+    "지",
+    "고",
+    "서",
+    "은",
+    "는",
+    "이",
+    "가",
+    "을",
+    "를",
+    "에",
+    "로",
+    "도",
+    "만",
+    "와",
+    "과",
+)
+_BANNER_DEPENDENT_STARTS = {"땐", "때", "수", "것", "거", "법", "중", "분", "명", "개", "가지", "배", "등", "전", "후"}
+
+
 def format_shorts_banner_text(title: str, hook: str = "", *, max_line_chars: int = 15, max_lines: int = 2) -> str:
-    """@brief Wrap a concise Shorts headline cleanly at word boundaries across up to 2 lines without mid-word truncation."""
+    """@brief Wrap a Shorts headline cleanly into balanced Korean phrases without breaking emphasized compound nouns."""
     raw = str(title or "").strip() or str(hook or "").strip()
     if not raw:
         return ""
+    if "\n" in raw:
+        explicit = [re.sub(r"[\r{}]+", " ", part).strip() for part in raw.splitlines() if part.strip()]
+        if explicit:
+            return r"\N".join(explicit[:max_lines])
     cleaned = re.sub(r"[\r\n{}]+", " ", raw).strip()
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
     if len(cleaned) > max_line_chars * max_lines + 4:
         clause = re.split(r"[!?.]\s+", cleaned)[0].strip()
-        if len(clause) >= 14:
+        if len(clause) >= 12:
             cleaned = clause
-    words = cleaned.split(" ")
+    words = [w for w in cleaned.split(" ") if w]
+    if not words:
+        return ""
+    if len(cleaned) <= max_line_chars or len(words) == 1 or max_lines <= 1:
+        return cleaned[: max_line_chars + 4]
+
+    # Pick a balanced 2-line split that respects Korean clause/particle endings and keeps compound noun phrases intact.
+    if max_lines == 2:
+        best_pair: tuple[str, str] | None = None
+        best_score = float("inf")
+        for split_idx in range(1, len(words)):
+            line1 = " ".join(words[:split_idx])
+            line2 = " ".join(words[split_idx:])
+            if len(line1) > max_line_chars + 2 or len(line2) > max_line_chars + 2:
+                continue
+            balance_penalty = abs(len(line1) - len(line2)) * 2.2
+            overflow_penalty = max(0, len(line1) - max_line_chars) * 8 + max(0, len(line2) - max_line_chars) * 8
+            orphan_penalty = 12 if (len(line2.replace(" ", "")) <= 3 or (len(line1.replace(" ", "")) <= 4 and len(line2) >= 12)) else 0
+            dependent_penalty = 14 if words[split_idx].rstrip("!?.") in _BANNER_DEPENDENT_STARTS else (4.0 if len(words[split_idx]) == 1 else 0.0)
+            last_w1 = words[split_idx - 1]
+            # Prefer breaking right after punctuation, clause endings ("~땐", "~면"), or particles ("~은/는/가/을/를/에").
+            if last_w1.endswith(_BANNER_CLAUSE_ENDINGS):
+                phrase_bonus = -9.0
+            else:
+                # Avoid cutting two adjacent noun phrases like "초승달 | 메밀베개"
+                phrase_bonus = 6.0
+            score = balance_penalty + overflow_penalty + orphan_penalty + dependent_penalty + phrase_bonus
+            if score < best_score:
+                best_score = score
+                best_pair = (line1, line2)
+        if best_pair is not None:
+            return rf"{best_pair[0]}\N{best_pair[1]}"
+
     lines: list[str] = []
     current = ""
     for word in words:
-        if not word:
-            continue
         candidate = f"{current} {word}".strip() if current else word
         if len(candidate) <= max_line_chars or not current:
             current = candidate
@@ -383,6 +449,40 @@ def format_shorts_banner_text(title: str, hook: str = "", *, max_line_chars: int
     if current and len(lines) < max_lines:
         lines.append(current)
     return r"\N".join(lines)
+
+
+_CAPTION_HIGHLIGHT_RE = re.compile(
+    r"(?<!\\)(?<![A-Za-z0-9])\d+(?:[.,:~×x\-]\d+)*(?:\s?(?:%|cm|mm|km|ml|mL|g|kg|mg|시간|분|초|원|만|억|배속|배|가지|종|개))?"
+    r"|(?<![A-Za-z0-9가-힣\\])(?:100%|무료|특가|할인|국내산|국내 제조|국내 제작|천연|핵심|비결|주의|실수|반드시|지금 바로)(?![A-Za-z0-9가-힣])"
+)
+
+
+def _format_hook_banner_ass(clean_banner: str, banner_size: int, banner_primary: str) -> str:
+    """@brief Style 2-line hook banners with a crisp sub-hook line and larger hero emphasis line."""
+    if r"\N" not in clean_banner:
+        return clean_banner
+    line1, line2 = clean_banner.split(r"\N", 1)
+    line1 = line1.strip()
+    line2 = line2.strip()
+    if not line1 or not line2:
+        return clean_banner
+    sub_fs = max(46, int(round(banner_size * 0.72)))
+    hero_fs = max(banner_size, int(round(banner_size * 1.12)))
+    hero_col = "&H0000E5FF" if banner_primary.upper() == "&H00FFFFFF" else banner_primary
+    return rf"{{\fs{sub_fs}\c&H00FFFFFF&}}{line1}\N{{\fs{hero_fs}\c{hero_col}}}{line2}"
+
+
+def _highlight_caption_keywords(text: str, primary_colour: str) -> str:
+    """@brief Highlight numeric specs, ratios, and key commerce emphasis words in ASS captions."""
+    if not text:
+        return text
+    accent = "&H0080FF9E" if "00E5FF" in primary_colour.upper() else "&H0000E5FF"
+
+    def _wrap(match: re.Match[str]) -> str:
+        token = match.group(0)
+        return rf"{{\c{accent}&}}{token}{{\c{primary_colour}&}}"
+
+    return _CAPTION_HIGHLIGHT_RE.sub(_wrap, text)
 
 
 def srt_to_shorts_ass(
@@ -424,9 +524,11 @@ def srt_to_shorts_ass(
     if clean_banner and r"\N" not in clean_banner:
         clean_banner = format_shorts_banner_text(clean_banner)
     if clean_banner:
-        events.append(f"Dialogue: 1,0:00:00.00,{_ass_time(total_end)},HookBanner,,0,0,0,,{clean_banner}")
+        banner_ass = _format_hook_banner_ass(clean_banner, banner_size, banner_primary)
+        events.append(f"Dialogue: 1,0:00:00.00,{_ass_time(total_end)},HookBanner,,0,0,0,,{banner_ass}")
     for start_s, end_s, cue_text in cues:
         safe_text = cue_text.replace("{", "(").replace("}", ")").replace("\n", r"\N")
+        safe_text = _highlight_caption_keywords(safe_text, primary)
         if anim_mode == "pop":
             anim = r"{\fad(30,30)\fscx108\fscy108\t(0,85,\fscx100\fscy100)}"
         elif anim_mode == "fade":
@@ -524,12 +626,103 @@ def download_https_file(url: str, destination: Path) -> int:
     return total
 
 
+def _build_tts_audio_filter(speed: float = 1.35, *, trim_silence: bool = True) -> str:
+    """@brief Build a pitch-preserving FFmpeg audio filter with dead-air trimming and atempo speedup."""
+    filters: list[str] = []
+    if trim_silence:
+        filters.append("silenceremove=start_periods=1:start_duration=0.03:start_threshold=-42dB:stop_periods=-1:stop_duration=0.14:stop_threshold=-40dB")
+    clamped = max(0.75, min(2.0, float(speed or 1.35)))
+    if abs(clamped - 1.0) >= 0.02:
+        filters.append(f"atempo={clamped:.3f}")
+    return ",".join(filters)
+
+
+def scale_srt_timestamps(raw_srt: str, speed_multiplier: float) -> str:
+    """@brief Rescale every SRT cue timestamp by 1 / speed_multiplier while keeping positive durations."""
+    factor = max(0.5, min(2.5, float(speed_multiplier or 1.0)))
+    cues = _parse_srt_cues(raw_srt)
+    lines: list[str] = []
+    for idx, (start_s, end_s, text) in enumerate(cues, 1):
+        new_start = start_s / factor
+        new_end = max(new_start + 0.18, end_s / factor)
+        lines.extend((str(idx), f"{_srt_time(new_start)} --> {_srt_time(new_end)}", text, ""))
+    return "\n".join(lines)
+
+
+def retime_video_file(source_path: Path, output_path: Path, speed_multiplier: float, *, cancel_check: Any = None) -> Path:
+    """@brief Adjust MP4 video playback speed cleanly using setpts without audio."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to retime video.")
+    factor = max(0.75, min(2.0, float(speed_multiplier or 1.0)))
+    staging = output_path.with_name(f"{output_path.stem}.retime{output_path.suffix}")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        source_path.name,
+        "-filter:v",
+        f"setpts=PTS/{factor:.4f}",
+        "-r",
+        "30",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-pix_fmt",
+        "yuv420p",
+        staging.name,
+    ]
+    try:
+        rc, detail = _run_ffmpeg(cmd, cwd=source_path.parent, cancel_check=cancel_check)
+        if rc != 0 or not staging.is_file():
+            raise RuntimeError(f"FFmpeg video retime failed: {detail}")
+        staging.replace(output_path)
+    except Exception:
+        staging.unlink(missing_ok=True)
+        raise
+    return output_path
+
+
+def retime_audio_file(source_path: Path, output_path: Path, speed_multiplier: float, *, cancel_check: Any = None) -> Path:
+    """@brief Adjust audio speed cleanly using pitch-preserving FFmpeg atempo."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to retime audio.")
+    factor = max(0.75, min(2.0, float(speed_multiplier or 1.0)))
+    staging = output_path.with_name(f"{output_path.stem}.retime{output_path.suffix}")
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        source_path.name,
+        "-af",
+        f"atempo={factor:.4f}",
+        "-c:a",
+        "libmp3lame",
+        "-q:a",
+        "3",
+        staging.name,
+    ]
+    try:
+        rc, detail = _run_ffmpeg(cmd, cwd=source_path.parent, cancel_check=cancel_check)
+        if rc != 0 or not staging.is_file():
+            raise RuntimeError(f"FFmpeg audio retime failed: {detail}")
+        staging.replace(output_path)
+    except Exception:
+        staging.unlink(missing_ok=True)
+        raise
+    return output_path
+
+
 def generate_voiceover(
     text: str,
     output_dir: Path,
     *,
     tts_provider: str = "auto",
     voice: str = "",
+    tts_speed: float = 1.35,
 ) -> dict[str, Any] | None:
     """@brief Create narration and timing metadata using ElevenLabs or OpenAI TTS."""
     provider = str(tts_provider or "auto").strip().lower()
@@ -548,9 +741,9 @@ def generate_voiceover(
             return None
 
     if provider == "gemini_tts":
-        return _generate_gemini_tts(text, output_dir, voice=voice)
+        return _generate_gemini_tts(text, output_dir, voice=voice, speed=tts_speed)
     if provider == "openai_tts":
-        return _generate_openai_tts(text, output_dir, voice=voice)
+        return _generate_openai_tts(text, output_dir, voice=voice, speed=tts_speed)
     if provider != "elevenlabs":
         raise ValueError("Unsupported TTS provider; choose auto, gemini_tts, elevenlabs, openai_tts, or none.")
 
@@ -637,10 +830,14 @@ def generate_scene_synced_voiceover(
     *,
     tts_provider: str = "auto",
     voice: str = "",
+    tts_speed: float = 1.35,
     synth_fn: Any = None,
 ) -> dict[str, Any] | None:
     """@brief Synthesize narration per scene so visual cuts and spoken cues stay 1:1 synced."""
+    import inspect
+
     synthesize = synth_fn or generate_voiceover
+    accepts_speed = "tts_speed" in inspect.signature(synthesize).parameters
     ffmpeg = shutil.which("ffmpeg")
     valid_scenes = [
         str(s.get("narration") or "").strip()
@@ -651,8 +848,15 @@ def generate_scene_synced_voiceover(
         from .planning import split_script_for_scenes
 
         valid_scenes = split_script_for_scenes(fallback_script, max(2, len(valid_scenes) or 4))
+
+    def _call_synth(line_text: str, target_dir: Path) -> dict[str, Any] | None:
+        kwargs: dict[str, Any] = {"tts_provider": tts_provider, "voice": voice}
+        if accepts_speed:
+            kwargs["tts_speed"] = tts_speed
+        return synthesize(line_text, target_dir, **kwargs)
+
     if len(valid_scenes) < 2 or not ffmpeg or str(tts_provider or "auto").strip().lower() == "none":
-        return synthesize(fallback_script, output_dir, tts_provider=tts_provider, voice=voice)
+        return _call_synth(fallback_script, output_dir)
 
     parts_dir = output_dir / "tts_parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
@@ -664,7 +868,7 @@ def generate_scene_synced_voiceover(
 
     for idx, line in enumerate(valid_scenes[:8]):
         scene_dir = parts_dir / f"scene_{idx}"
-        res = synthesize(line, scene_dir, tts_provider=tts_provider, voice=voice)
+        res = _call_synth(line, scene_dir)
         if res is None:
             return None
         if first_meta is None:
@@ -717,13 +921,14 @@ def ensure_ambient_bgm(output_path: Path, duration_seconds: float, *, mood: str 
         return None
     dur = max(5.0, min(90.0, float(duration_seconds or 25.0)))
     if mood != "calm":
-        # Bright ~128 BPM C-G-Am-F rhythmic marimba/pop arpeggio + gentle pulse for lively commerce/Shorts.
+        # Bright ~128 BPM C-G-Am-F rhythmic marimba/pop arpeggio + offbeat sparkle pulse for lively commerce/Shorts.
         eighth = "0.234375"
         beat = "0.46875"
         chord = "mod(floor(t/2),4)"
         step = "mod(floor(t/0.234375),4)"
         pluck = f"exp(-7.5*mod(t,{eighth}))"
         pulse = f"exp(-13*mod(t,{beat}))*0.18*sin(2*PI*82.41*t)"
+        offbeat_accent = f"eq(mod(floor(t/{eighth}),2),1)*exp(-24*mod(t,{eighth}))*0.09*sin(2*PI*1760*t)"
         root_hz = f"(eq({chord},0)*261.63+eq({chord},1)*196.00+eq({chord},2)*220.00+eq({chord},3)*174.61)"
         arp_hz = (
             f"(eq({chord},0)*(eq({step},0)*523.25+eq({step},1)*659.25+eq({step},2)*783.99+eq({step},3)*1046.50)"
@@ -732,11 +937,11 @@ def ensure_ambient_bgm(output_path: Path, duration_seconds: float, *, mood: str 
             f"+eq({chord},3)*(eq({step},0)*349.23+eq({step},1)*440.00+eq({step},2)*523.25+eq({step},3)*698.46))"
         )
         expr = (
-            f"{pulse}"
+            f"{pulse}+{offbeat_accent}"
             f"+0.24*sin(2*PI*{root_hz}*t)*(0.55+0.45*exp(-3.5*mod(t,{beat})))"
             f"+0.26*{pluck}*(0.75*sin(2*PI*{arp_hz}*t)+0.25*sin(4*PI*{arp_hz}*t))"
         )
-        af_filter_base = "lowpass=f=3600"
+        af_filter_base = "lowpass=f=4000"
     else:
         expr = "0.22*sin(2*PI*110.00*t)+0.18*sin(2*PI*164.81*t)+0.15*sin(2*PI*220.00*t)+0.10*sin(2*PI*329.63*t)*(0.6+0.4*sin(2*PI*0.25*t))"
         af_filter_base = "lowpass=f=1200"
@@ -769,16 +974,149 @@ def ensure_ambient_bgm(output_path: Path, duration_seconds: float, *, mood: str 
     return None
 
 
-def generate_ai_scene_image(prompt: str, output_path: Path) -> Path | None:
-    """@brief Generate a vertical 9:16 keyframe image via Gemini or OpenAI when stock clips fit poorly."""
-    clean_prompt = (
-        f"Vertical 9:16 realistic photography / editorial visual for short-form video, "
-        f"no text overlays, no watermarks, crisp lighting: {str(prompt or '')[:450]}"
-    )
+def synthesize_sfx_and_mix_bgm(
+    bgm_path: Path | None,
+    scene_durations: list[float],
+    output_path: Path,
+) -> Path | None:
+    """@brief Mix subtle opening pop and scene-transition swoop SFX into the BGM bed before sidechain ducking."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not bgm_path or not bgm_path.is_file():
+        return bgm_path
+    clean_durs = [max(0.5, float(d)) for d in scene_durations if isinstance(d, (int, float)) and d > 0]
+    total_dur = max(5.0, min(120.0, sum(clean_durs) + 0.6 if clean_durs else 25.0))
+    sfx_dir = output_path.parent / "sfx"
+    sfx_dir.mkdir(parents=True, exist_ok=True)
+    pop_wav = sfx_dir / "pop.wav"
+    whoosh_wav = sfx_dir / "whoosh.wav"
+
+    # Synthesize crisp opening pop chime (90ms) and gentle transition swoop (240ms) once per item dir.
+    try:
+        if not pop_wav.is_file():
+            rc_p, _ = _run_ffmpeg(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    r"aevalsrc=0.42*exp(-26*t)*(sin(2*PI*784*t)+0.55*sin(2*PI*1175*t)):s=44100:d=0.10",
+                    str(pop_wav),
+                ],
+                cwd=sfx_dir,
+            )
+            if rc_p != 0:
+                return bgm_path
+        if not whoosh_wav.is_file():
+            rc_w, _ = _run_ffmpeg(
+                [
+                    ffmpeg,
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    r"aevalsrc=0.35*exp(-14*abs(t-0.11))*(sin(2*PI*(240+520*t)*t)+0.4*sin(2*PI*(520+900*t)*t)):s=44100:d=0.24",
+                    "-af",
+                    "lowpass=f=2200,afade=t=in:st=0:d=0.04,afade=t=out:st=0.14:d=0.10",
+                    str(whoosh_wav),
+                ],
+                cwd=sfx_dir,
+            )
+            if rc_w != 0:
+                return bgm_path
+    except Exception:
+        return bgm_path
+
+    cues: list[tuple[int, str]] = [(40, pop_wav.name)]
+    cursor = 0.0
+    for idx, dur in enumerate(clean_durs[:-1]):
+        cursor += dur
+        if cursor >= 0.4 and cursor < total_dur - 0.35 and len(cues) < 8:
+            cues.append((int(round(cursor * 1000)), whoosh_wav.name if idx % 2 == 0 else pop_wav.name))
+
+    # Mix BGM + delayed SFX events while preserving base BGM gain (normalize=0).
+    staging = output_path.with_name(f"{output_path.stem}.mix{output_path.suffix}")
+    cmd = [ffmpeg, "-y", "-stream_loop", "-1", "-t", f"{total_dur:.2f}", "-i", str(bgm_path.resolve())]
+    filter_parts: list[str] = ["[0:a:0]volume=1.0[a0]"]
+    mix_labels = ["[a0]"]
+    for idx, (delay_ms, sfx_name) in enumerate(cues, 1):
+        cmd.extend(["-i", str((sfx_dir / sfx_name).resolve())])
+        vol = 0.72 if sfx_name == "pop.wav" else 0.58
+        filter_parts.append(f"[{idx}:a:0]adelay={delay_ms}|{delay_ms},volume={vol:.2f}[s{idx}]")
+        mix_labels.append(f"[s{idx}]")
+    filter_parts.append(f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=first:normalize=0[a_out]")
+    cmd.extend(["-filter_complex", ";".join(filter_parts), "-map", "[a_out]", "-c:a", "libmp3lame", "-b:a", "128k", str(staging)])
+    try:
+        rc, _detail = _run_ffmpeg(cmd, cwd=output_path.parent)
+        if rc == 0 and staging.is_file():
+            staging.replace(output_path)
+            return output_path
+    except Exception:
+        pass
+    staging.unlink(missing_ok=True)
+    return bgm_path
+
+
+def _encode_reference_image_part(path: Path) -> dict[str, Any] | None:
+    """@brief Encode a local product reference photo as an inlineData multimodal part for Gemini image generation."""
+    if not path.is_file():
+        return None
+    ext = path.suffix.lower()
+    mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+    mime_type = mime_map.get(ext)
+    raw: bytes | None = None
+    try:
+        if mime_type and path.stat().st_size <= 2_500_000:
+            raw = path.read_bytes()
+        else:
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg:
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                    tmp_path = Path(tmp.name)
+                try:
+                    rc, _ = _run_ffmpeg(
+                        [ffmpeg, "-y", "-i", str(path), "-vf", "scale=1024:-2:force_original_aspect_ratio=decrease", "-q:v", "4", str(tmp_path)],
+                        cwd=path.parent,
+                    )
+                    if rc == 0 and tmp_path.is_file() and tmp_path.stat().st_size > 0:
+                        raw = tmp_path.read_bytes()
+                        mime_type = "image/jpeg"
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+    except Exception:
+        return None
+    if not raw or not mime_type:
+        return None
+    return {"inlineData": {"mimeType": mime_type, "data": base64.b64encode(raw).decode("ascii")}}
+
+
+def generate_ai_scene_image(
+    prompt: str,
+    output_path: Path,
+    *,
+    reference_image_paths: list[Path] | None = None,
+) -> Path | None:
+    """@brief Generate a vertical 9:16 keyframe image via Gemini (optionally conditioned on product reference photos) or OpenAI."""
+    ref_parts: list[dict[str, Any]] = []
+    for ref_path in (reference_image_paths or [])[:2]:
+        part = _encode_reference_image_part(Path(ref_path))
+        if part is not None:
+            ref_parts.append(part)
+    if ref_parts:
+        clean_prompt = (
+            f"Using the exact physical product shape, colors, fabric texture, embroidery, and design shown in the attached "
+            f"reference photo(s), generate a vertical 9:16 realistic lifestyle/studio commercial photograph placing that exact "
+            f"product naturally into the scene, no text overlays, no watermarks, crisp lighting: {str(prompt or '')[:420]}"
+        )
+    else:
+        clean_prompt = (
+            f"Vertical 9:16 realistic photography / editorial visual for short-form video, "
+            f"no text overlays, no watermarks, crisp lighting: {str(prompt or '')[:450]}"
+        )
     gemini_key = get_secret("GEMINI_API_KEY")
     if gemini_key:
         body = {
-            "contents": [{"parts": [{"text": clean_prompt}]}],
+            "contents": [{"parts": [*ref_parts, {"text": clean_prompt}]}],
             "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
         }
         for image_model in ("gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"):
@@ -825,8 +1163,8 @@ def generate_ai_scene_image(prompt: str, output_path: Path) -> Path | None:
     return None
 
 
-def _generate_gemini_tts(text: str, output_dir: Path, *, voice: str = "") -> dict[str, Any]:
-    """@brief Synthesize native Korean/multilingual speech using Gemini TTS and produce word-aligned SRT captions."""
+def _generate_gemini_tts(text: str, output_dir: Path, *, voice: str = "", speed: float = 1.35) -> dict[str, Any]:
+    """@brief Synthesize native Korean/multilingual speech using Gemini TTS with crisp pace and word-aligned SRT."""
     api_key = get_secret("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is required for Gemini TTS.")
@@ -877,16 +1215,18 @@ def _generate_gemini_tts(text: str, output_dir: Path, *, voice: str = "") -> dic
 
     output_dir.mkdir(parents=True, exist_ok=True)
     audio_path = output_dir / "voiceover.mp3"
+    pace_filter = _build_tts_audio_filter(speed, trim_silence=True)
+    af_args = ["-af", pace_filter] if pace_filter else []
     if "wav" in mime_type or raw_bytes[:4] == b"RIFF":
         tmp_in = output_dir / "voiceover_raw.wav"
         tmp_in.write_bytes(raw_bytes)
-        cmd = [ffmpeg, "-y", "-i", tmp_in.name, "-c:a", "libmp3lame", "-q:a", "3", audio_path.name]
+        cmd = [ffmpeg, "-y", "-i", tmp_in.name, *af_args, "-c:a", "libmp3lame", "-q:a", "3", audio_path.name]
     else:
         rate_match = re.search(r"rate=(\d+)", mime_type)
         rate = rate_match.group(1) if rate_match else "24000"
         tmp_in = output_dir / "voiceover_raw.pcm"
         tmp_in.write_bytes(raw_bytes)
-        cmd = [ffmpeg, "-y", "-f", "s16le", "-ar", rate, "-ac", "1", "-i", tmp_in.name, "-c:a", "libmp3lame", "-q:a", "3", audio_path.name]
+        cmd = [ffmpeg, "-y", "-f", "s16le", "-ar", rate, "-ac", "1", "-i", tmp_in.name, *af_args, "-c:a", "libmp3lame", "-q:a", "3", audio_path.name]
     try:
         rc, detail = _run_ffmpeg(cmd, cwd=output_dir)
         if rc != 0 or not audio_path.is_file():
@@ -901,13 +1241,13 @@ def _generate_gemini_tts(text: str, output_dir: Path, *, voice: str = "") -> dic
         duration = max(1.5, estimate_speaking_duration(spoken)["estimated_seconds"])
     captions_path = output_dir / "captions.srt"
     captions_path.write_text(
-        text_to_fallback_srt(display_text, duration, max_chars=16 if _contains_hangul(display_text) else 24),
+        text_to_fallback_srt(display_text, duration, max_chars=12 if _contains_hangul(display_text) else 22),
         encoding="utf-8",
     )
     return {"audio_path": str(audio_path), "captions_path": str(captions_path), "provider": "gemini_tts", "voice_id": chosen_voice}
 
 
-def _generate_openai_tts(text: str, output_dir: Path, *, voice: str = "") -> dict[str, Any]:
+def _generate_openai_tts(text: str, output_dir: Path, *, voice: str = "", speed: float = 1.25) -> dict[str, Any]:
     """@brief Synthesize MP3 narration with OpenAI TTS and produce proportional SRT captions."""
     api_key = get_secret("OPENAI_API_KEY")
     if not api_key:
@@ -916,9 +1256,10 @@ def _generate_openai_tts(text: str, output_dir: Path, *, voice: str = "") -> dic
     if chosen_voice not in {"alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"}:
         chosen_voice = "alloy"
     spoken_text, display_text = _prepare_tts_and_caption_texts(text)
+    clamped_speed = max(0.75, min(2.0, float(speed or 1.25)))
     request = urllib.request.Request(
         "https://api.openai.com/v1/audio/speech",
-        data=json.dumps({"model": "tts-1", "voice": chosen_voice, "input": spoken_text[:4096], "response_format": "mp3", "speed": 1.08}).encode("utf-8"),
+        data=json.dumps({"model": "tts-1", "voice": chosen_voice, "input": spoken_text[:4096], "response_format": "mp3", "speed": clamped_speed}).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         method="POST",
     )
@@ -941,7 +1282,7 @@ def _generate_openai_tts(text: str, output_dir: Path, *, voice: str = "") -> dic
         duration = max(2.0, estimate_speaking_duration(spoken_text)["estimated_seconds"])
     captions_path = output_dir / "captions.srt"
     captions_path.write_text(
-        text_to_fallback_srt(display_text, duration, max_chars=16 if _contains_hangul(display_text) else 26),
+        text_to_fallback_srt(display_text, duration, max_chars=12 if _contains_hangul(display_text) else 22),
         encoding="utf-8",
     )
     return {"audio_path": str(audio_path), "captions_path": str(captions_path), "provider": "openai_tts", "voice_id": chosen_voice}
@@ -1241,6 +1582,53 @@ def render_video(
     return output_path
 
 
+def _probe_image_size(image_path: Path) -> tuple[int, int] | None:
+    """@brief Return natural (width, height) pixels for a still image when ffprobe is available."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe or not image_path.is_file():
+        return None
+    try:
+        res = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", str(image_path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if res.returncode != 0 or not res.stdout:
+            return None
+        streams = json.loads(res.stdout).get("streams") or []
+        if streams and isinstance(streams[0], dict):
+            w = int(streams[0].get("width") or 0)
+            h = int(streams[0].get("height") or 0)
+            if w > 0 and h > 0:
+                return w, h
+    except Exception:
+        pass
+    return None
+
+
+def _build_image_zoompan_expr(idx: int, frames: int, width: int, height: int, *, card_mode: bool) -> str:
+    """@brief Build varied per-scene zoompan expressions (push-in, L->R pan, pull-out, R->L pan)."""
+    span = max(1, frames - 1)
+    if card_mode:
+        # Preserve card margins: alternate centered push-in and gentle pull-out so product graphics never clip.
+        if idx % 2 == 0:
+            z_expr = "min(zoom+0.0005,1.05)"
+        else:
+            z_expr = f"max(1.0,1.05-0.05*on/{span})"
+        return f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps=30"
+
+    mode = idx % 4
+    if mode == 0:
+        return f"zoompan=z='min(zoom+0.0011,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps=30"
+    if mode == 1:
+        return f"zoompan=z='1.08':x='if(eq(on,0),0,min(iw-iw/zoom,(iw-iw/zoom)*on/{span}))':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps=30"
+    if mode == 2:
+        return f"zoompan=z='max(1.0,1.12-0.12*on/{span})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps=30"
+    return f"zoompan=z='1.08':x='if(eq(on,0),iw-iw/zoom,max(0,(iw-iw/zoom)*(1-on/{span})))':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps=30"
+
+
 def build_multiscene_ffmpeg_command(
     ffmpeg_bin: str,
     clips: list[dict[str, Any]],
@@ -1275,11 +1663,25 @@ def build_multiscene_ffmpeg_command(
             # whereas `-loop 1` causes zoompan to multiply frames (e.g. 150 * 180) and hang FFmpeg.
             command.extend(["-i", rel_path])
             frames = max(30, round(dur * 30))
-            filter_parts.append(
-                f"[{idx}:v:0]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},zoompan=z='min(zoom+0.0008,1.08)':d={frames}:s={width}x{height}:fps=30,"
-                f"trim=duration={dur:.2f},setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{idx}]"
-            )
+            card_mode = clip.get("aspect_fit") == "card"
+            zp = _build_image_zoompan_expr(idx, frames, width, height, card_mode=card_mode)
+            if card_mode:
+                card_w = max(320, width - 72)
+                card_h = max(480, height - 420)
+                filter_parts.append(
+                    f"[{idx}:v:0]setsar=1,split=2[bg{idx}][fg{idx}];"
+                    f"[bg{idx}]scale={width}:{height}:force_original_aspect_ratio=increase,"
+                    f"crop={width}:{height},boxblur=24:4,eq=brightness=-0.14,format=yuv420p[bgb{idx}];"
+                    f"[fg{idx}]scale={card_w}:{card_h}:force_original_aspect_ratio=decrease,format=yuva420p[fgs{idx}];"
+                    f"[bgb{idx}][fgs{idx}]overlay=(W-w)/2:(H-h)/2,{zp},"
+                    f"trim=duration={dur:.2f},setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{idx}]"
+                )
+            else:
+                filter_parts.append(
+                    f"[{idx}:v:0]scale={width}:{height}:force_original_aspect_ratio=increase,"
+                    f"crop={width}:{height},{zp},"
+                    f"trim=duration={dur:.2f},setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{idx}]"
+                )
         else:
             command.extend(["-stream_loop", "-1", "-t", f"{dur:.2f}", "-i", rel_path])
             filter_parts.append(
@@ -1356,10 +1758,21 @@ def assemble_multiscene_video(
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("FFmpeg is required for multi-scene assembly; install it and add ffmpeg to PATH.")
+    prepared_clips: list[dict[str, Any]] = []
+    for clip in clips:
+        entry = dict(clip)
+        if entry.get("media_type") == "image" and not entry.get("aspect_fit"):
+            dims = _probe_image_size(work_dir / str(entry.get("relative_path") or ""))
+            if dims is not None:
+                ratio = dims[0] / dims[1]
+                # Auto-switch non-9:16 images (landscape, square, or tall promo detail sheets) to blurred-card layout.
+                if ratio > 0.70 or ratio < 0.46:
+                    entry["aspect_fit"] = "card"
+        prepared_clips.append(entry)
     staging_path = output_path.with_name(f"{output_path.stem}.assembling{output_path.suffix}")
     command = build_multiscene_ffmpeg_command(
         ffmpeg,
-        clips,
+        prepared_clips,
         staging_path.name,
         transition=transition,
         audio_name=audio_path.name if audio_path else None,

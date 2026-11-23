@@ -1,4 +1,5 @@
-const state = { items: [], selectedId: null, settings: {}, aiModels: {}, brand: { profile: {}, series_templates: [] }, shortsReferences: [], styleTemplatesState: { templates: [], auto_sync_enabled: true, sync_interval_hours: 6 }, analytics: {}, dashboard: null, secretsStatus: {}, assetLibrary: [], schedules: [], experiments: [], pendingAttachments: [], assetLibraryMode: "manage", filters: { query: "", stage: "", platform: "" }, calendarView: "grid", calendarMonth: new Date(), safeZone: "none", subtitlesCache: {}, toastTimer: null, refreshTimer: null, modelSyncTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
+const ATTACHMENT_ACCEPT = ".txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.log,.srt,.vtt,.html,.htm,.pdf,.doc,.docx,.xls,.xlsx,.xlsm,.ppt,.pptx,.hwpx,.odt,.ods,.odp,.jpg,.jpeg,.png,.webp,.gif,.bmp,.mp4,.mov,.m4v,.webm,.mkv,.mp3,.wav,.m4a,.aac";
+const state = { items: [], selectedId: null, settings: {}, aiModels: {}, brand: { profile: {}, series_templates: [] }, shortsReferences: [], styleTemplatesState: { templates: [], auto_sync_enabled: true, sync_interval_hours: 6 }, analytics: {}, dashboard: null, secretsStatus: {}, assetLibrary: [], schedules: [], experiments: [], pendingAttachments: [], rejectPanel: { itemId: null, open: false, feedback: "" }, assetLibraryMode: "manage", filters: { query: "", stage: "", platform: "" }, calendarView: "grid", calendarMonth: new Date(), safeZone: "none", subtitlesCache: {}, toastTimer: null, refreshTimer: null, modelSyncTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
 const MODEL_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const stageLabels = { draft: "초안", researching: "웹 자료 조사 중", planning: "조사·기획 중", collecting_materials: "영상 소재 검색 중", planned: "기획 완료", generating: "영상 제작 중", generated: "영상 제작 완료", reviewing: "검수 중", reviewed: "검수 완료", approved: "게시 승인", publishing: "게시 중", published: "게시 완료", failed: "작업 오류" };
 const SUBTITLE_PRESETS = {
@@ -1150,6 +1151,23 @@ function renderDecisionCard(item) {
     ? `<button id="decision-approve-publish" class="button good" type="button" ${blocked ? "disabled" : ""}>승인 및 YouTube Shorts 게시</button><button id="decision-approve-only" class="button" type="button" ${blocked ? "disabled" : ""}>승인만 하기</button>`
     : `<button id="decision-approve-only" class="button good" type="button" ${blocked ? "disabled" : ""}>완성본 승인</button>`;
   const ytNote = ytSelected && !ytReady ? '<p class="small-note">YouTube OAuth JSON 경로를 연결하면 승인 즉시 YouTube Shorts로 바로 업로드됩니다.</p>' : "";
+  const rejectStateMatches = state.rejectPanel?.itemId === item.id;
+  const rejectOpen = Boolean(rejectStateMatches && state.rejectPanel.open);
+  const rejectDraft = rejectStateMatches ? String(state.rejectPanel.feedback || "") : "";
+  const attachments = item.attachments || [];
+  const hasVisualAtts = attachments.some(att => att.kind === "image" || att.kind === "video");
+  const rejectAttRows = attachments.map(att => {
+    const thumb = att.kind === "image"
+      ? `<img class="reject-att-thumb" src="/api/items/${encodeURIComponent(item.id)}/attachments/${encodeURIComponent(att.id)}/preview" alt="${escapeHtml(att.original_name)}">`
+      : `<span class="badge">${escapeHtml(attachmentKindLabel(att.original_name, att.kind))}</span>`;
+    const meta = [attachmentKindLabel(att.original_name, att.kind), formatFileSize(att.size_bytes)];
+    if (att.media_info?.width && att.media_info?.height) meta.push(`${att.media_info.width}×${att.media_info.height}`);
+    if (att.media_info?.duration_seconds) meta.push(`${att.media_info.duration_seconds}초`);
+    return `<div class="reject-att-row">${thumb}<div class="reject-att-meta"><strong>${escapeHtml(att.original_name)}</strong><small>${escapeHtml(meta.join(" · "))}</small></div><div class="reject-att-actions"><label class="check-row"><input type="checkbox" class="reject-att-include" data-att-id="${escapeHtml(att.id)}" ${att.included !== false ? "checked" : ""}> 반영</label><button type="button" class="button danger reject-att-delete" data-att-id="${escapeHtml(att.id)}" data-att-name="${escapeHtml(att.original_name)}">삭제</button></div></div>`;
+  }).join("");
+  const rejectUseMediaHtml = hasVisualAtts
+    ? `<label class="check-row"><input id="reject-use-attached-media" type="checkbox" ${item.use_attached_media !== false ? "checked" : ""}> 첨부 사진·동영상을 영상 장면에 우선 사용</label>`
+    : "";
 
   return `<section class="decision-card panel">
     <div class="card-head"><div><p class="eyebrow">FINAL APPROVAL · HUMAN IN THE LOOP</p><h3>완성본 최종 확인 · 승인 또는 반려</h3></div><span class="badge ${techFailed ? "bad" : "good"}">revision ${escapeHtml(plan?.revision ?? 1)}</span></div>
@@ -1162,12 +1180,24 @@ function renderDecisionCard(item) {
         ${usedSources ? `<p class="small-note">포함된 소재 출처: ${usedSources}</p>` : ""}
         ${issuesHtml}${blockerHtml}${rejectionHtml}
         <div class="decision-actions">
+          <div class="form-row">
+            <label>빠른 배속 재렌더링 (대본·화면 유지)<select id="retime-speed-select"><option value="1.0">1.0x (원본 속도)</option><option value="1.25">1.25x</option><option value="1.35">1.35x (쇼츠 표준)</option><option value="1.5" selected>1.5x (빠른 한국 쇼츠 추천)</option><option value="1.65">1.65x (초고속)</option></select></label>
+            <div class="actions"><button id="retime-video-button" class="button primary" type="button">이 배속으로 즉시 재렌더링</button></div>
+          </div>
           ${ytControls}
           <label class="approval-check"><input id="decision-confirm-check" type="checkbox" ${blocked ? "disabled" : ""}> 완성된 영상·음성·자막, 사용된 스톡·TTS 권리 및 플랫폼 정책을 직접 확인했습니다.</label>
           <div class="actions">${primaryApproveBtn}<button id="decision-reject-toggle" class="button danger" type="button">반려 (의견 전달)</button></div>
           ${ytNote}
-          <div id="reject-feedback-panel" class="reject-box" hidden>
-            <label>반려 의견 (수정·재제작 방향 입력)<textarea id="reject-feedback-input" rows="3" maxlength="2000" placeholder="예: 첫 문장이 너무 평범해요. 더 호기심을 끄는 훅으로 바꾸고, 배경 영상도 바꿔서 다시 만들어 주세요."></textarea></label>
+          <div id="reject-feedback-panel" class="reject-box" ${rejectOpen ? "" : "hidden"}>
+            <div id="reject-attachments-box" class="reject-attachments-box">
+              <div class="reject-att-head">
+                <strong>현재 첨부파일 (${attachments.length}/12)</strong>
+                <label class="button upload-label reject-att-add">+ 파일 추가<input id="reject-attachment-upload" type="file" multiple accept="${ATTACHMENT_ACCEPT}" ${attachments.length >= 12 ? "disabled" : ""}></label>
+              </div>
+              <div id="reject-attachment-list" class="reject-att-list">${rejectAttRows || '<p class="small-note">현재 첨부된 파일이 없습니다. 필요한 사진·문서·동영상을 추가하거나 끌어다 놓으세요.</p>'}</div>
+              ${rejectUseMediaHtml}
+            </div>
+            <label>반려 의견 (수정·재제작 방향 입력)<textarea id="reject-feedback-input" rows="3" maxlength="2000" placeholder="예: 첫 문장이 너무 평범해요. 새로 추가한 사진을 첫 장면에 쓰고, 배경 음악을 더 밝게 바꿔서 다시 만들어 주세요.">${escapeHtml(rejectDraft)}</textarea></label>
             <div class="actions"><button id="decision-reject-submit" class="button danger" type="button">반려 의견 반영해 다시 제작</button></div>
           </div>
         </div>
@@ -1209,9 +1239,59 @@ function wireItemActions(item) {
     const panel = document.getElementById("reject-feedback-panel");
     if (!panel) return;
     panel.hidden = !panel.hidden;
+    const draft = String(document.getElementById("reject-feedback-input")?.value || "");
+    state.rejectPanel = { itemId: item.id, open: !panel.hidden, feedback: draft };
     if (!panel.hidden) document.getElementById("reject-feedback-input")?.focus();
   });
+  document.getElementById("reject-feedback-input")?.addEventListener("input", event => {
+    state.rejectPanel = { itemId: item.id, open: true, feedback: String(event.target.value || "") };
+  });
+  document.getElementById("reject-attachment-upload")?.addEventListener("change", event => uploadRejectAttachments(event.target.files, item.id, event.target));
+  const rejectAttBox = document.getElementById("reject-attachments-box");
+  if (rejectAttBox) {
+    ["dragenter", "dragover"].forEach(evt => rejectAttBox.addEventListener(evt, event => {
+      event.preventDefault();
+      rejectAttBox.classList.add("dragover");
+    }));
+    ["dragleave", "drop"].forEach(evt => rejectAttBox.addEventListener(evt, event => {
+      event.preventDefault();
+      rejectAttBox.classList.remove("dragover");
+      if (evt === "drop" && event.dataTransfer?.files?.length) uploadRejectAttachments(event.dataTransfer.files, item.id);
+    }));
+  }
+  document.querySelectorAll(".reject-att-include").forEach(input => input.addEventListener("change", async event => {
+    const draft = String(document.getElementById("reject-feedback-input")?.value || "");
+    state.rejectPanel = { itemId: item.id, open: true, feedback: draft };
+    try {
+      await api(`/api/items/${item.id}/attachments/${encodeURIComponent(event.target.dataset.attId)}`, { method: "PUT", body: JSON.stringify({ included: event.target.checked }) });
+      await refresh(item.id);
+      toast(event.target.checked ? "첨부 파일을 재제작 참조에 포함했습니다." : "첨부 파일을 재제작 참조에서 제외했습니다.");
+    } catch (error) { toast(error.message); await refresh(item.id); }
+  }));
+  document.querySelectorAll(".reject-att-delete").forEach(btn => btn.addEventListener("click", async () => {
+    const draft = String(document.getElementById("reject-feedback-input")?.value || "");
+    state.rejectPanel = { itemId: item.id, open: true, feedback: draft };
+    const name = btn.dataset.attName || "첨부 파일";
+    try {
+      await api(`/api/items/${item.id}/attachments/${encodeURIComponent(btn.dataset.attId)}`, { method: "DELETE" });
+      await refresh(item.id);
+      toast(`'${name}' 첨부 파일을 삭제했습니다.`);
+    } catch (error) { toast(error.message); }
+  }));
+  document.getElementById("reject-use-attached-media")?.addEventListener("change", async event => {
+    const draft = String(document.getElementById("reject-feedback-input")?.value || "");
+    state.rejectPanel = { itemId: item.id, open: true, feedback: draft };
+    try {
+      await api(`/api/items/${item.id}/attachment-media-mode`, { method: "PUT", body: JSON.stringify({ included: event.target.checked }) });
+      await refresh(item.id);
+      toast(event.target.checked ? "첨부 사진·동영상을 영상 장면에 우선 사용합니다." : "첨부 사진·동영상은 기획 참고용으로만 사용합니다.");
+    } catch (error) { toast(error.message); await refresh(item.id); }
+  });
   document.getElementById("decision-reject-submit")?.addEventListener("click", () => rejectAutopilotItem(item.id));
+  document.getElementById("retime-video-button")?.addEventListener("click", () => {
+    const mult = Number(document.getElementById("retime-speed-select")?.value || 1.5);
+    runAction(`/api/items/${item.id}/retime`, "POST", `${mult}배속으로 영상·음성·자막을 빠르게 재렌더링합니다.`, { speed_multiplier: mult });
+  });
   document.getElementById("duplicate-item-button")?.addEventListener("click", () => duplicateItem(item.id));
   document.getElementById("archive-item-button")?.addEventListener("click", () => toggleArchiveItem(item.id, !item.archived));
   document.getElementById("delete-item-button")?.addEventListener("click", () => deleteItem(item.id));
@@ -1789,9 +1869,26 @@ async function rejectAutopilotItem(itemId) {
       method: "POST",
       body: JSON.stringify({ feedback, auto_reproduce: true })
     });
-    toast("반려 의견을 전달했습니다. 수정된 기획과 영상을 자동으로 다시 제작합니다.");
+    state.rejectPanel = { itemId: null, open: false, feedback: "" };
+    toast("반려 의견과 첨부 변경 사항을 반영해 기획·영상을 자동으로 다시 제작합니다.");
     await refresh(itemId);
   } catch (error) { toast(error.message); }
+}
+
+async function uploadRejectAttachments(fileList, itemId, inputEl = null) {
+  const files = [...(fileList || [])];
+  if (!files.length) return;
+  const draft = String(document.getElementById("reject-feedback-input")?.value || "");
+  state.rejectPanel = { itemId, open: true, feedback: draft };
+  try {
+    await uploadAttachmentFilesToItem(itemId, files);
+    await refresh(itemId);
+    toast(`첨부 파일 ${files.length}개를 추가했습니다.`);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    if (inputEl) inputEl.value = "";
+  }
 }
 
 async function publishItem(platform) {
@@ -2038,9 +2135,10 @@ async function saveItemSubtitles(event, itemId) {
   } catch (error) { toast(error.message); }
 }
 
-async function runAction(path, method, message) {
+async function runAction(path, method, message, payload = null) {
   try {
-    await api(path, { method });
+    const opts = payload !== null ? { method, body: JSON.stringify(payload) } : { method };
+    await api(path, opts);
     toast(message);
     await refresh(state.selectedId);
   } catch (error) { toast(error.message); }
@@ -2310,12 +2408,14 @@ async function createItem(event) {
   const mode = body.workflow_mode === "autopilot" ? "autopilot" : "manual";
   const visualMode = body.visual_mode || "hybrid";
   const styleTemplateId = body.style_template_id || null;
+  const ttsSpeed = Number(body.tts_speed || 1.35);
   const useAttachedMedia = form.querySelector('input[name="use_attached_media"]')?.checked ?? true;
   const pendingFiles = [...state.pendingAttachments];
   body.platforms = [...form.querySelectorAll('input[name="platforms"]:checked')].map(input => input.value);
   body.synthetic_media = form.querySelector('input[name="synthetic_media"]').checked;
   body.use_attached_media = useAttachedMedia;
   body.style_template_id = styleTemplateId;
+  body.tts_speed = ttsSpeed;
   body.duration_seconds = Number(body.duration_seconds);
   if (!body.platforms.length) return toast("게시 대상을 하나 이상 선택하세요.");
   try {

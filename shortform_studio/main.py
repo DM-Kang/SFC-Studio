@@ -82,6 +82,7 @@ from .workflow import (
     get_subtitles_state,
     item_directory,
     record_rejection_feedback,
+    retime_item_video,
     revise_plan,
     run_autopilot_pipeline,
     run_content_review,
@@ -134,6 +135,13 @@ class NewItem(BaseModel):
     workflow_mode: Literal["manual", "autopilot"] = "manual"
     visual_mode: Literal["hybrid", "ai_images", "stock"] = "hybrid"
     use_attached_media: bool = True
+    tts_speed: float = Field(default=1.35, ge=0.75, le=2.0)
+
+
+class RetimeVideoRequest(BaseModel):
+    """Adjust finished video playback/narration speed while keeping subtitles and audio synced."""
+
+    speed_multiplier: float = Field(default=1.5, ge=0.75, le=2.0)
 
 
 class StyleTemplateDiscoverRequest(BaseModel):
@@ -1701,6 +1709,11 @@ def delete_item_attachment(item_id: str, attachment_id: str) -> dict[str, Any]:
         candidate = (folder / rel).resolve()
         if folder in candidate.parents:
             candidate.unlink(missing_ok=True)
+    stored_name = str(target.get("stored_name") or "")
+    if stored_name:
+        safe_clip = (folder / "clips" / Path(stored_name).name).resolve()
+        if (folder / "clips").resolve() == safe_clip.parent:
+            safe_clip.unlink(missing_ok=True)
     remaining = [att for att in attachments if not (isinstance(att, dict) and att.get("id") == attachment_id)]
     assets = dict(item.get("assets") or {})
     if target.get("stored_name"):
@@ -1735,6 +1748,21 @@ def preview_item_attachment(item_id: str, attachment_id: str) -> FileResponse:
     if folder not in file_path.parents or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Attachment file is missing.")
     return FileResponse(file_path)
+
+
+@app.post("/api/items/{item_id}/retime", status_code=202)
+def retime_item_endpoint(item_id: str, request: RetimeVideoRequest | None = None) -> dict[str, str]:
+    """@brief Fast-retime an existing rendered video without re-running LLM planning or AI image synthesis."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    if not isinstance(item.get("plan"), dict):
+        raise HTTPException(status_code=409, detail="Create a plan before retiming a video.")
+    assets = item.get("assets") or {}
+    if not Path(str(assets.get("source_video") or assets.get("final_video") or "")).is_file():
+        raise HTTPException(status_code=409, detail="Generate or upload a video before adjusting speed.")
+    speed = float((request or RetimeVideoRequest()).speed_multiplier)
+    job_id = _schedule(item_id, "generating", lambda: retime_item_video(store, item_id, speed))
+    return {"job_id": job_id, "status": "generating"}
 
 
 @app.post("/api/items/{item_id}/clips", status_code=201)

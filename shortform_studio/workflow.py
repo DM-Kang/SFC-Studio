@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,8 +38,12 @@ from .media import (
     normalize_subtitle_style,
     probe_video,
     render_video,
+    retime_audio_file,
+    retime_video_file,
     runway_generate_video,
+    scale_srt_timestamps,
     srt_to_shorts_ass,
+    synthesize_sfx_and_mix_bgm,
     validate_and_normalize_srt,
 )
 from .planning import (
@@ -737,6 +742,7 @@ def run_scene_assembly(
     transition: str = "cut",
     tts_provider: str = "auto",
     tts_voice: str = "",
+    tts_speed: float = 1.35,
     bgm_volume: float = 0.18,
     ducking: bool = True,
     loudnorm: bool = False,
@@ -806,6 +812,7 @@ def run_scene_assembly(
         folder,
         tts_provider=tts_provider,
         voice=tts_voice,
+        tts_speed=tts_speed,
         synth_fn=generate_voiceover,
     )
     if narration is None and isinstance(existing_assets.get("voiceover"), dict):
@@ -823,12 +830,21 @@ def run_scene_assembly(
         if candidate_srt.is_file():
             captions_path = candidate_srt
 
-    bgm_path = Path(str(existing_assets.get("bgm_path") or "")) if existing_assets.get("bgm_path") else None
-    if bgm_path and (not bgm_path.is_file() or (auto_bgm and bgm_path.name == "bgm_auto.mp3")):
-        bgm_path = None
-    if bgm_path is None and auto_bgm:
+    base_bgm_path = Path(str(existing_assets.get("base_bgm_path") or existing_assets.get("bgm_path") or "")) if (existing_assets.get("base_bgm_path") or existing_assets.get("bgm_path")) else None
+    if base_bgm_path and (not base_bgm_path.is_file() or (auto_bgm and base_bgm_path.name == "bgm_auto.mp3") or base_bgm_path.name == "bgm_sfx.mp3"):
+        base_bgm_path = None
+    if base_bgm_path is None and auto_bgm:
         total_scene_dur = sum(float(c.get("duration_seconds") or 4.0) for c in resolved_clips)
-        bgm_path = ensure_ambient_bgm(folder / "bgm_auto.mp3", max(total_scene_dur, float(plan.get("duration_seconds") or 20)), mood=bgm_mood)
+        base_bgm_path = ensure_ambient_bgm(folder / "bgm_auto.mp3", max(total_scene_dur, float(plan.get("duration_seconds") or 20)), mood=bgm_mood)
+    bgm_path = (
+        synthesize_sfx_and_mix_bgm(
+            base_bgm_path,
+            [float(c.get("duration_seconds") or 4.0) for c in resolved_clips],
+            folder / "bgm_sfx.mp3",
+        )
+        if base_bgm_path
+        else None
+    )
 
     normalized_style = normalize_subtitle_style(subtitle_style or existing_assets.get("subtitle_style") or {"preset": "shorts_punch"})
     burn_captions_path = captions_path
@@ -845,6 +861,8 @@ def run_scene_assembly(
 
     master_path = folder / "source_assembled.mp4"
     final_path = folder / "final.mp4"
+    for stale_base in ("retime_base_video.mp4", "retime_base_voice.mp3", "retime_base_captions.srt"):
+        (folder / stale_base).unlink(missing_ok=True)
     # Render a clean master without burned captions first so subtitle editing can rerender without re-assembling.
     cancel_fn = lambda: store.is_cancel_requested(item_id)
     assemble_multiscene_video(
@@ -878,6 +896,7 @@ def run_scene_assembly(
         "video_provider": {"provider": "multiscene_ffmpeg", "scene_count": len(resolved_clips), "transition": transition},
         "voiceover": narration,
         "captions_path": str(captions_path) if captions_path else None,
+        "base_bgm_path": str(base_bgm_path) if base_bgm_path else existing_assets.get("base_bgm_path"),
         "bgm_path": str(bgm_path) if bgm_path else existing_assets.get("bgm_path"),
         "subtitle_style": normalized_style,
     }
@@ -1134,6 +1153,27 @@ def _assign_attached_media_to_scenes(
     return slots
 
 
+def _collect_reference_product_images(folder: Path, attachments: list[dict[str, Any]] | None) -> list[Path]:
+    """@brief Collect up to 2 included image attachment paths to anchor AI-generated scenes to the real product."""
+    if not isinstance(attachments, list):
+        return []
+    clips_dir = (folder / "clips").resolve()
+    refs: list[Path] = []
+    for att in attachments:
+        if (
+            isinstance(att, dict)
+            and att.get("included", True) is not False
+            and att.get("kind") == "image"
+            and att.get("stored_name")
+        ):
+            candidate = (clips_dir / Path(str(att["stored_name"])).name).resolve()
+            if candidate.parent == clips_dir and candidate.is_file():
+                refs.append(candidate)
+                if len(refs) >= 2:
+                    break
+    return refs
+
+
 def _ai_rerank_and_fill_visuals(
     folder: Path,
     scenes: list[dict[str, Any]],
@@ -1141,6 +1181,7 @@ def _ai_rerank_and_fill_visuals(
     scene_inputs: list[dict[str, Any]],
     *,
     visual_mode: str = "hybrid",
+    attachments: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """@brief Let planning AI pick the best clip per scene and synthesize 9:16 AI images for off-topic or AI-visual slots."""
     if not scenes or not scene_inputs:
@@ -1185,6 +1226,7 @@ def _ai_rerank_and_fill_visuals(
 
     if visual_mode != "stock" and (get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY")):
         by_id = {str(m.get("provider_id")): m for m in materials if isinstance(m, dict) and m.get("provider_id")}
+        ref_images = _collect_reference_product_images(folder, attachments)
         for idx, entry in enumerate(updated):
             if entry.get("from_attachment"):
                 continue
@@ -1194,7 +1236,12 @@ def _ai_rerank_and_fill_visuals(
             should_generate = (visual_mode == "ai_images") or (overlap == 0)
             if should_generate and isinstance(scene, dict):
                 prompt_text = f"{scene.get('visual_query') or ''} — mood and subject: {scene.get('narration') or ''}"
-                ai_img = generate_ai_scene_image(prompt_text, folder / "clips" / f"ai_scene_{idx + 1}.png")
+                out_path = folder / "clips" / f"ai_scene_{idx + 1}.png"
+                ai_img = (
+                    generate_ai_scene_image(prompt_text, out_path, reference_image_paths=ref_images)
+                    if ref_images
+                    else generate_ai_scene_image(prompt_text, out_path)
+                )
                 if ai_img and ai_img.is_file():
                     updated[idx] = {
                         "source_kind": "uploaded",
@@ -1389,12 +1436,19 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
                 if slot is None and idx < len(stock_selected):
                     scene_slots[idx] = stock_selected[idx]
 
+    ref_images = _collect_reference_product_images(folder, item.get("attachments"))
     if any(slot is None for slot in scene_slots) and visual_mode != "stock" and (get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY")) and scenes:
         store.set_job_progress(item_id, "3/4 AI 아트워크 장면 생성 중 (Gemini/OpenAI)", 58)
         per_dur = round(max(2.5, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, len(scenes)))), 1)
         for idx, sc in enumerate(scenes[:8]):
             if idx < len(scene_slots) and scene_slots[idx] is None and isinstance(sc, dict):
-                img = generate_ai_scene_image(f"{sc.get('visual_query') or ''} — mood and subject: {sc.get('narration') or ''}", folder / "clips" / f"ai_scene_{idx + 1}.png")
+                prompt_text = f"{sc.get('visual_query') or ''} — mood and subject: {sc.get('narration') or ''}"
+                out_path = folder / "clips" / f"ai_scene_{idx + 1}.png"
+                img = (
+                    generate_ai_scene_image(prompt_text, out_path, reference_image_paths=ref_images)
+                    if ref_images
+                    else generate_ai_scene_image(prompt_text, out_path)
+                )
                 if img and img.is_file():
                     scene_slots[idx] = {"source_kind": "uploaded", "filename": img.name, "duration_seconds": per_dur, "from_attachment": True}
 
@@ -1433,19 +1487,36 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
     else:
         resolved_bgm_mood = default_bgm_mood
     if scene_inputs:
-        scene_inputs = _ai_rerank_and_fill_visuals(folder, scenes, materials, scene_inputs, visual_mode=visual_mode)
+        scene_inputs = _ai_rerank_and_fill_visuals(
+            folder,
+            scenes,
+            materials,
+            scene_inputs,
+            visual_mode=visual_mode,
+            attachments=item.get("attachments"),
+        )
         store.set_job_progress(item_id, "3/4 클립 저장 · 씬별 음성·ASS 자막 · BGM 합성 중", 72)
         tts_mode = (
             "gemini_tts"
             if get_secret("GEMINI_API_KEY") and str(item.get("language") or "").strip().lower() in {"korean", "ko", "한국어"}
             else "auto"
         )
+        tts_speed = max(0.75, min(2.0, float(item.get("tts_speed") or 1.35)))
+        speed_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*배속", cleaned_feedback) if cleaned_feedback else None
+        if speed_match:
+            try:
+                tts_speed = max(0.75, min(2.0, float(speed_match.group(1))))
+            except ValueError:
+                pass
+        elif cleaned_feedback and any(tok in cleaned_feedback for tok in ("더 빠르", "템포 빠르", "성격 급")):
+            tts_speed = max(tts_speed, 1.45)
         run_scene_assembly(
             store,
             item_id,
             scene_inputs,
             transition=active_transition if len(scene_inputs) > 1 else "cut",
             tts_provider=tts_mode,
+            tts_speed=tts_speed,
             loudnorm=True,
             subtitle_style=active_subtitle_style,
             auto_bgm=True,
@@ -1461,6 +1532,138 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
         raise RuntimeError("Operation cancelled by operator.")
 
     store.set_job_progress(item_id, "4/4 완성 영상 기술 검사 · AI 독립 검수 중", 90)
+    run_content_review(store, item_id)
+    return "reviewed"
+
+
+def retime_item_video(store: Store, item_id: str, speed_multiplier: float = 1.5) -> str:
+    """@brief Rescale an existing rendered video, narration, and SRT captions cleanly without re-running AI."""
+    item = store.get_item(item_id)
+    if item is None:
+        raise KeyError(item_id)
+    plan = item.get("plan")
+    if not isinstance(plan, dict):
+        raise RuntimeError("Create a plan before retiming a video.")
+    assets = dict(item.get("assets") or {})
+    folder = item_directory(item_id)
+    factor = max(0.75, min(2.0, float(speed_multiplier or 1.5)))
+
+    base_video = folder / "retime_base_video.mp4"
+    if not base_video.is_file():
+        src_candidate = Path(str(assets.get("source_video") or folder / "source_assembled.mp4"))
+        if not src_candidate.is_file():
+            src_candidate = Path(str(assets.get("final_video") or ""))
+        if not src_candidate.is_file():
+            raise RuntimeError("A rendered source video is required before retiming.")
+        shutil.copy2(src_candidate, base_video)
+
+    base_audio = folder / "retime_base_voice.mp3"
+    voiceover_meta = dict(assets.get("voiceover") or {})
+    if not base_audio.is_file():
+        vo_candidate = Path(str(voiceover_meta.get("audio_path") or folder / "voiceover.mp3"))
+        if vo_candidate.is_file():
+            shutil.copy2(vo_candidate, base_audio)
+
+    base_srt = folder / "retime_base_captions.srt"
+    if not base_srt.is_file():
+        srt_candidate = Path(str(assets.get("captions_path") or voiceover_meta.get("captions_path") or folder / "captions.srt"))
+        if srt_candidate.is_file():
+            shutil.copy2(srt_candidate, base_srt)
+
+    store.cancel_pending_schedules(item_id, "Video retimed; review and approve the updated artifact.")
+    store.set_job_progress(item_id, f"영상·음성·자막 {factor:.2f}배속 재렌더링 중", 45)
+    cancel_fn = lambda: store.is_cancel_requested(item_id)
+
+    retimed_source = folder / "source_retimed.mp4"
+    retime_video_file(base_video, retimed_source, factor, cancel_check=cancel_fn)
+
+    audio_path: Path | None = None
+    if base_audio.is_file():
+        audio_path = folder / "voiceover.mp3"
+        retime_audio_file(base_audio, audio_path, factor, cancel_check=cancel_fn)
+
+    tpl_cfg = style_template_to_production_config(item.get("style_template_snapshot"))
+    style_obj = tpl_cfg.get("subtitle_style") if tpl_cfg else assets.get("subtitle_style")
+    normalized_style = normalize_subtitle_style(style_obj or {"preset": "shorts_punch"})
+    use_banner = tpl_cfg.get("use_hook_banner", True) if tpl_cfg else True
+    hook_banner = format_shorts_banner_text(str(plan.get("title") or ""), str(plan.get("hook") or "")) if use_banner else ""
+
+    captions_path: Path | None = None
+    burn_captions: Path | None = None
+    if base_srt.is_file():
+        scaled_srt = scale_srt_timestamps(base_srt.read_text(encoding="utf-8"), factor)
+        captions_path = folder / "captions.srt"
+        captions_path.write_text(scaled_srt, encoding="utf-8")
+        try:
+            burn_captions = srt_to_shorts_ass(
+                scaled_srt,
+                folder / "captions.ass",
+                style=normalized_style,
+                hook_title=hook_banner,
+            )
+        except Exception:
+            burn_captions = captions_path
+
+    raw_base_bgm = assets.get("base_bgm_path") or assets.get("bgm_path")
+    base_bgm = Path(str(raw_base_bgm or "")) if raw_base_bgm else None
+    if base_bgm and base_bgm.name == "bgm_sfx.mp3" and (folder / "bgm_auto.mp3").is_file():
+        base_bgm = folder / "bgm_auto.mp3"
+    if base_bgm and not base_bgm.is_file():
+        base_bgm = None
+
+    bgm_path = base_bgm
+    if base_bgm is not None:
+        raw_durs = voiceover_meta.get("scene_durations") if isinstance(voiceover_meta.get("scene_durations"), list) else []
+        if raw_durs:
+            scaled_durs = [max(0.8, float(d) / factor) for d in raw_durs if isinstance(d, (int, float)) and d > 0]
+        else:
+            sc_count = max(1, int((assets.get("video_provider") or {}).get("scene_count") or len(plan.get("scenes") or []) or 4))
+            est_total = max(6.0, float(plan.get("duration_seconds") or 20) / factor)
+            scaled_durs = [est_total / sc_count] * sc_count
+        bgm_path = synthesize_sfx_and_mix_bgm(base_bgm, scaled_durs, folder / "bgm_sfx.mp3")
+
+    final_path = folder / "final.mp4"
+    render_video(
+        retimed_source,
+        final_path,
+        audio_path=audio_path,
+        captions_path=burn_captions,
+        subtitle_style=normalized_style,
+        bgm_path=bgm_path,
+        bgm_volume=0.18,
+        ducking=True,
+        loudnorm=True,
+        cancel_check=cancel_fn,
+    )
+    if voiceover_meta:
+        if audio_path:
+            voiceover_meta["audio_path"] = str(audio_path)
+        if captions_path:
+            voiceover_meta["captions_path"] = str(captions_path)
+
+    new_assets = {
+        **assets,
+        "source_video": str(retimed_source),
+        "final_video": str(final_path),
+        "sha256": sha256_file(final_path),
+        "voiceover": voiceover_meta or assets.get("voiceover"),
+        "captions_path": str(captions_path) if captions_path else assets.get("captions_path"),
+        "subtitle_style": normalized_style,
+        "speed_multiplier": factor,
+    }
+    store.update_payload(
+        item_id,
+        {
+            "assets": new_assets,
+            "tts_speed": factor,
+            "review": None,
+            "approved_at": None,
+            "approved_asset_sha256": None,
+            "reviewed_asset_sha256": None,
+            "approval_record": None,
+        },
+    )
+    store.set_job_progress(item_id, "배속 영상 기술·AI 검수 중", 85)
     run_content_review(store, item_id)
     return "reviewed"
 

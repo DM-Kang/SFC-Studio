@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Shortform Content Studio</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20261123d">
-  <link rel="stylesheet" href="/static/management.css?v=20261123d">
-  <script src="/static/app.js?v=20261123d" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=20261123f">
+  <link rel="stylesheet" href="/static/management.css?v=20261123f">
+  <script src="/static/app.js?v=20261123f" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -61,6 +61,7 @@
           </div>
           <label>제작 방식<select name="workflow_mode" id="workflow-mode-select"><option value="manual">수동 단계별 모드 (기존)</option><option value="autopilot">완전 자동화 모드 (원클릭 기획→제작→검수)</option></select></label>
           <label>화면 비주얼 방식<select name="visual_mode" id="visual-mode-select"><option value="hybrid">하이브리드 (스톡 + 불일치 시 AI 이미지)</option><option value="ai_images">전 장면 Gemini/AI 아트워크 + 모션 (고일관성)</option><option value="stock">스톡 영상만 사용</option></select></label>
+          <label>나레이션·템포 배속<select name="tts_speed" id="tts-speed-select"><option value="1.0">1.0x (차분한 기본)</option><option value="1.25">1.25x (조금 빠르게)</option><option value="1.35" selected>1.35x (한국 쇼츠 추천)</option><option value="1.5">1.5x (빠른 텐션·홈쇼핑)</option><option value="1.65">1.65x (초고속 쇼츠)</option></select></label>
           <div class="style-template-picker">
             <div class="card-head">
               <span class="attachment-label">영상 제목·자막 스타일 템플릿</span>
