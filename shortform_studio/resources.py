@@ -227,6 +227,11 @@ def search_pexels_videos(scenes: list[dict[str, Any]], api_key: str) -> list[dic
         url = f"{PEXELS_VIDEO_SEARCH_URL}?{urllib.parse.urlencode({'query': query, 'orientation': 'portrait', 'per_page': MAX_VIDEOS_PER_SCENE, 'locale': 'ko-KR'})}"
         response = _get_json(url, headers={"Authorization": api_key})
         videos = response.get("videos", [])
+        if not videos:
+            ascii_words = [w for w in query.split() if w.isascii() and len(w) > 1]
+            if len(ascii_words) > 2:
+                retry_url = f"{PEXELS_VIDEO_SEARCH_URL}?{urllib.parse.urlencode({'query': ' '.join(ascii_words[:2]), 'orientation': 'portrait', 'per_page': MAX_VIDEOS_PER_SCENE})}"
+                videos = _get_json(retry_url, headers={"Authorization": api_key}).get("videos", [])
         for video in videos[:MAX_VIDEOS_PER_SCENE] if isinstance(videos, list) else []:
             if not isinstance(video, dict):
                 continue
@@ -237,6 +242,8 @@ def search_pexels_videos(scenes: list[dict[str, Any]], api_key: str) -> list[dic
             user = video.get("user") if isinstance(video.get("user"), dict) else {}
             video_files = video.get("video_files") if isinstance(video.get("video_files"), list) else []
             download_url = _select_pexels_download_url(video_files)
+            slug_parts = [p for p in urllib.parse.urlsplit(source_url).path.split("/") if p and p != "video"]
+            slug_tags = re.sub(r"-\d+$", "", slug_parts[-1]).replace("-", ", ") if slug_parts else ""
             materials.append(
                 {
                     "scene_id": scene_id,
@@ -244,6 +251,7 @@ def search_pexels_videos(scenes: list[dict[str, Any]], api_key: str) -> list[dic
                     "provider": "Pexels",
                     "provider_id": str(video.get("id") or "")[:80],
                     "title": f"Pexels video {video.get('id', '')}"[:160],
+                    "tags": slug_tags[:200],
                     "source_url": source_url,
                     "download_url": download_url,
                     "poster_url": poster_url,
@@ -367,6 +375,7 @@ def search_pixabay_videos(scenes: list[dict[str, Any]], api_key: str) -> list[di
                     "provider": "Pixabay",
                     "provider_id": f"pixabay-{hit_id}"[:80],
                     "title": (f"Pixabay · {str(hit.get('tags') or hit_id).split(',')[0].strip()}" if hit.get("tags") else f"Pixabay video {hit_id}")[:160],
+                    "tags": str(hit.get("tags") or "")[:200],
                     "source_url": source_url,
                     "download_url": best["url"],
                     "poster_url": poster_url,

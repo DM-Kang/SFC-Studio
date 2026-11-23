@@ -198,6 +198,37 @@ def _build_plan_payload(
     }
 
 
+def _translate_non_ascii_scene_queries(result: dict[str, Any], topic: str) -> dict[str, Any]:
+    """@brief Ask the planning model once to turn any non-English scene visual_query values into English stock keywords."""
+    raw_scenes = result.get("scenes")
+    if not isinstance(raw_scenes, list) or not raw_scenes:
+        return result
+    needs_fix = [
+        (idx, sc)
+        for idx, sc in enumerate(raw_scenes)
+        if isinstance(sc, dict) and isinstance(sc.get("visual_query"), str) and sc["visual_query"].strip() and not sc["visual_query"].isascii()
+    ]
+    if not needs_fix:
+        return result
+    items = [{"index": idx, "narration": str(sc.get("narration") or "")[:120], "visual_query": sc["visual_query"][:120]} for idx, sc in needs_fix]
+    try:
+        translated, _ = generate_json(
+            'Translate each scene visual_query into 2-4 concrete English stock-video keywords (e.g. "pouring iced coffee glass"). Return JSON: {"queries": [{"index": 0, "visual_query": "..."}]}.',
+            f"Topic: {topic}\nScenes: {json.dumps(items, ensure_ascii=False)}",
+            stage="planning",
+        )
+        entries = translated.get("queries") if isinstance(translated, dict) else None
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and isinstance(entry.get("index"), int) and isinstance(entry.get("visual_query"), str):
+                    pos = entry["index"]
+                    if 0 <= pos < len(raw_scenes) and isinstance(raw_scenes[pos], dict):
+                        raw_scenes[pos]["visual_query"] = entry["visual_query"].strip()
+    except Exception:
+        pass
+    return result
+
+
 def generate_plan(brief: dict[str, Any], use_ai: bool, research_sources: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """@brief Generate a structured short-form plan or a labeled local preview."""
     sources = _source_snapshot(research_sources)
@@ -226,6 +257,7 @@ def generate_plan(brief: dict[str, Any], use_ai: bool, research_sources: list[di
         "Do not treat a topic or operator notes as proof. If extracted sources are insufficient, write cautiously and identify what needs source verification."
     )
     result, model = generate_json(PLANNER_SYSTEM_PROMPT, user_prompt, stage="planning")
+    result = _translate_non_ascii_scene_queries(result, str(brief.get("topic") or ""))
     return _build_plan_payload(result, model, brief, sources)
 
 
@@ -402,6 +434,7 @@ def revise_plan_with_feedback(
         "Create a fresh improved plan addressing all of the operator's feedback. Update scenes and English visual_query terms to match any visual/pacing changes requested."
     )
     result, model = generate_json(PLANNER_SYSTEM_PROMPT, user_prompt, stage="planning")
+    result = _translate_non_ascii_scene_queries(result, str(brief.get("topic") or ""))
     fallback_duration = int(plan.get("duration_seconds") or brief.get("duration_seconds") or 30) if isinstance(plan, dict) else int(brief.get("duration_seconds") or 30)
     return _build_plan_payload(result, model, brief, sources, fallback_duration=fallback_duration, generated_by=f"{model} (revised)")
 

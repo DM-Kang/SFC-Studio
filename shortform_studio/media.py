@@ -192,9 +192,11 @@ def validate_and_normalize_srt(raw_srt: str) -> str:
 
 
 def build_subtitles_filter(captions_filename: str, style: dict[str, Any] | None = None) -> str:
-    """@brief Build a safe FFmpeg subtitles filter expression with ASS force_style."""
-    normalized = normalize_subtitle_style(style)
+    """@brief Build a safe FFmpeg subtitles filter expression supporting styled SRT or dynamic ASS."""
     safe_filename = captions_filename.replace("\\", "/").replace("'", "\\'").replace(":", "\\:")
+    if captions_filename.lower().endswith(".ass"):
+        return f"ass={safe_filename}"
+    normalized = normalize_subtitle_style(style)
     force_style = (
         f"FontName={normalized['font_name']},"
         f"FontSize={normalized['font_size']},"
@@ -206,6 +208,90 @@ def build_subtitles_filter(captions_filename: str, style: dict[str, Any] | None 
         f"OutlineColour={normalized['outline_colour']}"
     )
     return f"subtitles={safe_filename}:force_style='{force_style}'"
+
+
+def _ass_time(seconds: float) -> str:
+    """@brief Format non-negative seconds as H:MM:SS.CC for ASS dialogue events."""
+    cs = max(0, int(round(seconds * 100)))
+    hours, rem = divmod(cs, 360_000)
+    minutes, rem = divmod(rem, 6_000)
+    whole_seconds, centis = divmod(rem, 100)
+    return f"{hours}:{minutes:02d}:{whole_seconds:02d}.{centis:02d}"
+
+
+def _parse_srt_cues(raw_srt: str) -> list[tuple[float, float, str]]:
+    """@brief Extract normalized (start_sec, end_sec, text) tuples from SRT text."""
+    normalized_text = validate_and_normalize_srt(raw_srt)
+    cues: list[tuple[float, float, str]] = []
+    for block in re.split(r"\n{2,}", normalized_text.strip()):
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if len(lines) < 3:
+            continue
+        match = _SRT_TIME_PATTERN.fullmatch(lines[1])
+        if not match:
+            continue
+        start_s = _srt_timestamp_ms(*match.groups()[:4]) / 1000.0
+        end_s = _srt_timestamp_ms(*match.groups()[4:]) / 1000.0
+        text = " ".join(lines[2:]).strip()
+        if text:
+            cues.append((start_s, end_s, text))
+    return cues
+
+
+def srt_to_shorts_ass(
+    raw_srt: str,
+    output_path: Path,
+    *,
+    width: int = 1080,
+    height: int = 1920,
+    style: dict[str, Any] | None = None,
+    hook_title: str = "",
+) -> Path:
+    """@brief Build a styled 9:16 ASS caption file with pop-in text and optional top hook banner."""
+    normalized = normalize_subtitle_style(style)
+    cues = _parse_srt_cues(raw_srt)
+    font_name = normalized["font_name"] or default_subtitle_font()
+    font_size = max(48, int(normalized["font_size"]))
+    margin_v = int(normalized["margin_v"])
+    outline = max(3, int(normalized["outline"]))
+    shadow = max(1, int(normalized["shadow"]))
+    alignment = int(normalized["alignment"])
+    primary = normalized["primary_colour"]
+    outline_col = normalized["outline_colour"]
+
+    total_end = max((end for _, end, _ in cues), default=15.0)
+    events: list[str] = []
+    clean_banner = re.sub(r"[\r\n{}]+", " ", str(hook_title or "")).strip()[:32]
+    if clean_banner:
+        events.append(f"Dialogue: 1,0:00:00.00,{_ass_time(total_end)},HookBanner,,0,0,0,,{clean_banner}")
+    for start_s, end_s, cue_text in cues:
+        safe_text = cue_text.replace("{", "(").replace("}", ")").replace("\n", r"\N")
+        anim = r"{\fad(35,35)\fscx107\fscy107\t(0,85,\fscx100\fscy100)}"
+        events.append(f"Dialogue: 0,{_ass_time(start_s)},{_ass_time(end_s)},Default,,0,0,0,,{anim}{safe_text}")
+
+    ass_doc = "\n".join(
+        [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            f"PlayResX: {width}",
+            f"PlayResY: {height}",
+            "WrapStyle: 2",
+            "ScaledBorderAndShadow: yes",
+            "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+            f"Style: Default,{font_name},{font_size},{primary},&H000000FF,{outline_col},&H80000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},64,64,{margin_v},1",
+            f"Style: HookBanner,{font_name},52,&H0000E5FF,&H000000FF,&H00000000,&HCC0E1118,-1,0,0,0,100,100,0,0,3,16,0,8,56,56,120,1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+            *events,
+            "",
+        ]
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(ass_doc, encoding="utf-8")
+    return output_path
 
 
 def runway_generate_video(prompt: str, output_dir: Path, duration: int = 10) -> dict[str, Any]:
@@ -306,29 +392,43 @@ def generate_voiceover(
         raise RuntimeError("Both ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID are required.")
     encoded_voice = urllib.parse.quote(voice_id, safe="")
     model_id = get_secret("ELEVENLABS_MODEL", "eleven_multilingual_v2") or "eleven_multilingual_v2"
-    request = urllib.request.Request(
-        f"{ELEVENLABS_BASE_URL}/text-to-speech/{encoded_voice}/with-timestamps",
-        data=json.dumps({"text": text, "model_id": model_id}).encode("utf-8"),
-        headers={"Content-Type": "application/json", "xi-api-key": api_key},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        detail = ""
+    url = f"{ELEVENLABS_BASE_URL}/text-to-speech/{encoded_voice}/with-timestamps"
+    voice_settings: dict[str, Any] = {
+        "stability": 0.42,
+        "similarity_boost": 0.78,
+        "style": 0.35,
+        "use_speaker_boost": True,
+        "speed": 1.10,
+    }
+    result: dict[str, Any] | None = None
+    for attempt_settings in (voice_settings, {k: v for k, v in voice_settings.items() if k != "speed"}):
+        request = urllib.request.Request(
+            url,
+            data=json.dumps({"text": text, "model_id": model_id, "voice_settings": attempt_settings}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "xi-api-key": api_key},
+            method="POST",
+        )
         try:
-            err_body = json.loads(error.read(4096).decode("utf-8", errors="replace"))
-            err_detail = err_body.get("detail") if isinstance(err_body, dict) else None
-            if isinstance(err_detail, dict) and isinstance(err_detail.get("message"), str):
-                detail = f": {err_detail['message'][:300]}"
-            elif isinstance(err_detail, str):
-                detail = f": {err_detail[:300]}"
-        except Exception:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as error:
+            if error.code in {400, 422} and "speed" in attempt_settings:
+                continue
             detail = ""
-        raise RuntimeError(f"ElevenLabs request failed with HTTP {error.code}{detail}") from None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"ElevenLabs request failed: {type(error).__name__}.") from None
+            try:
+                err_body = json.loads(error.read(4096).decode("utf-8", errors="replace"))
+                err_detail = err_body.get("detail") if isinstance(err_body, dict) else None
+                if isinstance(err_detail, dict) and isinstance(err_detail.get("message"), str):
+                    detail = f": {err_detail['message'][:300]}"
+                elif isinstance(err_detail, str):
+                    detail = f": {err_detail[:300]}"
+            except Exception:
+                detail = ""
+            raise RuntimeError(f"ElevenLabs request failed with HTTP {error.code}{detail}") from None
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"ElevenLabs request failed: {type(error).__name__}.") from None
+    assert result is not None
     encoded_audio = result.get("audio_base64")
     raw_alignment = result.get("alignment")
     norm_alignment = result.get("normalized_alignment")
@@ -356,6 +456,181 @@ def generate_voiceover(
     return {"audio_path": str(audio_path), "captions_path": str(captions_path), "provider": "elevenlabs", "voice_id": voice_id}
 
 
+def generate_scene_synced_voiceover(
+    scenes: list[dict[str, Any]],
+    fallback_script: str,
+    output_dir: Path,
+    *,
+    tts_provider: str = "auto",
+    voice: str = "",
+    synth_fn: Any = None,
+) -> dict[str, Any] | None:
+    """@brief Synthesize narration per scene so visual cuts and spoken cues stay 1:1 synced."""
+    synthesize = synth_fn or generate_voiceover
+    ffmpeg = shutil.which("ffmpeg")
+    valid_scenes = [
+        str(s.get("narration") or "").strip()
+        for s in (scenes or [])
+        if isinstance(s, dict) and str(s.get("narration") or "").strip()
+    ]
+    if len(valid_scenes) < 2 or not ffmpeg or str(tts_provider or "auto").strip().lower() == "none":
+        return synthesize(fallback_script, output_dir, tts_provider=tts_provider, voice=voice)
+
+    parts_dir = output_dir / "tts_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    part_paths: list[Path] = []
+    part_durations: list[float] = []
+    merged_cues: list[tuple[float, float, str]] = []
+    cursor = 0.0
+    first_meta: dict[str, Any] | None = None
+
+    for idx, line in enumerate(valid_scenes[:8]):
+        scene_dir = parts_dir / f"scene_{idx}"
+        res = synthesize(line, scene_dir, tts_provider=tts_provider, voice=voice)
+        if res is None:
+            return None
+        if first_meta is None:
+            first_meta = res
+        audio_file = Path(res["audio_path"])
+        dur = probe_audio_duration(audio_file)
+        if dur is None or dur <= 0:
+            from .planning import estimate_speaking_duration
+
+            dur = max(1.2, estimate_speaking_duration(line)["estimated_seconds"])
+        cues = _parse_srt_cues(Path(res["captions_path"]).read_text(encoding="utf-8"))
+        for s_off, e_off, cue_txt in cues:
+            merged_cues.append((cursor + s_off, cursor + min(dur, max(s_off + 0.2, e_off)), cue_txt))
+        part_paths.append(audio_file)
+        part_durations.append(round(max(1.2, dur), 2))
+        cursor += dur
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    final_audio = output_dir / "voiceover.mp3"
+    staging_audio = output_dir / "voiceover.merging.mp3"
+    concat_inputs = "".join(f"[{i}:a:0]" for i in range(len(part_paths)))
+    cmd = [ffmpeg, "-y"]
+    for p in part_paths:
+        cmd.extend(["-i", str(p)])
+    cmd.extend(["-filter_complex", f"{concat_inputs}concat=n={len(part_paths)}:v=0:a=1[aout]", "-map", "[aout]", "-c:a", "libmp3lame", "-q:a", "3", str(staging_audio)])
+    rc, detail = _run_ffmpeg(cmd, cwd=output_dir)
+    if rc != 0 or not staging_audio.is_file():
+        staging_audio.unlink(missing_ok=True)
+        raise RuntimeError(f"FFmpeg voiceover concatenation failed: {detail}")
+    staging_audio.replace(final_audio)
+
+    srt_lines: list[str] = []
+    for idx, (start_s, end_s, txt) in enumerate(merged_cues, 1):
+        srt_lines.extend((str(idx), f"{_srt_time(start_s)} --> {_srt_time(end_s)}", txt, ""))
+    captions_path = output_dir / "captions.srt"
+    captions_path.write_text("\n".join(srt_lines), encoding="utf-8")
+    return {
+        "audio_path": str(final_audio),
+        "captions_path": str(captions_path),
+        "provider": (first_meta or {}).get("provider", "tts"),
+        "voice_id": (first_meta or {}).get("voice_id", ""),
+        "scene_durations": part_durations,
+    }
+
+
+def ensure_ambient_bgm(output_path: Path, duration_seconds: float, *, mood: str = "upbeat") -> Path | None:
+    """@brief Synthesize a clean, royalty-free ambient background chord pad when no custom BGM is provided."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    dur = max(5.0, min(90.0, float(duration_seconds or 25.0)))
+    # Warm pentatonic ambient pad (C-G-Am-F style harmonics) + gentle lowpass so it never competes with speech.
+    expr = (
+        "0.22*sin(2*PI*130.81*t)"
+        "+0.18*sin(2*PI*196.00*t)"
+        "+0.16*sin(2*PI*261.63*t)"
+        "+0.14*sin(2*PI*329.63*t)*(0.6+0.4*sin(2*PI*0.25*t))"
+        if mood != "calm"
+        else "0.22*sin(2*PI*110.00*t)+0.18*sin(2*PI*164.81*t)+0.15*sin(2*PI*220.00*t)"
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    staging = output_path.with_name(f"{output_path.stem}.synth{output_path.suffix}")
+    fade_out_start = max(0.5, dur - 1.2)
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"aevalsrc={expr}:s=44100:d={dur:.2f}",
+        "-af",
+        f"lowpass=f=950,afade=t=in:st=0:d=0.6,afade=t=out:st={fade_out_start:.2f}:d=1.1",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "128k",
+        str(staging),
+    ]
+    try:
+        rc, _detail = _run_ffmpeg(cmd, cwd=output_path.parent)
+        if rc == 0 and staging.is_file():
+            staging.replace(output_path)
+            return output_path
+    except Exception:
+        pass
+    staging.unlink(missing_ok=True)
+    return None
+
+
+def generate_ai_scene_image(prompt: str, output_path: Path) -> Path | None:
+    """@brief Generate a vertical 9:16 keyframe image via Gemini or OpenAI when stock clips fit poorly."""
+    clean_prompt = (
+        f"Vertical 9:16 realistic photography / editorial visual for short-form video, "
+        f"no text overlays, no watermarks, crisp lighting: {str(prompt or '')[:450]}"
+    )
+    gemini_key = get_secret("GEMINI_API_KEY")
+    if gemini_key:
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent"
+        body = {
+            "contents": [{"parts": [{"text": clean_prompt}]}],
+            "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": gemini_key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            for cand in payload.get("candidates", []):
+                for part in (cand.get("content") or {}).get("parts", []):
+                    inline = part.get("inlineData") or part.get("inline_data")
+                    if isinstance(inline, dict) and isinstance(inline.get("data"), str):
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        output_path.write_bytes(base64.b64decode(inline["data"]))
+                        return output_path
+        except Exception:
+            pass
+
+    openai_key = get_secret("OPENAI_API_KEY")
+    if openai_key:
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/images/generations",
+            data=json.dumps({"model": "gpt-image-1", "prompt": clean_prompt, "size": "1024x1536"}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {openai_key}"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            data_list = payload.get("data") or []
+            if data_list and isinstance(data_list[0], dict):
+                b64 = data_list[0].get("b64_json")
+                if isinstance(b64, str) and b64:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_bytes(base64.b64decode(b64))
+                    return output_path
+        except Exception:
+            pass
+    return None
+
+
 def _generate_openai_tts(text: str, output_dir: Path, *, voice: str = "") -> dict[str, Any]:
     """@brief Synthesize MP3 narration with OpenAI TTS and produce proportional SRT captions."""
     api_key = get_secret("OPENAI_API_KEY")
@@ -366,7 +641,7 @@ def _generate_openai_tts(text: str, output_dir: Path, *, voice: str = "") -> dic
         chosen_voice = "alloy"
     request = urllib.request.Request(
         "https://api.openai.com/v1/audio/speech",
-        data=json.dumps({"model": "tts-1", "voice": chosen_voice, "input": text[:4096], "response_format": "mp3"}).encode("utf-8"),
+        data=json.dumps({"model": "tts-1", "voice": chosen_voice, "input": text[:4096], "response_format": "mp3", "speed": 1.08}).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         method="POST",
     )
@@ -621,7 +896,13 @@ def render_video(
 
     voice_idx = 1 if audio_path else None
     bgm_idx = (2 if audio_path else 1) if bgm_path else None
-    duration_args = ["-t", f"{audio_duration + 0.10:.2f}"] if (audio_duration is not None and audio_duration > 0) else []
+    target_duration = audio_duration
+    if audio_path is None and bgm_path is not None:
+        info = probe_video(source_path)
+        raw_dur = info.get("duration_seconds") if isinstance(info, dict) else None
+        if isinstance(raw_dur, (int, float)) and raw_dur > 0:
+            target_duration = float(raw_dur)
+    duration_args = ["-t", f"{target_duration + 0.10:.2f}"] if (target_duration is not None and target_duration > 0) else []
     use_complex = bool(bgm_path or (loudnorm and audio_path))
     if use_complex:
         filter_parts: list[str] = []
@@ -701,7 +982,7 @@ def build_multiscene_ffmpeg_command(
             command.extend(["-stream_loop", "-1", "-t", f"{dur:.2f}", "-i", rel_path])
             filter_parts.append(
                 f"[{idx}:v:0]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},setsar=1,fps=30,format=yuv420p[v{idx}]"
+                f"crop={width}:{height},eq=contrast=1.04:saturation=1.08,setsar=1,fps=30,format=yuv420p[v{idx}]"
             )
 
     if len(clips) == 1:
@@ -846,8 +1127,11 @@ def probe_video(video_path: Path) -> dict[str, Any]:
     )
     if result.returncode != 0:
         return {"available": True, "passed": False, "message": "ffprobe could not parse the video file."}
+    raw_stdout = getattr(result, "stdout", None)
+    if not isinstance(raw_stdout, str) or not raw_stdout.strip():
+        return {"available": True, "passed": False, "message": "ffprobe returned empty metadata."}
     try:
-        metadata = json.loads(result.stdout)
+        metadata = json.loads(raw_stdout)
     except json.JSONDecodeError:
         return {"available": True, "passed": False, "message": "ffprobe returned malformed metadata."}
     streams = metadata.get("streams")

@@ -9,19 +9,28 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .ai import ai_ready
+from .ai import ai_ready, generate_json
 from .analytics import summarize_analytics
-from .shorts_learner import summarize_shorts_references_for_planning
+from .shorts_learner import (
+    analyze_shorts_reference,
+    extract_youtube_urls,
+    resolve_learned_production_style,
+    summarize_shorts_references_for_planning,
+)
 from .config import get_projects_dir, get_secret
 from .media import (
     SUBTITLE_STYLE_PRESETS,
     assemble_multiscene_video,
+    ensure_ambient_bgm,
     extract_video_frame,
+    generate_ai_scene_image,
+    generate_scene_synced_voiceover,
     generate_voiceover,
     normalize_subtitle_style,
     probe_video,
     render_video,
     runway_generate_video,
+    srt_to_shorts_ass,
     validate_and_normalize_srt,
 )
 from .planning import (
@@ -698,6 +707,9 @@ def run_scene_assembly(
     ducking: bool = True,
     loudnorm: bool = False,
     subtitle_style: dict[str, Any] | None = None,
+    auto_bgm: bool = False,
+    bgm_mood: str = "upbeat",
+    hook_banner: str = "",
 ) -> str:
     """@brief Assemble selected clips/images across scenes with optional narration, BGM, and captions."""
     item = store.get_item(item_id)
@@ -754,11 +766,23 @@ def run_scene_assembly(
         rel = local_path.resolve().relative_to(folder_resolved).as_posix()
         resolved_clips.append({"relative_path": rel, "duration_seconds": duration, "media_type": media_type})
 
-    narration = generate_voiceover(plan["script"], folder, tts_provider=tts_provider, voice=tts_voice)
+    narration = generate_scene_synced_voiceover(
+        plan.get("scenes") or [],
+        plan["script"],
+        folder,
+        tts_provider=tts_provider,
+        voice=tts_voice,
+        synth_fn=generate_voiceover,
+    )
     if narration is None and isinstance(existing_assets.get("voiceover"), dict):
         existing_vo = existing_assets["voiceover"]
         if Path(str(existing_vo.get("audio_path") or "")).is_file():
             narration = existing_vo
+    if narration and isinstance(narration.get("scene_durations"), list) and len(narration["scene_durations"]) == len(resolved_clips):
+        for idx, dur_val in enumerate(narration["scene_durations"]):
+            if isinstance(dur_val, (int, float)) and dur_val > 0:
+                resolved_clips[idx]["duration_seconds"] = round(max(1.2, min(30.0, float(dur_val))), 2)
+
     captions_path = Path(narration["captions_path"]) if narration and narration.get("captions_path") else None
     if not captions_path and existing_assets.get("captions_path"):
         candidate_srt = Path(str(existing_assets["captions_path"]))
@@ -768,8 +792,23 @@ def run_scene_assembly(
     bgm_path = Path(str(existing_assets.get("bgm_path") or "")) if existing_assets.get("bgm_path") else None
     if bgm_path and not bgm_path.is_file():
         bgm_path = None
+    if bgm_path is None and auto_bgm:
+        total_scene_dur = sum(float(c.get("duration_seconds") or 4.0) for c in resolved_clips)
+        bgm_path = ensure_ambient_bgm(folder / "bgm_auto.mp3", max(total_scene_dur, float(plan.get("duration_seconds") or 20)), mood=bgm_mood)
 
     normalized_style = normalize_subtitle_style(subtitle_style or existing_assets.get("subtitle_style") or {"preset": "shorts_punch"})
+    burn_captions_path = captions_path
+    if captions_path and captions_path.is_file() and captions_path.suffix.lower() == ".srt":
+        try:
+            burn_captions_path = srt_to_shorts_ass(
+                captions_path.read_text(encoding="utf-8"),
+                folder / "captions.ass",
+                style=normalized_style,
+                hook_title=hook_banner,
+            )
+        except Exception:
+            burn_captions_path = captions_path
+
     master_path = folder / "source_assembled.mp4"
     final_path = folder / "final.mp4"
     # Render a clean master without burned captions first so subtitle editing can rerender without re-assembling.
@@ -788,7 +827,7 @@ def run_scene_assembly(
         master_path,
         final_path,
         audio_path=Path(narration["audio_path"]) if narration else None,
-        captions_path=captions_path,
+        captions_path=burn_captions_path,
         subtitle_style=normalized_style,
         bgm_path=bgm_path,
         bgm_volume=bgm_volume,
@@ -805,6 +844,7 @@ def run_scene_assembly(
         "video_provider": {"provider": "multiscene_ffmpeg", "scene_count": len(resolved_clips), "transition": transition},
         "voiceover": narration,
         "captions_path": str(captions_path) if captions_path else None,
+        "bgm_path": str(bgm_path) if bgm_path else existing_assets.get("bgm_path"),
         "subtitle_style": normalized_style,
     }
     rights_assets = replace_final_video_rights_record(rights_assets, "multi-scene FFmpeg assembly")
@@ -920,12 +960,36 @@ def save_thumbnail_from_video(store: Store, item_id: str, timestamp_seconds: flo
     return store.update_payload(item_id, {"assets": assets})
 
 
+def _keyword_overlap_score(scene: dict[str, Any], material: dict[str, Any]) -> int:
+    """@brief Measure token overlap between scene visual query and candidate clip metadata."""
+    q_tokens = {tok.lower() for tok in str(scene.get("visual_query") or "").replace(",", " ").split() if len(tok) >= 2 and tok.isascii()}
+    if not q_tokens:
+        return 0
+    haystack = " ".join(
+        str(material.get(field) or "") for field in ("tags", "title")
+    ).lower().replace(",", " ").replace("·", " ")
+    m_tokens = {tok for tok in haystack.split() if len(tok) >= 2}
+    return len(q_tokens & m_tokens)
+
+
+def _score_material_for_scene(scene: dict[str, Any], material: dict[str, Any], target_dur: float) -> tuple[int, int]:
+    """@brief Return (overlap_count, total_quality_score) for ranking a stock clip candidate."""
+    overlap = _keyword_overlap_score(scene, material)
+    w = int(material.get("width") or 0)
+    h = int(material.get("height") or 0)
+    portrait = 50 if h > w > 0 else 0
+    hd = 20 if h >= 1080 else (10 if h >= 720 else 0)
+    dur_ok = 10 if int(material.get("duration_seconds") or 0) >= target_dur else 0
+    scene_match = 100 if str(material.get("scene_id") or "") == str(scene.get("id") or "") else 0
+    return overlap, (overlap * 200) + scene_match + portrait + hd + dur_ok
+
+
 def _auto_select_scene_clips(
     scenes: list[dict[str, Any]],
     materials: list[dict[str, Any]],
     target_duration: int | float,
 ) -> list[dict[str, Any]]:
-    """@brief Automatically match the best unused stock video clip to each planned scene."""
+    """@brief Automatically match the highest-scoring unused stock video clip to each planned scene."""
     downloadable = [m for m in materials if isinstance(m, dict) and m.get("provider_id") and m.get("download_url")]
     if not downloadable:
         return []
@@ -937,6 +1001,8 @@ def _auto_select_scene_clips(
     used_ids: set[str] = set()
     for scene in bounded_scenes:
         sid = str(scene.get("id") or "")
+        raw_dur = scene.get("duration_seconds")
+        dur = round(max(1.0, min(30.0, float(raw_dur))), 1) if isinstance(raw_dur, (int, float)) and not isinstance(raw_dur, bool) else default_dur
         scene_matches = [m for m in downloadable if str(m.get("scene_id") or "") == sid]
         pool = (
             [m for m in scene_matches if str(m["provider_id"]) not in used_ids]
@@ -944,13 +1010,73 @@ def _auto_select_scene_clips(
             or [m for m in downloadable if str(m["provider_id"]) not in used_ids]
             or downloadable
         )
-        chosen = pool[0]
+        ranked = sorted(pool, key=lambda cand: _score_material_for_scene(scene, cand, dur)[1], reverse=True)
+        chosen = ranked[0]
         pid = str(chosen["provider_id"])
         used_ids.add(pid)
-        raw_dur = scene.get("duration_seconds")
-        dur = round(max(1.0, min(30.0, float(raw_dur))), 1) if isinstance(raw_dur, (int, float)) and not isinstance(raw_dur, bool) else default_dur
         selected.append({"source_kind": "stock", "provider_id": pid, "duration_seconds": dur})
     return selected
+
+
+def _ai_rerank_and_fill_visuals(
+    folder: Path,
+    scenes: list[dict[str, Any]],
+    materials: list[dict[str, Any]],
+    scene_inputs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """@brief Let planning AI pick the best clip per scene and synthesize 9:16 AI images for off-topic slots."""
+    if not scenes or not scene_inputs:
+        return scene_inputs
+    updated = [dict(entry) for entry in scene_inputs]
+    if ai_ready("planning") and len(materials) > len(scenes):
+        try:
+            candidates_by_scene = []
+            for idx, scene in enumerate(scenes[: len(updated)]):
+                sid = str(scene.get("id") or f"scene-{idx + 1}")
+                pool = [m for m in materials if str(m.get("scene_id") or "") == sid][:5]
+                if pool:
+                    candidates_by_scene.append(
+                        {
+                            "scene_id": sid,
+                            "narration": str(scene.get("narration") or "")[:120],
+                            "visual_query": str(scene.get("visual_query") or "")[:80],
+                            "candidates": [{"provider_id": m.get("provider_id"), "title": m.get("title"), "tags": m.get("tags", "")} for m in pool],
+                        }
+                    )
+            if candidates_by_scene:
+                ai_pick, _ = generate_json(
+                    'Select the most visually relevant stock candidate per scene. Return JSON: {"choices": {"scene-1": "provider_id", ...}}.',
+                    f"Scenes and candidates: {candidates_by_scene}",
+                    stage="planning",
+                )
+                choices = ai_pick.get("choices") if isinstance(ai_pick, dict) else None
+                if isinstance(choices, dict):
+                    valid_ids = {str(m.get("provider_id")) for m in materials if m.get("provider_id")}
+                    used: set[str] = set()
+                    for idx, scene in enumerate(scenes[: len(updated)]):
+                        chosen_id = str(choices.get(str(scene.get("id") or "")) or "")
+                        if chosen_id in valid_ids and chosen_id not in used:
+                            updated[idx]["provider_id"] = chosen_id
+                            used.add(chosen_id)
+        except Exception:
+            pass
+
+    if get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY"):
+        by_id = {str(m.get("provider_id")): m for m in materials if isinstance(m, dict) and m.get("provider_id")}
+        for idx, entry in enumerate(updated):
+            scene = scenes[idx] if idx < len(scenes) else {}
+            mat = by_id.get(str(entry.get("provider_id") or ""))
+            overlap = _keyword_overlap_score(scene, mat) if mat else 0
+            if overlap == 0 and idx < 2 and isinstance(scene, dict):
+                prompt_text = f"{scene.get('visual_query') or ''} ({scene.get('narration') or ''})"
+                ai_img = generate_ai_scene_image(prompt_text, folder / "clips" / f"ai_scene_{idx + 1}.png")
+                if ai_img and ai_img.is_file():
+                    updated[idx] = {
+                        "source_kind": "uploaded",
+                        "filename": ai_img.name,
+                        "duration_seconds": entry.get("duration_seconds") or 4.0,
+                    }
+    return updated
 
 
 def confirm_item_rights_for_approval(item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1013,6 +1139,23 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
     item = store.get_item(item_id)
     if item is None:
         raise KeyError(item_id)
+
+    note_yt_urls = extract_youtube_urls(str(item.get("source_notes") or ""), limit=2)
+    if note_yt_urls:
+        saved_refs = [r for r in (store.get_setting("shorts_references", []) or []) if isinstance(r, dict)]
+        known_urls = {str(r.get("video_id") or "") for r in saved_refs}
+        changed_refs = False
+        for yt_url in note_yt_urls:
+            try:
+                analyzed = analyze_shorts_reference(yt_url, use_ai=ai_ready("planning"))
+                if analyzed["video_id"] not in known_urls:
+                    saved_refs.append(analyzed)
+                    known_urls.add(analyzed["video_id"])
+                    changed_refs = True
+            except Exception:
+                continue
+        if changed_refs:
+            store.set_setting("shorts_references", saved_refs[-30:])
 
     tavily_key = get_secret("TAVILY_API_KEY")
     existing_research = item.get("research") if isinstance(item.get("research"), dict) else {}
@@ -1110,20 +1253,37 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
                 {"source_kind": "uploaded", "filename": str(uploaded_clips[idx % len(uploaded_clips)]["filename"]), "duration_seconds": per_dur}
                 for idx in range(max(1, min(len(scenes), 8)))
             ]
+    if not scene_inputs and (get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY")) and scenes:
+        folder = item_directory(item_id)
+        per_dur = round(max(2.5, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, len(scenes)))), 1)
+        ai_scenes: list[dict[str, Any]] = []
+        for idx, sc in enumerate(scenes[:6]):
+            img = generate_ai_scene_image(f"{sc.get('visual_query') or ''} ({sc.get('narration') or ''})", folder / "clips" / f"ai_scene_{idx + 1}.png")
+            if img and img.is_file():
+                ai_scenes.append({"source_kind": "uploaded", "filename": img.name, "duration_seconds": per_dur})
+        scene_inputs = ai_scenes
+
+    style_cfg = resolve_learned_production_style(store.get_setting("shorts_references", []))
     if scene_inputs:
-        store.set_job_progress(item_id, "3/4 클립 저장 · ElevenLabs/TTS · FFmpeg 합성 중", 72)
+        folder = item_directory(item_id)
+        scene_inputs = _ai_rerank_and_fill_visuals(folder, scenes, materials, scene_inputs)
+        store.set_job_progress(item_id, "3/4 클립 저장 · 씬별 음성·ASS 자막 · BGM 합성 중", 72)
         run_scene_assembly(
             store,
             item_id,
             scene_inputs,
-            transition="fade" if len(scene_inputs) > 1 else "cut",
+            transition=style_cfg["transition"] if len(scene_inputs) > 1 else "cut",
             tts_provider="auto",
             loudnorm=True,
+            subtitle_style={"preset": style_cfg["caption_preset"]},
+            auto_bgm=True,
+            bgm_mood=style_cfg["bgm_mood"],
+            hook_banner=str(plan.get("hook") or plan.get("title") or "")[:32] if style_cfg["use_hook_banner"] else "",
         )
     elif runway_key:
         run_video_generation(store, item_id)
     else:
-        raise RuntimeError("완전 자동화 제작에는 스톡 영상 API(PIXABAY_API_KEY/PEXELS_API_KEY), 업로드 클립, 또는 RUNWAY_API_KEY가 필요합니다.")
+        raise RuntimeError("완전 자동화 제작에는 스톡 영상 API(PIXABAY_API_KEY/PEXELS_API_KEY), AI 이미지 키, 업로드 클립, 또는 RUNWAY_API_KEY가 필요합니다.")
 
     if store.is_cancel_requested(item_id):
         raise RuntimeError("Operation cancelled by operator.")

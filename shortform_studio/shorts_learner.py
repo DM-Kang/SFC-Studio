@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import json
 import re
@@ -14,6 +15,9 @@ from typing import Any
 from uuid import uuid4
 
 from .ai import generate_json
+from .config import get_secret
+
+_YOUTUBE_URL_IN_TEXT_RE = re.compile(r"https://(?:www\.|m\.)?(?:youtube\.com/(?:shorts/[A-Za-z0-9_-]{11}|watch\?[^\s]*v=[A-Za-z0-9_-]{11})|youtu\.be/[A-Za-z0-9_-]{11})[^\s]*")
 
 _YOUTUBE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _ALLOWED_YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
@@ -176,6 +180,38 @@ def compute_pacing_metrics(transcript: str, segments: list[dict[str, Any]], dura
     }
 
 
+def _fetch_innertube_caption_segments(video_id: str) -> tuple[list[dict[str, Any]], str]:
+    """@brief Fetch non-empty YouTube timedtext captions via Android Innertube player fallback."""
+    try:
+        req = urllib.request.Request(
+            "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+            data=json.dumps(
+                {
+                    "videoId": video_id,
+                    "context": {"client": {"clientName": "ANDROID", "clientVersion": "20.10.38", "hl": "ko", "gl": "KR"}},
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14)"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            player = json.loads(resp.read().decode("utf-8"))
+        tracks = ((player.get("captions") or {}).get("playerCaptionsTracklistRenderer") or {}).get("captionTracks")
+        track = _select_caption_track(tracks)
+        if not track:
+            return [], ""
+        lang = str(track.get("languageCode") or "")[:20]
+        cap_req = urllib.request.Request(
+            track["baseUrl"],
+            headers={"User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14)"},
+        )
+        with urllib.request.urlopen(cap_req, timeout=15) as cap_resp:
+            raw_body = cap_resp.read(1_500_000).decode("utf-8", errors="replace")
+        return _parse_caption_segments(raw_body), lang
+    except Exception:
+        return [], ""
+
+
 def fetch_youtube_shorts_data(url: str) -> dict[str, Any]:
     """@brief Fetch public metadata and timed captions for a YouTube Shorts or watch URL."""
     video_id = parse_youtube_video_id(url)
@@ -219,6 +255,12 @@ def fetch_youtube_shorts_data(url: str) -> dict[str, Any]:
             segments = _parse_caption_segments(raw_xml)
         except Exception:
             segments = []
+    if not segments:
+        it_segments, it_lang = _fetch_innertube_caption_segments(video_id)
+        if it_segments:
+            segments = it_segments
+            if it_lang:
+                caption_language = it_lang
 
     transcript = " ".join(seg["text"] for seg in segments).strip()
     return {
@@ -267,6 +309,88 @@ def _heuristic_style_analysis(data: dict[str, Any], metrics: dict[str, Any], not
     }
 
 
+def extract_youtube_urls(text: str, *, limit: int = 3) -> list[str]:
+    """@brief Find unique valid public YouTube/Shorts URLs embedded in operator notes."""
+    seen: set[str] = set()
+    urls: list[str] = []
+    for match in _YOUTUBE_URL_IN_TEXT_RE.findall(str(text or "")):
+        cleaned = match.rstrip(".,);]'\"")
+        try:
+            vid = parse_youtube_video_id(cleaned)
+        except ValueError:
+            continue
+        if vid not in seen:
+            seen.add(vid)
+            urls.append(cleaned)
+        if len(urls) >= limit:
+            break
+    return urls
+
+
+def _analyze_thumbnail_with_gemini(video_id: str) -> dict[str, Any]:
+    """@brief Inspect a Shorts cover frame with Gemini Vision when GEMINI_API_KEY is available."""
+    api_key = get_secret("GEMINI_API_KEY")
+    if not api_key:
+        return {}
+    thumb_url = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    try:
+        req = urllib.request.Request(thumb_url, headers={"User-Agent": "ShortformContentStudio/0.1"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            img_bytes = resp.read(1_500_000)
+        if not img_bytes:
+            return {}
+        prompt = (
+            "Analyze this YouTube Shorts frame layout. Return JSON only with keys: "
+            "has_top_banner (boolean), caption_style (one of clean_bottom, shorts_punch, bold_center, yellow_pop, top_news), "
+            "bgm_mood (one of upbeat, calm), visual_cue (short Korean description of shot composition and text styling)."
+        )
+        body = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(img_bytes).decode("ascii")}},
+                    ]
+                }
+            ],
+            "generationConfig": {"responseMimeType": "application/json"},
+        }
+        g_req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            method="POST",
+        )
+        with urllib.request.urlopen(g_req, timeout=20) as g_resp:
+            payload = json.loads(g_resp.read().decode("utf-8"))
+        text = payload["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def resolve_learned_production_style(references: Any) -> dict[str, Any]:
+    """@brief Pick concrete FFmpeg caption, BGM, and transition settings from active learned Shorts."""
+    default = {"caption_preset": "shorts_punch", "bgm_mood": "upbeat", "transition": "cut", "use_hook_banner": True}
+    if not isinstance(references, list):
+        return default
+    active = [r for r in references if isinstance(r, dict) and r.get("active_for_planning", True) is not False]
+    if not active:
+        return default
+    latest = active[-1]
+    analysis = latest.get("analysis") if isinstance(latest.get("analysis"), dict) else {}
+    metrics = latest.get("metrics") if isinstance(latest.get("metrics"), dict) else {}
+    preset = str(analysis.get("caption_style_recommendation") or "shorts_punch")
+    if preset not in {"clean_bottom", "shorts_punch", "bold_center", "yellow_pop", "top_news"}:
+        preset = "shorts_punch"
+    avg_seg = float(metrics.get("avg_segment_seconds") or 3.2)
+    transition = "cut" if avg_seg <= 3.8 or int(metrics.get("recommended_scenes") or 5) >= 4 else "fade"
+    bgm_mood = "calm" if analysis.get("bgm_mood") == "calm" else "upbeat"
+    use_banner = bool(analysis.get("has_top_banner", True))
+    return {"caption_preset": preset, "bgm_mood": bgm_mood, "transition": transition, "use_hook_banner": use_banner}
+
+
 def analyze_shorts_reference(
     url: str,
     *,
@@ -279,6 +403,9 @@ def analyze_shorts_reference(
     effective_transcript = str(manual_transcript or "").strip()[:6000] or data["transcript"]
     metrics = compute_pacing_metrics(effective_transcript, data["segments"], data["duration_seconds"])
     analysis = _heuristic_style_analysis(data, metrics, notes)
+    avg_seg = float(metrics.get("avg_segment_seconds") or 3.2)
+    analysis["bgm_mood"] = "calm" if avg_seg > 4.2 else "upbeat"
+    analysis["has_top_banner"] = True
 
     if use_ai and (effective_transcript or data["description"] or notes.strip()):
         prompt = (
@@ -302,11 +429,26 @@ def analyze_shorts_reference(
                 "pacing_style": str(ai_result.get("pacing_style") or analysis["pacing_style"]).strip()[:300],
                 "visual_rhythm": str(ai_result.get("visual_rhythm") or analysis["visual_rhythm"]).strip()[:300],
                 "caption_style_recommendation": preset,
+                "bgm_mood": analysis["bgm_mood"],
+                "has_top_banner": analysis["has_top_banner"],
                 "learned_rules": [str(r).strip()[:240] for r in rules[:5] if isinstance(r, str) and r.strip()] if isinstance(rules, list) and rules else analysis["learned_rules"],
                 "analyzed_by": model,
             }
         except Exception:
             pass
+
+    if use_ai:
+        vision = _analyze_thumbnail_with_gemini(data["video_id"])
+        if vision:
+            if isinstance(vision.get("has_top_banner"), bool):
+                analysis["has_top_banner"] = vision["has_top_banner"]
+            if vision.get("bgm_mood") in {"upbeat", "calm"}:
+                analysis["bgm_mood"] = vision["bgm_mood"]
+            v_preset = vision.get("caption_style")
+            if v_preset in {"clean_bottom", "shorts_punch", "bold_center", "yellow_pop", "top_news"}:
+                analysis["caption_style_recommendation"] = v_preset
+            if isinstance(vision.get("visual_cue"), str) and vision["visual_cue"].strip():
+                analysis["visual_rhythm"] = f"{analysis['visual_rhythm']} · {vision['visual_cue'].strip()[:160]}"[:300]
 
     return {
         "id": str(uuid4()),

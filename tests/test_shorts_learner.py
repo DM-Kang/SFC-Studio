@@ -156,6 +156,90 @@ class ShortsLearnerAndQualityTests(unittest.TestCase):
         self.assertEqual(len(validated["series_templates"]), 1)
         self.assertEqual(validated["series_templates"][0]["duration_seconds"], 22)
 
+    def test_ass_hook_banner_scene_synced_tts_smart_clip_ranking_and_ai_fallback(self) -> None:
+        """@brief Verify ASS banner generation, scene-synced TTS timing merge, smart stock ranking, and AI image fallback."""
+        from shortform_studio.media import (
+            build_subtitles_filter,
+            generate_scene_synced_voiceover,
+            srt_to_shorts_ass,
+        )
+        from shortform_studio.shorts_learner import extract_youtube_urls, resolve_learned_production_style
+        from shortform_studio.workflow import _ai_rerank_and_fill_visuals, _auto_select_scene_clips
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ass_path = srt_to_shorts_ass(
+                "1\n00:00:00,000 --> 00:00:02,000\n콜드브루 1:9 비율\n",
+                root / "captions.ass",
+                style={"preset": "shorts_punch"},
+                hook_title="집에서 카페급 콜드브루!",
+            )
+            ass_text = ass_path.read_text(encoding="utf-8")
+            self.assertIn("PlayResX: 1080", ass_text)
+            self.assertIn("Style: HookBanner", ass_text)
+            self.assertIn("집에서 카페급 콜드브루!", ass_text)
+            self.assertEqual(build_subtitles_filter("captions.ass"), "ass=captions.ass")
+
+            def fake_synth(text: str, out_dir: Path, **_kw: object) -> dict[str, str]:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                mp3 = out_dir / "voiceover.mp3"
+                srt = out_dir / "captions.srt"
+                mp3.write_bytes(b"mp3")
+                srt.write_text(f"1\n00:00:00,000 --> 00:00:02,000\n{text}\n", encoding="utf-8")
+                return {"audio_path": str(mp3), "captions_path": str(srt), "provider": "elevenlabs", "voice_id": "v1"}
+
+            def fake_ff(cmd: list[str], **_kw: object) -> tuple[int, str]:
+                Path(cmd[-1]).write_bytes(b"merged-mp3")
+                return 0, ""
+
+            with (
+                patch("shortform_studio.media.shutil.which", return_value="ffmpeg"),
+                patch("shortform_studio.media.probe_audio_duration", side_effect=[2.4, 3.1]),
+                patch("shortform_studio.media._run_ffmpeg", side_effect=fake_ff),
+            ):
+                synced = generate_scene_synced_voiceover(
+                    [{"narration": "첫 장면"}, {"narration": "둘째 장면"}],
+                    "첫 장면 둘째 장면",
+                    root / "vo",
+                    synth_fn=fake_synth,
+                )
+            self.assertEqual(synced["scene_durations"], [2.4, 3.1])
+            merged_srt = Path(synced["captions_path"]).read_text(encoding="utf-8")
+            self.assertIn("00:00:02,400 --> 00:00:04,400", merged_srt)
+
+            # Smart ranking chooses matching coffee clip over unrelated lemur clip
+            scenes = [{"id": "scene-1", "visual_query": "cold brew coffee glass"}]
+            mats = [
+                {"scene_id": "scene-1", "provider_id": "pixabay-bad", "title": "Pixabay · lemur", "tags": "lemur, animal", "download_url": "https://cdn.pixabay.com/bad.mp4", "width": 720, "height": 1280, "duration_seconds": 10},
+                {"scene_id": "scene-1", "provider_id": "pixabay-good", "title": "Pixabay · coffee", "tags": "cold brew, coffee, glass", "download_url": "https://cdn.pixabay.com/good.mp4", "width": 1080, "height": 1920, "duration_seconds": 10},
+            ]
+            chosen = _auto_select_scene_clips(scenes, mats, 10)
+            self.assertEqual(chosen[0]["provider_id"], "pixabay-good")
+
+            # AI image fallback activates when stock overlap is 0
+            clips_dir = root / "clips"
+            clips_dir.mkdir()
+            with (
+                patch("shortform_studio.workflow.ai_ready", return_value=False),
+                patch("shortform_studio.workflow.get_secret", side_effect=lambda k, d="": "gem-key" if k == "GEMINI_API_KEY" else d),
+                patch("shortform_studio.workflow.generate_ai_scene_image", side_effect=lambda p, out: (out.write_bytes(b"png"), out)[1]),
+            ):
+                filled = _ai_rerank_and_fill_visuals(
+                    root,
+                    [{"id": "scene-1", "narration": "콜드브루", "visual_query": "espresso extraction"}],
+                    [mats[0]],
+                    [{"source_kind": "stock", "provider_id": "pixabay-bad", "duration_seconds": 4.0}],
+                )
+            self.assertEqual(filled[0]["source_kind"], "uploaded")
+            self.assertEqual(filled[0]["filename"], "ai_scene_1.png")
+
+        urls = extract_youtube_urls("참고 링크: https://www.youtube.com/shorts/dQw4w9WgXcQ 그리고 https://youtu.be/abcDEF12345")
+        self.assertEqual(len(urls), 2)
+        style_cfg = resolve_learned_production_style(
+            [{"active_for_planning": True, "analysis": {"caption_style_recommendation": "yellow_pop", "bgm_mood": "calm", "has_top_banner": True}, "metrics": {"avg_segment_seconds": 2.5, "recommended_scenes": 6}}]
+        )
+        self.assertEqual(style_cfg, {"caption_preset": "yellow_pop", "bgm_mood": "calm", "transition": "cut", "use_hook_banner": True})
+
 
 if __name__ == "__main__":
     unittest.main()
