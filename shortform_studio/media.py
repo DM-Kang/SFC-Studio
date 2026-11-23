@@ -160,6 +160,28 @@ SUBTITLE_STYLE_PRESETS: dict[str, dict[str, Any]] = {
         "banner_margin_v": 165,
         "animation": "fade",
     },
+    "clean_pill": {
+        "label": "감성 캡슐 카드형 자막 (Google Flow 스타일)",
+        "font_name": "Pretendard",
+        "font_size": 58,
+        "margin_v": 290,
+        "outline": 14,
+        "shadow": 0,
+        "alignment": 2,
+        "primary_colour": "&H00202632",
+        "outline_colour": "&H00FFFFFF",
+        "back_colour": "&H00FFFFFF",
+        "border_style": 3,
+        "banner_font_name": "Pretendard",
+        "banner_font_size": 64,
+        "banner_primary_colour": "&H00FFFFFF",
+        "banner_outline_colour": "&H00000000",
+        "banner_back_colour": "&H88000000",
+        "banner_border_style": 1,
+        "banner_outline": 5,
+        "banner_margin_v": 165,
+        "animation": "fade",
+    },
 }
 
 
@@ -476,7 +498,14 @@ def _highlight_caption_keywords(text: str, primary_colour: str) -> str:
     """@brief Highlight numeric specs, ratios, and key commerce emphasis words in ASS captions."""
     if not text:
         return text
-    accent = "&H0080FF9E" if "00E5FF" in primary_colour.upper() else "&H0000E5FF"
+    upper_pri = primary_colour.upper()
+    if "202632" in upper_pri:
+        # Dark text on bright frosted-white pill uses crisp deep cobalt highlight.
+        accent = "&H00D84E1D"
+    elif "00E5FF" in upper_pri:
+        accent = "&H0080FF9E"
+    else:
+        accent = "&H0000E5FF"
 
     def _wrap(match: re.Match[str]) -> str:
         token = match.group(0)
@@ -914,12 +943,100 @@ def generate_scene_synced_voiceover(
     }
 
 
+def _generate_lyria_bgm(output_path: Path, dur: float, *, mood: str, ffmpeg: str) -> Path | None:
+    """@brief Synthesize studio-quality instrumental BGM using Google Lyria 3 when GEMINI_API_KEY is available."""
+    gemini_key = get_secret("GEMINI_API_KEY")
+    if not gemini_key:
+        return None
+    if mood == "calm":
+        music_prompt = (
+            "Warm gentle acoustic piano and soft felt strings instrumental background music, "
+            "cozy Korean lifestyle and bedroom wellness vibe, clean studio mix, NO vocals, NO singing, 88 BPM."
+        )
+    else:
+        music_prompt = (
+            "Bright modern acoustic pop groove with warm plucked marimba, crisp light beat, and uplifting piano chords, "
+            "instrumental Korean short-form lifestyle commerce background music, NO vocals, NO singing, 122 BPM."
+        )
+    body = {
+        "contents": [{"parts": [{"text": music_prompt}]}],
+        "generationConfig": {"responseModalities": ["AUDIO"]},
+    }
+    audio_bytes: bytes | None = None
+    ext = ".mp3"
+    for lyria_model in ("lyria-3-clip-preview", "lyria-3.5"):
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{lyria_model}:generateContent",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": gemini_key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=55) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            for cand in payload.get("candidates", []):
+                for part in (cand.get("content") or {}).get("parts", []):
+                    inline = part.get("inlineData") or part.get("inline_data")
+                    if isinstance(inline, dict) and isinstance(inline.get("data"), str) and inline["data"]:
+                        raw = base64.b64decode(inline["data"])
+                        if len(raw) > 8192:
+                            audio_bytes = raw
+                            mime = str(inline.get("mimeType") or "").lower()
+                            ext = ".wav" if "wav" in mime else ".mp3"
+                            break
+                if audio_bytes:
+                    break
+            if audio_bytes:
+                break
+        except Exception:
+            continue
+    if not audio_bytes:
+        return None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path = output_path.with_name(f"{output_path.stem}.lyria_raw{ext}")
+    staging = output_path.with_name(f"{output_path.stem}.lyria{output_path.suffix}")
+    fade_out_start = max(0.5, dur - 1.2)
+    try:
+        raw_path.write_bytes(audio_bytes)
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-stream_loop",
+            "-1",
+            "-t",
+            f"{dur:.2f}",
+            "-i",
+            raw_path.name,
+            "-af",
+            f"afade=t=in:st=0:d=0.45,afade=t=out:st={fade_out_start:.2f}:d=1.1",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "160k",
+            staging.name,
+        ]
+        rc, _detail = _run_ffmpeg(cmd, cwd=output_path.parent)
+        if rc == 0 and staging.is_file():
+            staging.replace(output_path)
+            return output_path
+    except Exception:
+        pass
+    finally:
+        raw_path.unlink(missing_ok=True)
+        staging.unlink(missing_ok=True)
+    return None
+
+
 def ensure_ambient_bgm(output_path: Path, duration_seconds: float, *, mood: str = "upbeat") -> Path | None:
-    """@brief Synthesize a clean, royalty-free background track (bright rhythmic pop groove or calm pad)."""
+    """@brief Synthesize a clean BGM bed via Google Lyria 3 AI music or deterministic FFmpeg chord synthesis."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return None
     dur = max(5.0, min(90.0, float(duration_seconds or 25.0)))
+    lyria_track = _generate_lyria_bgm(output_path, dur, mood=mood, ffmpeg=ffmpeg)
+    if lyria_track is not None:
+        return lyria_track
     if mood != "calm":
         # Bright ~128 BPM C-G-Am-F rhythmic marimba/pop arpeggio + offbeat sparkle pulse for lively commerce/Shorts.
         eighth = "0.234375"
@@ -1055,6 +1172,109 @@ def synthesize_sfx_and_mix_bgm(
         pass
     staging.unlink(missing_ok=True)
     return bgm_path
+
+
+def _extract_omni_video_bytes(payload: dict[str, Any]) -> bytes | None:
+    """@brief Extract base64 MP4 bytes from a Gemini Interactions API response."""
+    steps = payload.get("steps")
+    if isinstance(steps, list):
+        for step in reversed(steps):
+            if not isinstance(step, dict):
+                continue
+            for item in step.get("content") or []:
+                if not isinstance(item, dict):
+                    continue
+                mime = str(item.get("mime_type") or item.get("mimeType") or "").lower()
+                if (item.get("type") == "video" or mime.startswith("video/")) and isinstance(item.get("data"), str) and item["data"]:
+                    raw = base64.b64decode(item["data"])
+                    if len(raw) > 4096:
+                        return raw
+    for item in payload.get("outputs") or []:
+        if isinstance(item, dict):
+            mime = str(item.get("mime_type") or item.get("mimeType") or "").lower()
+            if (item.get("type") == "video" or mime.startswith("video/")) and isinstance(item.get("data"), str) and item["data"]:
+                raw = base64.b64decode(item["data"])
+                if len(raw) > 4096:
+                    return raw
+    return None
+
+
+def generate_ai_scene_video_omni(
+    prompt: str,
+    output_path: Path,
+    *,
+    reference_image_paths: list[Path] | None = None,
+    duration_seconds: float = 4.0,
+    timeout: int = 180,
+) -> Path | None:
+    """@brief Generate a native 9:16 realistic motion video clip via Gemini Omni 1.2 Flash Interactions API."""
+    gemini_key = get_secret("GEMINI_API_KEY")
+    if not gemini_key:
+        return None
+    input_blocks: list[dict[str, Any]] = []
+    for ref_path in (reference_image_paths or [])[:2]:
+        encoded = _encode_reference_image_part(Path(ref_path))
+        if encoded and isinstance(encoded.get("inlineData"), dict):
+            inl = encoded["inlineData"]
+            input_blocks.append(
+                {
+                    "type": "image",
+                    "mime_type": inl.get("mimeType") or "image/jpeg",
+                    "data": inl["data"],
+                }
+            )
+    clip_hint = max(3, min(8, int(round(float(duration_seconds or 4.0)))))
+    if input_blocks:
+        omni_text = (
+            f"Create a vertical 9:16 realistic commercial/lifestyle short video clip (~{clip_hint} seconds, "
+            f"continuous smooth natural motion, authentic warm home/studio lighting, NO text or subtitles on screen). "
+            f"Strictly preserve the exact physical product appearance, shape, colors, pattern, and details from the "
+            f"reference image(s). Scene: {str(prompt or '')[:420]}"
+        )
+    else:
+        omni_text = (
+            f"Create a vertical 9:16 realistic commercial/lifestyle short video clip (~{clip_hint} seconds, "
+            f"continuous smooth natural motion, NO text or subtitles on screen): {str(prompt or '')[:450]}"
+        )
+    input_blocks.append({"type": "text", "text": omni_text})
+
+    for omni_model in ("gemini-omni-1.2-flash", "gemini-omni-1.1-flash"):
+        body = {
+            "model": omni_model,
+            "input": input_blocks if len(input_blocks) > 1 else omni_text,
+        }
+        req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/interactions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": gemini_key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            interaction_id = payload.get("id")
+            status = str(payload.get("status") or "").lower()
+            deadline = time.monotonic() + timeout
+            while status in {"in_progress", "pending", "running"} and interaction_id and time.monotonic() < deadline:
+                time.sleep(3)
+                poll_req = urllib.request.Request(
+                    f"https://generativelanguage.googleapis.com/v1beta/interactions/{urllib.parse.quote(str(interaction_id), safe='')}",
+                    headers={"x-goog-api-key": gemini_key},
+                    method="GET",
+                )
+                with urllib.request.urlopen(poll_req, timeout=45) as poll_resp:
+                    payload = json.loads(poll_resp.read().decode("utf-8"))
+                status = str(payload.get("status") or "").lower()
+            video_bytes = _extract_omni_video_bytes(payload)
+            if video_bytes:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                staging = output_path.with_name(f"{output_path.stem}.omni{output_path.suffix}")
+                staging.write_bytes(video_bytes)
+                staging.replace(output_path)
+                return output_path
+        except Exception:
+            continue
+    return None
 
 
 def _encode_reference_image_part(path: Path) -> dict[str, Any] | None:

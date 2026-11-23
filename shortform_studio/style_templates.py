@@ -49,16 +49,16 @@ Return ONLY one JSON object with these keys:
 - description: 1 concise Korean sentence describing the font weight, color contrast, and cut rhythm
 - banner_font_name: MUST be exactly one of {list(KOREAN_SHORTS_FONT_FAMILIES)}
 - banner_font_size: integer 60..92
-- banner_primary_colour: ASS &HAABBGGRR hex (note BBGGRR byte order! e.g. Yellow "&H0000E5FF", White "&H00FFFFFF", Mint "&H00C8FF78")
-- banner_back_colour: ASS &HAABBGGRR hex (e.g. "&HCC101520")
+- banner_primary_colour: ASS &HAABBGGRR hex (NOTE: in ASS alpha AA=00 is 100% opaque, AA=33 is ~80% opaque, AA=FF is transparent! Note BBGGRR byte order! e.g. Yellow "&H0000E5FF", White "&H00FFFFFF", Mint "&H00C8FF78")
+- banner_back_colour: ASS &HAABBGGRR hex (e.g. "&H28101520" for 85% opaque dark navy)
 - banner_border_style: integer 1 (clean thick outline+shadow) or 3 (solid/translucent pill backdrop box)
 - banner_margin_v: integer 130..230
 - use_hook_banner: boolean
 - font_name: MUST be exactly one of {list(KOREAN_SHORTS_FONT_FAMILIES)}
 - font_size: integer 54..78
 - primary_colour: ASS &HAABBGGRR hex (e.g. White "&H00FFFFFF", Yellow "&H0000E5FF")
-- outline_colour: ASS &HAABBGGRR hex (usually "&H00000000")
-- back_colour: ASS &HAABBGGRR hex (e.g. "&H99000000" or "&HCC101520")
+- outline_colour: ASS &HAABBGGRR hex (usually "&H00000000" for border_style=1, or "&H00FFFFFF" / "&H28101520" for border_style=3 box fill)
+- back_colour: ASS &HAABBGGRR hex (e.g. "&H66000000" or "&H28101520")
 - border_style: integer 1 (clean bold outline) or 3 (card backdrop box)
 - outline: integer 4..9
 - shadow: integer 1..4
@@ -97,6 +97,27 @@ def _builtin_style_templates() -> list[dict[str, Any]]:
     """@brief Return curated starter templates modeled on top-performing Korean Shorts styles."""
     now = "2026-11-23T00:00:00+00:00"
     return [
+        {
+            "id": "builtin_flow_cinematic_pill",
+            "name": "감성 릴스 · 캡슐 자막 (Google Flow 스타일)",
+            "origin": "builtin",
+            "category": "스토리·감성",
+            "description": "상단 배너를 생략해 영상 몰입감을 높이고, 하단 반투명 화이트 캡슐 카드 자막(52px)과 따뜻한 피아노 BGM, 부드러운 페이드 전환을 사용하는 감성 릴스/Flow 스타일",
+            "source_video": None,
+            "editing": {
+                "transition": "fade",
+                "recommended_scenes": 5,
+                "cut_interval_sec": 3.5,
+                "bgm_mood": "calm",
+                "hook_style": "따뜻한 일상 장면으로 시작해 짧은 공감 질문 훅 제시",
+                "script_rules": [
+                    "과장된 홈쇼핑 감탄사 대신 담백하고 진정성 있는 1인칭 추천 톤을 사용합니다.",
+                    "한 장면마다 10~18자 내외의 짧은 문장 하나로 화면과 자연스럽게 맞춥니다.",
+                ],
+            },
+            "visual": normalize_subtitle_style({"preset": "clean_pill"}) | {"use_hook_banner": False},
+            "updated_at": now,
+        },
         {
             "id": "builtin_viral_hook_punch",
             "name": "바이럴 훅 임팩트 (Black Han Sans · Pretendard)",

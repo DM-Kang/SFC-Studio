@@ -133,7 +133,7 @@ class NewItem(BaseModel):
     series_template_id: str | None = Field(default=None, max_length=36)
     style_template_id: str | None = Field(default=None, max_length=64)
     workflow_mode: Literal["manual", "autopilot"] = "manual"
-    visual_mode: Literal["hybrid", "ai_images", "stock"] = "hybrid"
+    visual_mode: Literal["hybrid", "ai_images", "omni_video", "stock"] = "hybrid"
     use_attached_media: bool = True
     tts_speed: float = Field(default=1.35, ge=0.75, le=2.0)
 
@@ -239,6 +239,8 @@ class RejectRequest(BaseModel):
 
     feedback: str = Field(min_length=2, max_length=2000)
     auto_reproduce: bool = True
+    visual_mode: Literal["hybrid", "ai_images", "omni_video", "stock"] | None = None
+    style_template_id: str | None = Field(default=None, max_length=64)
 
 
 class PublishRequest(BaseModel):
@@ -2073,6 +2075,15 @@ def reject_item(item_id: str, request: RejectRequest) -> Any:
         updated = record_rejection_feedback(store, item_id, request.feedback)
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from None
+    updates: dict[str, Any] = {}
+    if request.visual_mode is not None:
+        updates["visual_mode"] = request.visual_mode
+    if "style_template_id" in request.model_fields_set:
+        tpl_id = request.style_template_id.strip() if isinstance(request.style_template_id, str) and request.style_template_id.strip() else None
+        updates["style_template_id"] = tpl_id
+        updates["style_template_snapshot"] = find_style_template(store, tpl_id) if tpl_id else None
+    if updates:
+        updated = store.update_payload(item_id, updates)
     if not request.auto_reproduce:
         return JSONResponse(status_code=200, content=updated)
     job_id = _schedule(item_id, "planning", lambda: run_autopilot_pipeline(store, item_id, feedback=request.feedback))

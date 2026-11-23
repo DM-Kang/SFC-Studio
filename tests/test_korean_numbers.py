@@ -287,6 +287,143 @@ class KoreanNumbersTests(unittest.TestCase):
             self.assertIn("adelay=7000|7000", fc)
             self.assertIn("normalize=0", fc)
 
+    def test_rejection_feedback_enforces_7_scenes_and_banned_phrases(self) -> None:
+        from shortform_studio.planning import revise_plan_with_feedback
+
+        # Simulate AI still returning 5 scenes AND accidentally keeping the forbidden ending phrase
+        mock_ai = (
+            {
+                "title": "초승달 전통 메밀베개",
+                "hook": "자고 일어나도 목이 뻐근한 이유?",
+                "script": "자고 일어나도 목이 뻐근한 이유! 100% 천연 메밀이 목 곡선을 잡아줍니다. 지금 특별한 가격으로 만나보세요.",
+                "caption": "초승달 메밀베개 소개. 지금 특별한 가격으로 만나보세요.",
+                "hashtags": ["#메밀베개"],
+                "video_prompt": "Vertical buckwheat pillow showcase",
+                "duration_seconds": 30,
+                "claims": [],
+                "scenes": [
+                    {"narration": "자고 일어나도 목이 뻐근한 이유?", "visual_query": "neck pain morning bedroom"},
+                    {"narration": "100% 천연 메밀 충전재로 통기성이 좋습니다.", "visual_query": "buckwheat hulls pouring bowl"},
+                    {"narration": "전통 자수 면 겉커버로 촉감이 부드럽습니다.", "visual_query": "embroidered cotton pillow fabric"},
+                    {"narration": "초승달 설계가 목 곡선을 받쳐줍니다.", "visual_query": "crescent neck pillow ergonomic"},
+                    {"narration": "지퍼 분리 세탁이 간편합니다. 지금 특별한 가격으로 만나보세요.", "visual_query": "zipper pillow cover washing"},
+                ],
+            },
+            "gemini_api:gemini-4-hydrogen",
+        )
+        brief = {
+            "topic": "전통 메밀베개",
+            "audience": "일반",
+            "tone": "홈쇼핑",
+            "language": "Korean",
+            "platforms": ["youtube"],
+            "duration_seconds": 30,
+            "rejection_history": ["마지막에 특별한 가격으로 만나보세요 이부분은 빼줘"],
+        }
+        prev_plan = {"duration_seconds": 30, "sources": []}
+        with patch("shortform_studio.planning.generate_json", return_value=mock_ai):
+            revised = revise_plan_with_feedback(
+                brief,
+                prev_plan,
+                "씬 7개로 만들어 주고 씬 순서대로 장면을 나눠줘",
+                use_ai=True,
+                research_sources=[],
+            )
+        self.assertEqual(len(revised["scenes"]), 7)
+        self.assertNotIn("특별한 가격", revised["script"])
+        self.assertNotIn("특별한 가격", revised["caption"])
+        for sc in revised["scenes"]:
+            self.assertNotIn("특별한 가격", sc["narration"])
+
+    def test_generate_ai_scene_video_omni_and_lyria_bgm_and_clean_pill(self) -> None:
+        import base64 as _base64
+        import json as _json
+        from shortform_studio.media import (
+            ensure_ambient_bgm,
+            generate_ai_scene_video_omni,
+            srt_to_shorts_ass,
+        )
+        from shortform_studio.style_templates import _builtin_style_templates, style_template_to_production_config
+
+        flow_tpl = next((t for t in _builtin_style_templates() if t["id"] == "builtin_flow_cinematic_pill"), None)
+        self.assertIsNotNone(flow_tpl)
+        cfg = style_template_to_production_config(flow_tpl)
+        self.assertFalse(cfg["use_hook_banner"])
+        self.assertEqual(cfg["subtitle_style"]["preset"], "clean_pill")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ass_path = srt_to_shorts_ass(
+                "1\n00:00:00,000 --> 00:00:02,000\n할머니 방에 있던 100% 천연 베개\n",
+                root / "pill.ass",
+                style={"preset": "clean_pill"},
+                hook_title="",
+            )
+            ass_text = ass_path.read_text(encoding="utf-8")
+            self.assertIn("&H00202632", ass_text)
+            self.assertIn("&H00FFFFFF", ass_text)
+            self.assertIn(r"{\c&H00D84E1D&}100%{\c&H00202632&}", ass_text)
+
+            ref_img = root / "pillow.jpg"
+            ref_img.write_bytes(b"\xff\xd8\xff\xe0dummy-jpeg")
+            captured_omni: dict = {}
+            fake_mp4 = b"\x00\x00\x00\x18ftypmp42" + b"0" * 5000
+
+            class _FakeResp:
+                def __init__(self, body: bytes) -> None:
+                    self._body = body
+
+                def read(self) -> bytes:
+                    return self._body
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args) -> None:
+                    return None
+
+            def _fake_urlopen(req, timeout=60):
+                payload = _json.loads(req.data.decode("utf-8"))
+                if "interactions" in req.full_url:
+                    captured_omni["body"] = payload
+                    return _FakeResp(
+                        _json.dumps(
+                            {
+                                "id": "i1",
+                                "status": "completed",
+                                "steps": [
+                                    {
+                                        "type": "model_output",
+                                        "content": [{"type": "video", "mime_type": "video/mp4", "data": _base64.b64encode(fake_mp4).decode("ascii")}],
+                                    }
+                                ],
+                            }
+                        ).encode("utf-8")
+                    )
+                fake_mp3 = b"ID3" + b"1" * 10000
+                return _FakeResp(
+                    _json.dumps(
+                        {"candidates": [{"content": {"parts": [{"inlineData": {"mimeType": "audio/mpeg", "data": _base64.b64encode(fake_mp3).decode("ascii")}}]}}]}
+                    ).encode("utf-8")
+                )
+
+            with patch("shortform_studio.media.get_secret", side_effect=lambda k, d="": "fake-key" if k == "GEMINI_API_KEY" else d), patch(
+                "shortform_studio.media.urllib.request.urlopen", side_effect=_fake_urlopen
+            ):
+                omni_out = generate_ai_scene_video_omni("hand stroking pillow", root / "omni.mp4", reference_image_paths=[ref_img])
+                self.assertEqual(omni_out, root / "omni.mp4")
+                self.assertEqual((root / "omni.mp4").read_bytes(), fake_mp4)
+                self.assertEqual(captured_omni["body"]["model"], "gemini-omni-1.2-flash")
+                self.assertEqual(captured_omni["body"]["input"][0]["type"], "image")
+
+                with patch("shortform_studio.media.shutil.which", return_value="/usr/bin/ffmpeg"), patch(
+                    "shortform_studio.media._run_ffmpeg",
+                    side_effect=lambda cmd, cwd=None: ((cwd / cmd[-1]).write_bytes(b"lyria-out"), (0, ""))[1],
+                ):
+                    bgm_out = ensure_ambient_bgm(root / "bgm_auto.mp3", 12.0, mood="calm")
+                self.assertEqual(bgm_out, root / "bgm_auto.mp3")
+                self.assertEqual(bgm_out.read_bytes(), b"lyria-out")
+
 
 if __name__ == "__main__":
     unittest.main()

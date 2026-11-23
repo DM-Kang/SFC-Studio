@@ -24,7 +24,7 @@ from .shorts_learner import (
     resolve_learned_production_style,
     summarize_shorts_references_for_planning,
 )
-from .style_templates import style_template_to_production_config
+from .style_templates import find_style_template, style_template_to_production_config
 from .config import get_projects_dir, get_secret
 from .media import (
     SUBTITLE_STYLE_PRESETS,
@@ -33,6 +33,7 @@ from .media import (
     extract_video_frame,
     format_shorts_banner_text,
     generate_ai_scene_image,
+    generate_ai_scene_video_omni,
     generate_scene_synced_voiceover,
     generate_voiceover,
     normalize_subtitle_style,
@@ -137,6 +138,11 @@ def _brief(item: dict[str, Any]) -> dict[str, Any]:
         else {},
         "brand_profile": item.get("brand_profile_snapshot") or {},
         "series_template": item.get("series_template_snapshot") or {},
+        "rejection_history": [
+            str(entry.get("feedback") or "").strip()
+            for entry in (item.get("rejection_history") or [])[-5:]
+            if isinstance(entry, dict) and str(entry.get("feedback") or "").strip()
+        ],
     }
 
 
@@ -1076,6 +1082,8 @@ def _assign_attached_media_to_scenes(
     scenes: list[dict[str, Any]],
     attachments: list[dict[str, Any]] | None,
     total_duration: Any,
+    *,
+    operator_feedback: list[str] | str | None = None,
 ) -> list[dict[str, Any] | None]:
     """@brief Place operator-attached images and video clips onto matching scenes before stock or AI visuals."""
     slots: list[dict[str, Any] | None] = [None] * len(scenes)
@@ -1114,9 +1122,14 @@ def _assign_attached_media_to_scenes(
                 }
                 for att in media_atts
             ]
+            feedback_hint = (
+                f"\nOperator storyboard / scene-to-image instructions: {operator_feedback}"
+                if operator_feedback
+                else ""
+            )
             ai_map, _ = generate_json(
-                'Match the operator-attached photos and videos to the scenes where they fit best. Return JSON: {"assignments": {"scene-1": "attachment_id"}}. Only assign attachment_id values that clearly fit the scene; use each attachment at most once.',
-                f"Scenes: {scene_briefs}\nAttached media: {att_briefs}",
+                'Match the operator-attached photos and videos to the scenes where they fit best, strictly honoring any operator storyboard/scene-ordering notes if given. Return JSON: {"assignments": {"scene-1": "attachment_id"}}. Only assign attachment_id values that clearly fit the scene; use each attachment at most once.',
+                f"Scenes: {scene_briefs}\nAttached media: {att_briefs}{feedback_hint}",
                 stage="planning",
             )
             raw_assignments = ai_map.get("assignments") if isinstance(ai_map, dict) else None
@@ -1187,7 +1200,7 @@ def _ai_rerank_and_fill_visuals(
     if not scenes or not scene_inputs:
         return scene_inputs
     updated = [dict(entry) for entry in scene_inputs]
-    if visual_mode != "ai_images" and ai_ready("planning") and len(materials) > len(scenes):
+    if visual_mode not in {"ai_images", "omni_video"} and ai_ready("planning") and len(materials) > len(scenes):
         try:
             candidates_by_scene = []
             for idx, scene in enumerate(scenes[: len(updated)]):
@@ -1385,7 +1398,9 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
         raise RuntimeError("Operation cancelled by operator.")
 
     item = store.get_item(item_id) or item
-    if isinstance(item.get("plan"), dict) and ai_ready("review") and ai_ready("planning"):
+    # Skip automatic editorial autofix right after explicit operator rejection revision so the user's
+    # exact scene count, storyboard structure, and negative constraints are never overwritten.
+    if not cleaned_feedback and isinstance(item.get("plan"), dict) and ai_ready("review") and ai_ready("planning"):
         try:
             editorial = review_plan(_brief(item), item["plan"])
             if editorial.get("status") != "passed":
@@ -1411,13 +1426,27 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
 
     folder = item_directory(item_id)
     materials: list[dict[str, Any]] = []
+    operator_notes = [
+        *[
+            str(entry.get("feedback") or "").strip()
+            for entry in (item.get("rejection_history") or [])[-5:]
+            if isinstance(entry, dict) and str(entry.get("feedback") or "").strip()
+        ],
+        *([cleaned_feedback] if cleaned_feedback else []),
+    ]
     scene_slots: list[dict[str, Any] | None] = (
-        _assign_attached_media_to_scenes(folder, scenes, item.get("attachments"), plan.get("duration_seconds") or 20)
+        _assign_attached_media_to_scenes(
+            folder,
+            scenes,
+            item.get("attachments"),
+            plan.get("duration_seconds") or 20,
+            operator_feedback=operator_notes or None,
+        )
         if item.get("use_attached_media", True)
         else [None] * len(scenes)
     )
     has_missing_slots = any(slot is None for slot in scene_slots) or not scene_slots
-    if has_missing_slots and visual_mode != "ai_images":
+    if has_missing_slots and visual_mode not in {"ai_images", "omni_video"}:
         store.set_job_progress(item_id, "3/4 스톡 영상 검색 · 음성·자막 · 영상 제작 중", 55)
         if pixabay_key:
             materials.extend(search_pixabay_videos(scenes, pixabay_key))
@@ -1437,6 +1466,53 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
                     scene_slots[idx] = stock_selected[idx]
 
     ref_images = _collect_reference_product_images(folder, item.get("attachments"))
+    if visual_mode == "omni_video" and get_secret("GEMINI_API_KEY") and scenes:
+        bounded_scenes = scenes[:8]
+        per_dur = round(max(2.5, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, len(bounded_scenes)))), 1)
+        for idx, sc in enumerate(bounded_scenes):
+            if store.is_cancel_requested(item_id):
+                raise RuntimeError("Operation cancelled by operator.")
+            if not isinstance(sc, dict):
+                continue
+            existing_slot = scene_slots[idx] if idx < len(scene_slots) else None
+            # Preserve operator-uploaded MP4/video clips directly; animate static photos or empty slots via Gemini Omni.
+            if (
+                isinstance(existing_slot, dict)
+                and existing_slot.get("source_kind") == "uploaded"
+                and existing_slot.get("filename")
+                and Path(str(existing_slot["filename"])).suffix.lower() not in IMAGE_EXTS
+            ):
+                continue
+            store.set_job_progress(
+                item_id,
+                f"3/4 Google Omni AI 동영상 생성 중 ({idx + 1}/{len(bounded_scenes)})",
+                52 + int(((idx + 1) / max(1, len(bounded_scenes))) * 18),
+            )
+            scene_refs: list[Path] = []
+            if isinstance(existing_slot, dict) and existing_slot.get("filename"):
+                matched_img = (folder / "clips" / Path(str(existing_slot["filename"])).name).resolve()
+                if matched_img.is_file() and matched_img.suffix.lower() in IMAGE_EXTS:
+                    scene_refs.append(matched_img)
+            for fallback_ref in ref_images:
+                if fallback_ref not in scene_refs:
+                    scene_refs.append(fallback_ref)
+                    if len(scene_refs) >= 2:
+                        break
+            prompt_text = f"{sc.get('visual_query') or ''} — mood and action: {sc.get('narration') or ''}"
+            omni_vid = generate_ai_scene_video_omni(
+                prompt_text,
+                folder / "clips" / f"omni_scene_{idx + 1}.mp4",
+                reference_image_paths=scene_refs,
+                duration_seconds=per_dur,
+            )
+            if omni_vid and omni_vid.is_file():
+                if idx < len(scene_slots):
+                    scene_slots[idx] = {
+                        "source_kind": "uploaded",
+                        "filename": omni_vid.name,
+                        "duration_seconds": per_dur,
+                        "from_attachment": True,
+                    }
     if any(slot is None for slot in scene_slots) and visual_mode != "stock" and (get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY")) and scenes:
         store.set_job_progress(item_id, "3/4 AI 아트워크 장면 생성 중 (Gemini/OpenAI)", 58)
         per_dur = round(max(2.5, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, len(scenes)))), 1)
@@ -1452,7 +1528,7 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
                 if img and img.is_file():
                     scene_slots[idx] = {"source_kind": "uploaded", "filename": img.name, "duration_seconds": per_dur, "from_attachment": True}
 
-    if any(slot is None for slot in scene_slots) and visual_mode != "ai_images":
+    if any(slot is None for slot in scene_slots) and visual_mode not in {"ai_images", "omni_video"}:
         uploaded_clips = ((item.get("assets") or {}).get("uploaded_clips")) or []
         if uploaded_clips:
             per_dur = round(max(2.0, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, len(scenes)))), 1)
@@ -1467,7 +1543,11 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
     scene_inputs: list[dict[str, Any]] = [slot for slot in scene_slots if isinstance(slot, dict)]
 
     style_cfg = resolve_learned_production_style(store.get_setting("shorts_references", []))
-    tpl_cfg = style_template_to_production_config(item.get("style_template_snapshot"))
+    tpl_snap = item.get("style_template_snapshot")
+    tpl_id = str(item.get("style_template_id") or "")
+    if tpl_id.startswith("builtin_"):
+        tpl_snap = find_style_template(store, tpl_id) or tpl_snap
+    tpl_cfg = style_template_to_production_config(tpl_snap)
     if tpl_cfg:
         active_subtitle_style = tpl_cfg["subtitle_style"]
         active_transition = tpl_cfg["transition"]
@@ -1582,7 +1662,11 @@ def retime_item_video(store: Store, item_id: str, speed_multiplier: float = 1.5)
         audio_path = folder / "voiceover.mp3"
         retime_audio_file(base_audio, audio_path, factor, cancel_check=cancel_fn)
 
-    tpl_cfg = style_template_to_production_config(item.get("style_template_snapshot"))
+    tpl_snap = item.get("style_template_snapshot")
+    tpl_id = str(item.get("style_template_id") or "")
+    if tpl_id.startswith("builtin_"):
+        tpl_snap = find_style_template(store, tpl_id) or tpl_snap
+    tpl_cfg = style_template_to_production_config(tpl_snap)
     style_obj = tpl_cfg.get("subtitle_style") if tpl_cfg else assets.get("subtitle_style")
     normalized_style = normalize_subtitle_style(style_obj or {"preset": "shorts_punch"})
     use_banner = tpl_cfg.get("use_hook_banner", True) if tpl_cfg else True

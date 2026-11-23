@@ -7,7 +7,8 @@ const SUBTITLE_PRESETS = {
   shorts_punch: { label: "쇼츠 볼드 강조 자막", font_size: 54, margin_v: 240, alignment: 2, outline: 5, shadow: 2, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" },
   bold_center: { label: "강조 중앙 자막", font_size: 52, margin_v: 80, alignment: 5, outline: 4, shadow: 2, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" },
   yellow_pop: { label: "노란색 포인트 자막", font_size: 46, margin_v: 210, alignment: 2, outline: 4, shadow: 2, primary_colour: "&H0000E5FF", outline_colour: "&H00000000" },
-  top_news: { label: "상단 뉴스형 자막", font_size: 40, margin_v: 180, alignment: 8, outline: 3, shadow: 1, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" }
+  top_news: { label: "상단 뉴스형 자막", font_size: 40, margin_v: 180, alignment: 8, outline: 3, shadow: 1, primary_colour: "&H00FFFFFF", outline_colour: "&H00000000" },
+  clean_pill: { label: "감성 캡슐 카드형 자막 (Google Flow)", font_size: 58, margin_v: 290, alignment: 2, outline: 14, shadow: 0, primary_colour: "&H00202632", outline_colour: "&H00FFFFFF" }
 };
 
 function escapeHtml(value) {
@@ -1168,6 +1169,10 @@ function renderDecisionCard(item) {
   const rejectUseMediaHtml = hasVisualAtts
     ? `<label class="check-row"><input id="reject-use-attached-media" type="checkbox" ${item.use_attached_media !== false ? "checked" : ""}> 첨부 사진·동영상을 영상 장면에 우선 사용</label>`
     : "";
+  const curVisMode = item.visual_mode || "hybrid";
+  const curTplId = item.style_template_id || item.style_template_snapshot?.id || "";
+  const tplList = state.styleTemplatesState?.templates || [];
+  const rejectTplOpts = `<option value="">기본 스타일 유지</option>` + tplList.map(tpl => `<option value="${escapeHtml(tpl.id)}" ${tpl.id === curTplId ? "selected" : ""}>${escapeHtml(tpl.name)}</option>`).join("");
 
   return `<section class="decision-card panel">
     <div class="card-head"><div><p class="eyebrow">FINAL APPROVAL · HUMAN IN THE LOOP</p><h3>완성본 최종 확인 · 승인 또는 반려</h3></div><span class="badge ${techFailed ? "bad" : "good"}">revision ${escapeHtml(plan?.revision ?? 1)}</span></div>
@@ -1196,6 +1201,10 @@ function renderDecisionCard(item) {
               </div>
               <div id="reject-attachment-list" class="reject-att-list">${rejectAttRows || '<p class="small-note">현재 첨부된 파일이 없습니다. 필요한 사진·문서·동영상을 추가하거나 끌어다 놓으세요.</p>'}</div>
               ${rejectUseMediaHtml}
+            </div>
+            <div class="form-row">
+              <label>재제작 화면 방식<select id="reject-visual-mode-select"><option value="hybrid" ${curVisMode === "hybrid" ? "selected" : ""}>하이브리드 (스톡 + AI 이미지)</option><option value="omni_video" ${curVisMode === "omni_video" ? "selected" : ""}>Google Omni AI 실제 동영상 (Flow급 · 유료 API)</option><option value="ai_images" ${curVisMode === "ai_images" ? "selected" : ""}>전 장면 Gemini AI 이미지 + 모션</option><option value="stock" ${curVisMode === "stock" ? "selected" : ""}>스톡 영상만 사용</option></select></label>
+              <label>자막·편집 스타일 템플릿<select id="reject-style-template-select">${rejectTplOpts}</select></label>
             </div>
             <label>반려 의견 (수정·재제작 방향 입력)<textarea id="reject-feedback-input" rows="3" maxlength="2000" placeholder="예: 첫 문장이 너무 평범해요. 새로 추가한 사진을 첫 장면에 쓰고, 배경 음악을 더 밝게 바꿔서 다시 만들어 주세요.">${escapeHtml(rejectDraft)}</textarea></label>
             <div class="actions"><button id="decision-reject-submit" class="button danger" type="button">반려 의견 반영해 다시 제작</button></div>
@@ -1864,13 +1873,18 @@ async function decideAutopilotItem(item, publishYouTube) {
 async function rejectAutopilotItem(itemId) {
   const feedback = String(document.getElementById("reject-feedback-input")?.value || "").trim();
   if (feedback.length < 2) return toast("반려 의견(수정 방향)을 2자 이상 입력하세요.");
+  const visualMode = document.getElementById("reject-visual-mode-select")?.value || null;
+  const styleTplRaw = document.getElementById("reject-style-template-select")?.value;
+  const payload = { feedback, auto_reproduce: true };
+  if (visualMode) payload.visual_mode = visualMode;
+  if (styleTplRaw !== undefined) payload.style_template_id = styleTplRaw || null;
   try {
     await api(`/api/items/${itemId}/reject`, {
       method: "POST",
-      body: JSON.stringify({ feedback, auto_reproduce: true })
+      body: JSON.stringify(payload)
     });
     state.rejectPanel = { itemId: null, open: false, feedback: "" };
-    toast("반려 의견과 첨부 변경 사항을 반영해 기획·영상을 자동으로 다시 제작합니다.");
+    toast("반려 의견과 화면·스타일 설정을 반영해 기획·영상을 자동으로 다시 제작합니다.");
     await refresh(itemId);
   } catch (error) { toast(error.message); }
 }
