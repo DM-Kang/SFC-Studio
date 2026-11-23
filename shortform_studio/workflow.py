@@ -11,18 +11,26 @@ from uuid import uuid4
 
 from .ai import ai_ready, generate_json
 from .analytics import summarize_analytics
+from .attachments import (
+    IMAGE_EXTS,
+    analyze_item_attachments,
+    attachments_to_citable_sources,
+    summarize_attachments_for_planning,
+)
 from .shorts_learner import (
     analyze_shorts_reference,
     extract_youtube_urls,
     resolve_learned_production_style,
     summarize_shorts_references_for_planning,
 )
+from .style_templates import style_template_to_production_config
 from .config import get_projects_dir, get_secret
 from .media import (
     SUBTITLE_STYLE_PRESETS,
     assemble_multiscene_video,
     ensure_ambient_bgm,
     extract_video_frame,
+    format_shorts_banner_text,
     generate_ai_scene_image,
     generate_scene_synced_voiceover,
     generate_voiceover,
@@ -109,11 +117,36 @@ def can_reuse_video_for_plan(previous_plan: dict[str, Any], restored_plan: dict[
 
 def _brief(item: dict[str, Any]) -> dict[str, Any]:
     """@brief Select only planning inputs from a stored project item."""
+    style_snap = item.get("style_template_snapshot")
+    style_cfg = style_template_to_production_config(style_snap) if isinstance(style_snap, dict) else {}
     return {
         **{key: item.get(key) for key in ("topic", "audience", "tone", "language", "platforms", "duration_seconds", "source_notes")},
+        "use_attached_media": bool(item.get("use_attached_media", True)),
+        "attachments": summarize_attachments_for_planning(item.get("attachments")),
+        "style_template": {
+            k: style_cfg[k]
+            for k in ("name", "recommended_scenes", "hook_style", "script_rules")
+            if k in style_cfg
+        }
+        if style_cfg
+        else {},
         "brand_profile": item.get("brand_profile_snapshot") or {},
         "series_template": item.get("series_template_snapshot") or {},
     }
+
+
+def _prepare_attachments_and_sources(store: Store, item_id: str, web_sources: list[dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """@brief Run lazy Vision/PDF extraction on attachments and prepend citable attachment sources."""
+    item = store.get_item(item_id)
+    if item is None:
+        raise KeyError(item_id)
+    raw_atts = item.get("attachments")
+    if isinstance(raw_atts, list) and raw_atts:
+        updated_atts, changed = analyze_item_attachments(raw_atts, item_directory(item_id))
+        if changed:
+            item = store.update_payload(item_id, {"attachments": updated_atts})
+    att_sources = attachments_to_citable_sources(item.get("attachments"))
+    return item, [*att_sources, *web_sources]
 
 
 def final_video_rights_record(source: str) -> dict[str, Any]:
@@ -154,7 +187,8 @@ def run_planning(store: Store, item_id: str) -> str:
     store.set_job_progress(item_id, "참고 자료 및 성과 요약 수집 중", 20)
     research = item.get("research")
     raw_sources = research.get("sources", []) if isinstance(research, dict) else []
-    research_sources = [src for src in raw_sources if isinstance(src, dict) and src.get("included", True) is not False]
+    web_sources = [src for src in raw_sources if isinstance(src, dict) and src.get("included", True) is not False]
+    item, research_sources = _prepare_attachments_and_sources(store, item_id, web_sources)
     brief = _brief(item)
     prior_items = [candidate for candidate in store.list_items() if candidate.get("id") != item_id]
     brief["analytics_feedback"] = summarize_analytics(prior_items)
@@ -755,7 +789,7 @@ def run_scene_assembly(
             local_path = (folder / "clips" / clip_name).resolve()
             if local_path.parent != (folder / "clips").resolve() or not local_path.is_file():
                 raise RuntimeError(f"Scene {index + 1}: uploaded clip '{clip_name}' was not found.")
-            media_type = "image" if local_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else "video"
+            media_type = "image" if local_path.suffix.lower() in (IMAGE_EXTS - {".gif"}) else "video"
         elif source_kind == "source":
             local_path = Path(str(existing_assets.get("source_video") or ""))
             if not local_path.is_file() or local_path.resolve().parent != folder_resolved:
@@ -790,7 +824,7 @@ def run_scene_assembly(
             captions_path = candidate_srt
 
     bgm_path = Path(str(existing_assets.get("bgm_path") or "")) if existing_assets.get("bgm_path") else None
-    if bgm_path and not bgm_path.is_file():
+    if bgm_path and (not bgm_path.is_file() or (auto_bgm and bgm_path.name == "bgm_auto.mp3")):
         bgm_path = None
     if bgm_path is None and auto_bgm:
         total_scene_dur = sum(float(c.get("duration_seconds") or 4.0) for c in resolved_clips)
@@ -1018,20 +1052,106 @@ def _auto_select_scene_clips(
     return selected
 
 
+def _assign_attached_media_to_scenes(
+    folder: Path,
+    scenes: list[dict[str, Any]],
+    attachments: list[dict[str, Any]] | None,
+    total_duration: Any,
+) -> list[dict[str, Any] | None]:
+    """@brief Place operator-attached images and video clips onto matching scenes before stock or AI visuals."""
+    slots: list[dict[str, Any] | None] = [None] * len(scenes)
+    if not scenes or not isinstance(attachments, list):
+        return slots
+    clips_dir = (folder / "clips").resolve()
+    media_atts = [
+        att
+        for att in attachments
+        if isinstance(att, dict)
+        and att.get("included", True) is not False
+        and att.get("kind") in {"image", "video"}
+        and att.get("stored_name")
+        and (clips_dir / Path(str(att["stored_name"])).name).is_file()
+    ]
+    if not media_atts:
+        return slots
+
+    default_dur = round(max(2.0, min(30.0, float(total_duration or 20) / max(1, len(scenes)))), 1)
+    by_id = {str(att["id"]): att for att in media_atts if att.get("id")}
+    assigned_by_idx: dict[int, dict[str, Any]] = {}
+
+    if ai_ready("planning"):
+        try:
+            scene_briefs = [
+                {"scene_id": str(sc.get("id") or f"scene-{i + 1}"), "narration": str(sc.get("narration") or "")[:160], "visual_query": str(sc.get("visual_query") or "")[:80]}
+                for i, sc in enumerate(scenes)
+                if isinstance(sc, dict)
+            ]
+            att_briefs = [
+                {
+                    "attachment_id": str(att.get("id")),
+                    "name": str(att.get("original_name") or ""),
+                    "kind": str(att.get("kind") or ""),
+                    "visual_summary": str(att.get("visual_summary") or "")[:400],
+                }
+                for att in media_atts
+            ]
+            ai_map, _ = generate_json(
+                'Match the operator-attached photos and videos to the scenes where they fit best. Return JSON: {"assignments": {"scene-1": "attachment_id"}}. Only assign attachment_id values that clearly fit the scene; use each attachment at most once.',
+                f"Scenes: {scene_briefs}\nAttached media: {att_briefs}",
+                stage="planning",
+            )
+            raw_assignments = ai_map.get("assignments") if isinstance(ai_map, dict) else None
+            if isinstance(raw_assignments, dict):
+                used_att_ids: set[str] = set()
+                for idx, sc in enumerate(scenes):
+                    sid = str(sc.get("id") or f"scene-{idx + 1}")
+                    aid = str(raw_assignments.get(sid) or "")
+                    if aid in by_id and aid not in used_att_ids:
+                        assigned_by_idx[idx] = by_id[aid]
+                        used_att_ids.add(aid)
+        except Exception:
+            assigned_by_idx.clear()
+
+    if not assigned_by_idx:
+        count = min(len(media_atts), len(scenes))
+        for i in range(count):
+            idx = min(len(scenes) - 1, int((i * len(scenes)) / count))
+            while idx < len(scenes) and idx in assigned_by_idx:
+                idx += 1
+            if idx < len(scenes):
+                assigned_by_idx[idx] = media_atts[i]
+
+    for idx, att in assigned_by_idx.items():
+        sc = scenes[idx] if idx < len(scenes) and isinstance(scenes[idx], dict) else {}
+        dur = sc.get("duration_seconds")
+        slot_dur = round(max(2.0, min(30.0, float(dur))), 1) if isinstance(dur, (int, float)) else default_dur
+        slots[idx] = {
+            "source_kind": "uploaded",
+            "filename": Path(str(att["stored_name"])).name,
+            "duration_seconds": slot_dur,
+            "from_attachment": True,
+        }
+    return slots
+
+
 def _ai_rerank_and_fill_visuals(
     folder: Path,
     scenes: list[dict[str, Any]],
     materials: list[dict[str, Any]],
     scene_inputs: list[dict[str, Any]],
+    *,
+    visual_mode: str = "hybrid",
 ) -> list[dict[str, Any]]:
-    """@brief Let planning AI pick the best clip per scene and synthesize 9:16 AI images for off-topic slots."""
+    """@brief Let planning AI pick the best clip per scene and synthesize 9:16 AI images for off-topic or AI-visual slots."""
     if not scenes or not scene_inputs:
         return scene_inputs
     updated = [dict(entry) for entry in scene_inputs]
-    if ai_ready("planning") and len(materials) > len(scenes):
+    if visual_mode != "ai_images" and ai_ready("planning") and len(materials) > len(scenes):
         try:
             candidates_by_scene = []
             for idx, scene in enumerate(scenes[: len(updated)]):
+                if updated[idx].get("from_attachment"):
+                    continue
                 sid = str(scene.get("id") or f"scene-{idx + 1}")
                 pool = [m for m in materials if str(m.get("scene_id") or "") == sid][:5]
                 if pool:
@@ -1054,6 +1174,8 @@ def _ai_rerank_and_fill_visuals(
                     valid_ids = {str(m.get("provider_id")) for m in materials if m.get("provider_id")}
                     used: set[str] = set()
                     for idx, scene in enumerate(scenes[: len(updated)]):
+                        if updated[idx].get("from_attachment"):
+                            continue
                         chosen_id = str(choices.get(str(scene.get("id") or "")) or "")
                         if chosen_id in valid_ids and chosen_id not in used:
                             updated[idx]["provider_id"] = chosen_id
@@ -1061,14 +1183,17 @@ def _ai_rerank_and_fill_visuals(
         except Exception:
             pass
 
-    if get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY"):
+    if visual_mode != "stock" and (get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY")):
         by_id = {str(m.get("provider_id")): m for m in materials if isinstance(m, dict) and m.get("provider_id")}
         for idx, entry in enumerate(updated):
+            if entry.get("from_attachment"):
+                continue
             scene = scenes[idx] if idx < len(scenes) else {}
             mat = by_id.get(str(entry.get("provider_id") or ""))
             overlap = _keyword_overlap_score(scene, mat) if mat else 0
-            if overlap == 0 and idx < 2 and isinstance(scene, dict):
-                prompt_text = f"{scene.get('visual_query') or ''} ({scene.get('narration') or ''})"
+            should_generate = (visual_mode == "ai_images") or (overlap == 0)
+            if should_generate and isinstance(scene, dict):
+                prompt_text = f"{scene.get('visual_query') or ''} — mood and subject: {scene.get('narration') or ''}"
                 ai_img = generate_ai_scene_image(prompt_text, folder / "clips" / f"ai_scene_{idx + 1}.png")
                 if ai_img and ai_img.is_file():
                     updated[idx] = {
@@ -1173,7 +1298,10 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
     item = store.get_item(item_id) or item
     research = item.get("research") if isinstance(item.get("research"), dict) else {}
     raw_sources = research.get("sources", []) if isinstance(research, dict) else []
-    research_sources = [src for src in raw_sources if isinstance(src, dict) and src.get("included", True) is not False]
+    web_sources = [src for src in raw_sources if isinstance(src, dict) and src.get("included", True) is not False]
+    if item.get("attachments"):
+        store.set_job_progress(item_id, "1/4 첨부 파일 텍스트·시각 자료 분석 중", 18)
+    item, research_sources = _prepare_attachments_and_sources(store, item_id, web_sources)
 
     cleaned_feedback = str(feedback or "").strip()
     if cleaned_feedback and isinstance(item.get("plan"), dict):
@@ -1229,56 +1357,100 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
     item = store.get_item(item_id) or item
     plan = item.get("plan") or {}
     scenes = plan.get("scenes") or []
+    visual_mode = str(item.get("visual_mode") or "hybrid")
     pixabay_key = get_secret("PIXABAY_API_KEY")
     pexels_key = get_secret("PEXELS_API_KEY")
     runway_key = get_secret("RUNWAY_API_KEY")
 
-    store.set_job_progress(item_id, "3/4 스톡 영상 검색 · 음성·자막 · 영상 제작 중", 55)
+    folder = item_directory(item_id)
     materials: list[dict[str, Any]] = []
-    if pixabay_key:
-        materials.extend(search_pixabay_videos(scenes, pixabay_key))
-    if pexels_key:
-        materials.extend(search_pexels_videos(scenes, pexels_key))
-    if materials:
-        store.update_payload(
-            item_id,
-            {"materials": materials, "materials_collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds")},
-        )
-    scene_inputs = _auto_select_scene_clips(scenes, materials, plan.get("duration_seconds") or 20)
-    if not scene_inputs:
+    scene_slots: list[dict[str, Any] | None] = (
+        _assign_attached_media_to_scenes(folder, scenes, item.get("attachments"), plan.get("duration_seconds") or 20)
+        if item.get("use_attached_media", True)
+        else [None] * len(scenes)
+    )
+    has_missing_slots = any(slot is None for slot in scene_slots) or not scene_slots
+    if has_missing_slots and visual_mode != "ai_images":
+        store.set_job_progress(item_id, "3/4 스톡 영상 검색 · 음성·자막 · 영상 제작 중", 55)
+        if pixabay_key:
+            materials.extend(search_pixabay_videos(scenes, pixabay_key))
+        if pexels_key:
+            materials.extend(search_pexels_videos(scenes, pexels_key))
+        if materials:
+            store.update_payload(
+                item_id,
+                {"materials": materials, "materials_collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds")},
+            )
+        stock_selected = _auto_select_scene_clips(scenes, materials, plan.get("duration_seconds") or 20)
+        if not scene_slots:
+            scene_slots = list(stock_selected)
+        else:
+            for idx, slot in enumerate(scene_slots):
+                if slot is None and idx < len(stock_selected):
+                    scene_slots[idx] = stock_selected[idx]
+
+    if any(slot is None for slot in scene_slots) and visual_mode != "stock" and (get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY")) and scenes:
+        store.set_job_progress(item_id, "3/4 AI 아트워크 장면 생성 중 (Gemini/OpenAI)", 58)
+        per_dur = round(max(2.5, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, len(scenes)))), 1)
+        for idx, sc in enumerate(scenes[:8]):
+            if idx < len(scene_slots) and scene_slots[idx] is None and isinstance(sc, dict):
+                img = generate_ai_scene_image(f"{sc.get('visual_query') or ''} — mood and subject: {sc.get('narration') or ''}", folder / "clips" / f"ai_scene_{idx + 1}.png")
+                if img and img.is_file():
+                    scene_slots[idx] = {"source_kind": "uploaded", "filename": img.name, "duration_seconds": per_dur, "from_attachment": True}
+
+    if any(slot is None for slot in scene_slots) and visual_mode != "ai_images":
         uploaded_clips = ((item.get("assets") or {}).get("uploaded_clips")) or []
         if uploaded_clips:
-            per_dur = round(max(2.0, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, min(len(scenes), len(uploaded_clips))))), 1)
-            scene_inputs = [
-                {"source_kind": "uploaded", "filename": str(uploaded_clips[idx % len(uploaded_clips)]["filename"]), "duration_seconds": per_dur}
-                for idx in range(max(1, min(len(scenes), 8)))
-            ]
-    if not scene_inputs and (get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY")) and scenes:
-        folder = item_directory(item_id)
-        per_dur = round(max(2.5, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, len(scenes)))), 1)
-        ai_scenes: list[dict[str, Any]] = []
-        for idx, sc in enumerate(scenes[:6]):
-            img = generate_ai_scene_image(f"{sc.get('visual_query') or ''} ({sc.get('narration') or ''})", folder / "clips" / f"ai_scene_{idx + 1}.png")
-            if img and img.is_file():
-                ai_scenes.append({"source_kind": "uploaded", "filename": img.name, "duration_seconds": per_dur})
-        scene_inputs = ai_scenes
+            per_dur = round(max(2.0, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, len(scenes)))), 1)
+            for idx, slot in enumerate(scene_slots):
+                if slot is None:
+                    scene_slots[idx] = {
+                        "source_kind": "uploaded",
+                        "filename": str(uploaded_clips[idx % len(uploaded_clips)]["filename"]),
+                        "duration_seconds": per_dur,
+                    }
+
+    scene_inputs: list[dict[str, Any]] = [slot for slot in scene_slots if isinstance(slot, dict)]
 
     style_cfg = resolve_learned_production_style(store.get_setting("shorts_references", []))
+    tpl_cfg = style_template_to_production_config(item.get("style_template_snapshot"))
+    if tpl_cfg:
+        active_subtitle_style = tpl_cfg["subtitle_style"]
+        active_transition = tpl_cfg["transition"]
+        active_use_banner = tpl_cfg["use_hook_banner"]
+        default_bgm_mood = tpl_cfg["bgm_mood"]
+    else:
+        active_subtitle_style = {"preset": style_cfg["caption_preset"]}
+        active_transition = style_cfg["transition"]
+        active_use_banner = style_cfg["use_hook_banner"]
+        default_bgm_mood = style_cfg["bgm_mood"]
+
+    mood_hint = f"{cleaned_feedback} {item.get('tone') or ''}".lower()
+    if any(tok in mood_hint for tok in ("밝", "활발", "신나", "경쾌", "홈쇼핑", "텐션", "upbeat", "energetic")):
+        resolved_bgm_mood = "upbeat"
+    elif any(tok in mood_hint for tok in ("차분", "잔잔", "조용", "calm")):
+        resolved_bgm_mood = "calm"
+    else:
+        resolved_bgm_mood = default_bgm_mood
     if scene_inputs:
-        folder = item_directory(item_id)
-        scene_inputs = _ai_rerank_and_fill_visuals(folder, scenes, materials, scene_inputs)
+        scene_inputs = _ai_rerank_and_fill_visuals(folder, scenes, materials, scene_inputs, visual_mode=visual_mode)
         store.set_job_progress(item_id, "3/4 클립 저장 · 씬별 음성·ASS 자막 · BGM 합성 중", 72)
+        tts_mode = (
+            "gemini_tts"
+            if get_secret("GEMINI_API_KEY") and str(item.get("language") or "").strip().lower() in {"korean", "ko", "한국어"}
+            else "auto"
+        )
         run_scene_assembly(
             store,
             item_id,
             scene_inputs,
-            transition=style_cfg["transition"] if len(scene_inputs) > 1 else "cut",
-            tts_provider="auto",
+            transition=active_transition if len(scene_inputs) > 1 else "cut",
+            tts_provider=tts_mode,
             loudnorm=True,
-            subtitle_style={"preset": style_cfg["caption_preset"]},
+            subtitle_style=active_subtitle_style,
             auto_bgm=True,
-            bgm_mood=style_cfg["bgm_mood"],
-            hook_banner=str(plan.get("hook") or plan.get("title") or "")[:32] if style_cfg["use_hook_banner"] else "",
+            bgm_mood=resolved_bgm_mood,
+            hook_banner=format_shorts_banner_text(str(plan.get("title") or ""), str(plan.get("hook") or "")) if active_use_banner else "",
         )
     elif runway_key:
         run_video_generation(store, item_id)

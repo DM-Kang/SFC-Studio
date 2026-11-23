@@ -15,8 +15,8 @@ AI_PROVIDERS = {"openai_api", "chatgpt_oauth", "gemini_api", "gemini_oauth", "an
 DEFAULT_MODELS = {
     "openai_api": "gpt-4.1-mini",
     "chatgpt_oauth": "gpt-6.1-sol",
-    "gemini_api": "gemini-2.5-flash",
-    "gemini_oauth": "gemini-2.5-flash",
+    "gemini_api": "gemini-3-flash-preview",
+    "gemini_oauth": "gemini-3-flash-preview",
     "anthropic_api": "claude-sonnet-4-5",
     "ollama": "qwen3:8b",
 }

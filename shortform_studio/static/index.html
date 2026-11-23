@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Shortform Content Studio</title>
-  <link rel="stylesheet" href="/static/styles.css">
-  <link rel="stylesheet" href="/static/management.css">
-  <script src="/static/app.js" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=20261123d">
+  <link rel="stylesheet" href="/static/management.css?v=20261123d">
+  <script src="/static/app.js?v=20261123d" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -16,7 +16,7 @@
       <h1>Shortform Studio</h1>
       <p class="subtitle">기획부터 검수, 승인된 게시까지 한 흐름으로</p>
     </div>
-    <div class="provider-control"><div id="provider-status" class="provider-status" aria-live="polite">연결 상태 확인 중…</div><div class="actions"><button id="brand-settings-open" class="button" type="button">브랜드 · 시리즈 설정</button><button id="shorts-learn-open" class="button" type="button">쇼츠 학습 · 벤치마킹</button><button id="ai-settings-open" class="button" type="button">AI 모델 · OAuth 설정</button><button id="secrets-settings-open" class="button" type="button">API 키 · .env 설정</button><button id="schedule-calendar-open" class="button" type="button">예약 캘린더</button><button id="analytics-dashboard-open" class="button" type="button">성과 대시보드</button><button id="asset-library-open" class="button" type="button">소재 라이브러리</button><button id="experiments-open" class="button" type="button">A/B 실험</button><button id="backup-open" class="button" type="button">백업 · 복구</button></div></div>
+    <div class="provider-control"><div id="provider-status" class="provider-status" aria-live="polite">연결 상태 확인 중…</div><div class="actions"><button id="brand-settings-open" class="button" type="button">브랜드 · 시리즈 설정</button><button id="style-templates-open" class="button" type="button">100만+ 쇼츠 스타일 템플릿</button><button id="shorts-learn-open" class="button" type="button">쇼츠 학습 · 벤치마킹</button><button id="ai-settings-open" class="button" type="button">AI 모델 · OAuth 설정</button><button id="secrets-settings-open" class="button" type="button">API 키 · .env 설정</button><button id="schedule-calendar-open" class="button" type="button">예약 캘린더</button><button id="analytics-dashboard-open" class="button" type="button">성과 대시보드</button><button id="asset-library-open" class="button" type="button">소재 라이브러리</button><button id="experiments-open" class="button" type="button">A/B 실험</button><button id="backup-open" class="button" type="button">백업 · 복구</button></div></div>
   </header>
 
   <nav class="mobile-nav" aria-label="모바일 화면 선택">
@@ -46,7 +46,29 @@
           </fieldset>
           <label class="check-row"><input type="checkbox" name="synthetic_media" checked> 실제처럼 보이는 AI 생성·변형 콘텐츠 포함 (YouTube 표시)</label>
           <label>참고 자료·근거<textarea name="source_notes" rows="3" maxlength="12000" placeholder="URL, 검증된 사실, 피해야 할 표현 등을 입력하세요."></textarea></label>
+          <div class="attachment-field">
+            <div class="card-head">
+              <span class="attachment-label">첨부 파일 (문서·사진·동영상)</span>
+              <small class="muted">최대 12개</small>
+            </div>
+            <label id="new-attachment-dropzone" class="attachment-dropzone">
+              <input id="new-item-attachments" type="file" multiple accept=".txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.log,.srt,.vtt,.html,.htm,.pdf,.doc,.docx,.xls,.xlsx,.xlsm,.ppt,.pptx,.hwpx,.odt,.ods,.odp,.jpg,.jpeg,.png,.webp,.gif,.bmp,.mp4,.mov,.m4v,.webm,.mkv,.mp3,.wav,.m4a,.aac">
+              <strong>파일을 끌어다 놓거나 클릭해 선택</strong>
+              <small class="muted">텍스트, PDF, Word, Excel, PPT, HWPX, 사진, 동영상</small>
+            </label>
+            <div id="new-attachment-list" class="attachment-list"></div>
+            <label class="check-row"><input type="checkbox" name="use_attached_media" checked> 첨부 사진·동영상을 영상 장면에 우선 사용</label>
+          </div>
           <label>제작 방식<select name="workflow_mode" id="workflow-mode-select"><option value="manual">수동 단계별 모드 (기존)</option><option value="autopilot">완전 자동화 모드 (원클릭 기획→제작→검수)</option></select></label>
+          <label>화면 비주얼 방식<select name="visual_mode" id="visual-mode-select"><option value="hybrid">하이브리드 (스톡 + 불일치 시 AI 이미지)</option><option value="ai_images">전 장면 Gemini/AI 아트워크 + 모션 (고일관성)</option><option value="stock">스톡 영상만 사용</option></select></label>
+          <div class="style-template-picker">
+            <div class="card-head">
+              <span class="attachment-label">영상 제목·자막 스타일 템플릿</span>
+              <button id="open-style-templates-inline" class="link-button" type="button">100만+ 자동분석 관리</button>
+            </div>
+            <select name="style_template_id" id="style-template-select"></select>
+            <div id="new-style-template-preview" class="style-mini-preview"></div>
+          </div>
           <button id="create-item-submit" class="button primary full" type="submit">콘텐츠 작업 만들기</button>
         </form>
       </section>
@@ -125,6 +147,37 @@
   </dialog>
   <dialog id="backup-dialog" class="settings-dialog">
     <section class="settings-form"><header class="settings-header"><div><p class="eyebrow">LOCAL DATA RECOVERY</p><h2>백업 · 복구</h2><p class="muted">백업에는 SQLite 콘텐츠·설정과 프로젝트 미디어가 포함됩니다. `.env`, OAuth 토큰, API 자격 증명은 제외됩니다.</p></div><button class="icon-button dialog-close" type="button" aria-label="닫기">×</button></header><div class="settings-card"><a class="button primary" href="/api/backup">전체 백업 ZIP 다운로드</a><label class="restore-warning">백업 복원<input id="backup-restore-file" type="file" accept=".zip,application/zip"></label><p class="warning-banner">복원하면 현재 프로젝트를 ZIP 안전 복구본으로 보존한 뒤 선택한 백업으로 교체합니다. 예약 게시 항목은 자동 게시되지 않도록 취소되며, 다시 확인 후 예약해야 합니다.</p><p class="small-note">업로드 제한 10 GB, 압축 해제 제한 20 GB. ZIP 경로, 스키마와 SQLite 무결성을 검증합니다.</p></div></section>
+  </dialog>
+  <dialog id="style-templates-dialog" class="settings-dialog">
+    <section class="settings-form">
+      <header class="settings-header">
+        <div>
+          <p class="eyebrow">VIRAL 1M+ SHORTS · AUTO STYLE TEMPLATES</p>
+          <h2>100만+ 한국 쇼츠 스타일 템플릿</h2>
+          <p class="muted">조회수 100만 이상 한국 쇼츠의 상단 제목 배너·폰트·자막 위치·전환 리듬·BGM 분위기를 지속 분석해 템플릿으로 자동 업데이트합니다.</p>
+        </div>
+        <button class="icon-button dialog-close" type="button" aria-label="닫기">×</button>
+      </header>
+      <div class="settings-card">
+        <div class="card-head">
+          <strong>지속 자동 분석 설정</strong>
+          <span id="style-sync-status-badge" class="badge">확인 중</span>
+        </div>
+        <p id="style-sync-status-text" class="small-note"></p>
+        <div class="form-row">
+          <label class="check-row"><input id="style-auto-sync-enabled" type="checkbox" checked> 백그라운드 지속 자동 분석 켜기</label>
+          <label>수집 주기(시간)<input id="style-sync-interval-hours" type="number" min="1" max="72" value="6"></label>
+        </div>
+        <div class="form-row">
+          <label>즉시 검색 키워드 (선택 · 비우면 카테고리 순환)<input id="style-discover-query" maxlength="100" placeholder="예: #shorts 살림꿀팁, #shorts 리뷰"></label>
+          <div class="actions" style="align-self:end;">
+            <button id="style-save-settings-btn" class="button" type="button">주기 저장</button>
+            <button id="style-discover-now-btn" class="button primary" type="button">지금 100만+ 쇼츠 분석·업데이트</button>
+          </div>
+        </div>
+      </div>
+      <div id="style-templates-list" class="management-list"></div>
+    </section>
   </dialog>
   <dialog id="shorts-learn-dialog" class="settings-dialog">
     <form id="shorts-learn-form" class="settings-form">

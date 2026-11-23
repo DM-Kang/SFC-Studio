@@ -240,6 +240,93 @@ class ShortsLearnerAndQualityTests(unittest.TestCase):
         )
         self.assertEqual(style_cfg, {"caption_preset": "yellow_pop", "bgm_mood": "calm", "transition": "cut", "use_hook_banner": True})
 
+    def test_korean_plan_and_tts_never_speak_chinese_scene_narrations(self) -> None:
+        """@brief Replace leaked Chinese scene narrations with Korean script chunks in planning and TTS."""
+        from shortform_studio.media import generate_scene_synced_voiceover
+
+        mixed_plan = {
+            "title": "콜드브루 황금 비율",
+            "hook": "카페보다 맛있는 비결!",
+            "script": "원두 50g을 준비하세요. 차가운 물 450ml를 부으세요. 14시간 냉장 추출하세요.",
+            "caption": "집에서 만드는 콜드브루",
+            "hashtags": ["#콜드브루"],
+            "video_prompt": "pouring iced cold brew coffee",
+            "duration_seconds": 18,
+            "claims": [],
+            "scenes": [
+                {"narration": "准备咖啡豆", "visual_query": "coffee beans"},
+                {"narration": "准备冷水", "visual_query": "pouring water coffee"},
+                {"narration": "放置冰箱冷藏", "visual_query": "cold brew bottle"},
+            ],
+        }
+        payload = _build_plan_payload(mixed_plan, "ollama:qwen2.5:7b", {"topic": "콜드브루", "language": "Korean", "duration_seconds": 18}, [])
+        for scene in payload["scenes"]:
+            self.assertNotRegex(scene["narration"], r"[\u4e00-\u9fff]")
+            self.assertRegex(scene["narration"], r"[\uac00-\ud7a3]")
+
+        spoken_texts: list[str] = []
+
+        def fake_synth(text: str, out_dir: Path, **_kw: object) -> dict[str, str]:
+            spoken_texts.append(text)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            mp3 = out_dir / "voiceover.mp3"
+            srt = out_dir / "captions.srt"
+            mp3.write_bytes(b"mp3")
+            srt.write_text(f"1\n00:00:00,000 --> 00:00:02,000\n{text}\n", encoding="utf-8")
+            return {"audio_path": str(mp3), "captions_path": str(srt), "provider": "elevenlabs", "voice_id": "v1"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                patch("shortform_studio.media.shutil.which", return_value="ffmpeg"),
+                patch("shortform_studio.media.probe_audio_duration", return_value=2.0),
+                patch("shortform_studio.media._run_ffmpeg", side_effect=lambda cmd, **_kw: (Path(cmd[-1]).write_bytes(b"mp3"), (0, ""))[1]),
+            ):
+                generate_scene_synced_voiceover(
+                    [{"narration": "准备咖啡豆"}, {"narration": "准备冷水"}],
+                    "원두 50g을 준비하세요. 물 450ml를 부으세요.",
+                    root,
+                    synth_fn=fake_synth,
+                )
+        self.assertEqual(len(spoken_texts), 2)
+        for line in spoken_texts:
+            self.assertNotRegex(line, r"[\u4e00-\u9fff]")
+            self.assertRegex(line, r"[\uac00-\ud7a3]")
+
+    def test_banner_wrap_word_boundary_srt_and_gemini_native_tts(self) -> None:
+        """@brief Wrap banners on word boundaries, keep Korean SRT words intact, and synthesize Gemini TTS."""
+        from shortform_studio.media import alignment_to_srt, format_shorts_banner_text
+
+        banner = format_shorts_banner_text("", "집에서 만든 콜드브루가 텁텁했다면, 비율과 거르는 법을 놓친 겁니다!")
+        self.assertNotIn("놓\n", banner)
+        self.assertNotIn("겁\\", banner)
+        for line in banner.split(r"\N"):
+            self.assertLessEqual(len(line), 22)
+
+        phrase = "집에서 만든 콜드브루가 텁텁했다면, 비율과 거르는 법을 놓친 겁니다!"
+        alignment = {
+            "characters": list(phrase),
+            "character_start_times_seconds": [i * 0.1 for i in range(len(phrase))],
+            "character_end_times_seconds": [(i + 1) * 0.1 for i in range(len(phrase))],
+        }
+        srt = alignment_to_srt(alignment, max_chars=16)
+        self.assertNotIn("텁텁했\n", srt)
+        self.assertNotIn("준\n", srt)
+        self.assertIn("텁텁했다면,", srt)
+
+        fake_gemini_audio = {"candidates": [{"content": {"parts": [{"inlineData": {"mimeType": "audio/L16;rate=24000", "data": base64.b64encode(b"\x00\x00" * 100).decode("ascii")}}]}}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                patch("shortform_studio.media.get_secret", side_effect=lambda k, d="": "gem-key" if k == "GEMINI_API_KEY" else d),
+                patch("shortform_studio.media.shutil.which", return_value="ffmpeg"),
+                patch("shortform_studio.media._run_ffmpeg", side_effect=lambda cmd, cwd: ((cwd / cmd[-1]).write_bytes(b"mp3"), (0, ""))[1]),
+                patch("shortform_studio.media.probe_audio_duration", return_value=3.2),
+                patch("urllib.request.urlopen", return_value=_FakeUrlResponse(json.dumps(fake_gemini_audio).encode("utf-8"))),
+            ):
+                vo = generate_voiceover("집에서 만든 콜드브루, 오늘 밤 시작해 보세요!", Path(tmp), tts_provider="gemini_tts")
+            self.assertEqual(vo["provider"], "gemini_tts")
+            self.assertIn("콜드브루,", Path(vo["captions_path"]).read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -152,6 +152,20 @@ class LiveAIModelCatalogTests(unittest.TestCase):
         self.assertEqual(req.call_args_list[1].kwargs["headers"]["x-goog-api-key"], "ai-studio-key")
         self.assertEqual(output, '{"ok":true}')
 
+    def test_gemini_falls_back_on_deprecated_404_or_503_model(self) -> None:
+        """@brief Fall back cleanly to a current Gemini flash model when an older ID returns HTTP 404 or 503."""
+        gen_payload = {"candidates": [{"content": {"parts": [{"text": "{\"ok\":true}"}]}}]}
+        with (
+            patch("shortform_studio.config.get_secret", side_effect=lambda k, d="": "ai-studio-key" if k == "GEMINI_API_KEY" else d),
+            patch(
+                "shortform_studio.ai_providers._request_json",
+                side_effect=[RuntimeError("AI provider request failed with HTTP 404 (not found)"), gen_payload],
+            ) as req,
+        ):
+            output = generate_text("gemini_api", "gemini-2.5-flash", "sys", "usr")
+        self.assertEqual(output, '{"ok":true}')
+        self.assertIn("gemini-3-flash-preview:generateContent", req.call_args_list[1].args[0])
+
 
 if __name__ == "__main__":
     unittest.main()

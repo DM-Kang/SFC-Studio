@@ -1,4 +1,4 @@
-const state = { items: [], selectedId: null, settings: {}, aiModels: {}, brand: { profile: {}, series_templates: [] }, shortsReferences: [], analytics: {}, dashboard: null, secretsStatus: {}, assetLibrary: [], schedules: [], experiments: [], assetLibraryMode: "manage", filters: { query: "", stage: "", platform: "" }, calendarView: "grid", calendarMonth: new Date(), safeZone: "none", subtitlesCache: {}, toastTimer: null, refreshTimer: null, modelSyncTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
+const state = { items: [], selectedId: null, settings: {}, aiModels: {}, brand: { profile: {}, series_templates: [] }, shortsReferences: [], styleTemplatesState: { templates: [], auto_sync_enabled: true, sync_interval_hours: 6 }, analytics: {}, dashboard: null, secretsStatus: {}, assetLibrary: [], schedules: [], experiments: [], pendingAttachments: [], assetLibraryMode: "manage", filters: { query: "", stage: "", platform: "" }, calendarView: "grid", calendarMonth: new Date(), safeZone: "none", subtitlesCache: {}, toastTimer: null, refreshTimer: null, modelSyncTimer: null, mobileView: null, oauthTabs: {}, openedOAuthUrls: {} };
 const MODEL_SYNC_INTERVAL_MS = 5 * 60 * 1000;
 const stageLabels = { draft: "초안", researching: "웹 자료 조사 중", planning: "조사·기획 중", collecting_materials: "영상 소재 검색 중", planned: "기획 완료", generating: "영상 제작 중", generated: "영상 제작 완료", reviewing: "검수 중", reviewed: "검수 완료", approved: "게시 승인", publishing: "게시 중", published: "게시 완료", failed: "작업 오류" };
 const SUBTITLE_PRESETS = {
@@ -867,19 +867,75 @@ function renderPaceMeterMarkup(script, language, targetSeconds) {
   return `<div id="script-pace-meter" class="pace-meter ${cls}"><span>예상 발화 약 <strong>${pace.estimatedSeconds}초</strong> (${pace.unitCount}${pace.unitLabel})</span><span>목표 ${target}초 · ${status}</span></div>`;
 }
 
+function formatFileSize(bytes) {
+  const num = Number(bytes || 0);
+  if (num < 1024) return `${num}B`;
+  if (num < 1024 * 1024) return `${(num / 1024).toFixed(1)}KB`;
+  return `${(num / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+function attachmentKindLabel(name, kind = "") {
+  if (kind === "image") return "사진";
+  if (kind === "video") return "동영상";
+  if (kind === "audio") return "오디오";
+  const lower = String(name || "").toLowerCase();
+  if (/\.(jpe?g|png|webp|gif|bmp)$/.test(lower)) return "사진";
+  if (/\.(mp4|mov|m4v|webm|mkv)$/.test(lower)) return "동영상";
+  if (/\.(mp3|wav|m4a|aac)$/.test(lower)) return "오디오";
+  if (lower.endsWith(".pdf")) return "PDF";
+  if (lower.endsWith(".doc") || lower.endsWith(".docx") || lower.endsWith(".hwpx") || lower.endsWith(".odt")) return "워드/문서";
+  if (lower.endsWith(".xls") || lower.endsWith(".xlsx") || lower.endsWith(".xlsm") || lower.endsWith(".csv") || lower.endsWith(".ods")) return "엑셀/표";
+  if (lower.endsWith(".ppt") || lower.endsWith(".pptx") || lower.endsWith(".odp")) return "PPT";
+  return "텍스트";
+}
+
+function renderAttachmentsPanel(item) {
+  const attachments = item.attachments || [];
+  const disabled = item.active_job || Object.values(item.publications || {}).some(post => post.status === "published");
+  const rows = attachments.map((att, index) => {
+    const thumb = att.kind === "image"
+      ? `<img class="attachment-thumb" src="/api/items/${encodeURIComponent(item.id)}/attachments/${encodeURIComponent(att.id)}/preview" alt="${escapeHtml(att.original_name)}">`
+      : "";
+    const metaParts = [attachmentKindLabel(att.original_name, att.kind), formatFileSize(att.size_bytes)];
+    if (att.media_info?.width && att.media_info?.height) metaParts.push(`${att.media_info.width}×${att.media_info.height}`);
+    if (att.media_info?.duration_seconds) metaParts.push(`${att.media_info.duration_seconds}초`);
+    const previewText = [att.extracted_text, att.visual_summary].filter(Boolean).join("\n\n");
+    const excerptBlock = previewText
+      ? `<details class="source-card"><summary><span class="badge good">내용 추출됨</span><strong>참조 내용 미리보기</strong><small>${previewText.length}자</small></summary><p class="source-excerpt">${escapeHtml(previewText.slice(0, 1800))}${previewText.length > 1800 ? "…" : ""}</p></details>`
+      : att.extraction_note
+        ? `<p class="small-note">${escapeHtml(att.extraction_note)}</p>`
+        : `<p class="small-note">${att.kind === "image" || att.kind === "video" ? "기획/자동화 실행 시 AI가 시각 내용을 자동 분석해 반영합니다." : ""}</p>`;
+    return `<div class="attachment-item-row">${thumb}<div style="min-width:0;display:grid;gap:6px;"><div class="card-head"><strong>A${index + 1} · ${escapeHtml(att.original_name)}</strong><span class="badge">${escapeHtml(metaParts.join(" · "))}</span></div>${excerptBlock}<div class="card-head"><label class="check-row"><input type="checkbox" class="attachment-include-toggle" data-att-id="${escapeHtml(att.id)}" ${att.included !== false ? "checked" : ""} ${disabled ? "disabled" : ""}> 기획·대본 참조에 포함</label><button type="button" class="button danger delete-item-attachment" data-att-id="${escapeHtml(att.id)}" ${disabled ? "disabled" : ""}>삭제</button></div></div></div>`;
+  }).join("");
+  const hasVisuals = attachments.some(att => att.kind === "image" || att.kind === "video");
+  const mediaModeToggle = hasVisuals
+    ? `<label class="check-row"><input id="item-use-attached-media" type="checkbox" ${item.use_attached_media !== false ? "checked" : ""} ${disabled ? "disabled" : ""}> 첨부 사진·동영상을 영상 장면에 우선 사용</label>`
+    : "";
+  return `<section class="resource-panel"><div class="card-head"><h4>첨부 참조 파일 (${attachments.length}/12)</h4><label class="button upload-label">파일 추가<input id="workspace-attachment-upload" type="file" multiple accept=".txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.log,.srt,.vtt,.html,.htm,.pdf,.doc,.docx,.xls,.xlsx,.xlsm,.ppt,.pptx,.hwpx,.odt,.ods,.odp,.jpg,.jpeg,.png,.webp,.gif,.bmp,.mp4,.mov,.m4v,.webm,.mkv,.mp3,.wav,.m4a,.aac" ${disabled ? "disabled" : ""}></label></div>${mediaModeToggle}${rows || '<p class="small-note">아직 첨부된 문서·사진·동영상이 없습니다. 텍스트, PDF, Word, Excel, PPT, 사진, 동영상을 올리면 대본과 영상 화면에 반영됩니다.</p>'}</section>`;
+}
+
+function renderItemStyleTemplateControl(item) {
+  const templates = state.styleTemplatesState?.templates || [];
+  if (!templates.length) return "";
+  const disabled = item.active_job || Object.values(item.publications || {}).some(post => post.status === "published");
+  const currentId = item.style_template_id || item.style_template_snapshot?.id || "";
+  const options = `<option value="">기본 스타일 (자동)</option>` + templates.map(tpl => `<option value="${escapeHtml(tpl.id)}" ${tpl.id === currentId ? "selected" : ""}>${escapeHtml(tpl.name)}</option>`).join("");
+  return `<div class="resource-panel"><div class="card-head"><h4>영상 제목·자막 스타일 템플릿</h4><button type="button" class="link-button open-style-dialog-inline">100만+ 템플릿 관리</button></div><label>적용된 스타일 (변경 후 재제작 시 반영)<select id="item-style-template-select" ${disabled ? "disabled" : ""}>${options}</select></label></div>`;
+}
+
 function renderPlan(item) {
   const plan = item.plan;
-  if (!plan) return `<section class="card panel"><h3>① 자료 조사 · 콘텐츠 기획</h3><p class="muted">먼저 주제의 원문 출처를 모으고, 확인 가능한 근거와 직접 입력한 참고 메모를 바탕으로 대본을 만듭니다.</p>${renderAnalyticsFeedback()}${renderResearch(item)}<button id="plan-button" class="button primary">기획안 만들기</button><p class="small-note">웹 조사는 위 버튼으로 별도 실행합니다. 조사하지 않아도 기획은 가능하지만 사실 검토는 미완료 상태로 남습니다. 모델 키가 없으면 로컬 템플릿 미리보기를 만듭니다.</p></section>`;
+  if (!plan) return `<section class="card panel"><h3>① 자료 조사 · 콘텐츠 기획</h3><p class="muted">먼저 주제의 원문 출처를 모으고, 확인 가능한 근거와 첨부 파일·참고 메모를 바탕으로 대본을 만듭니다.</p>${renderAnalyticsFeedback()}${renderItemStyleTemplateControl(item)}${renderAttachmentsPanel(item)}${renderResearch(item)}<button id="plan-button" class="button primary">기획안 만들기</button><p class="small-note">웹 조사는 위 버튼으로 별도 실행합니다. 조사하지 않아도 첨부 파일과 참고 메모만으로 기획할 수 있습니다. 모델 키가 없으면 로컬 템플릿 미리보기를 만듭니다.</p></section>`;
   const sources = plan.sources || [];
   const sourceById = new Map(sources.map(source => [source.id, source]));
   const claims = (plan.claims || []).map(claim => {
-    const citations = (claim.source_ids || []).map(sourceId => sourceById.get(sourceId)).filter(Boolean).map(source => `<a href="${escapeHtml(source.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(source.id)} · ${escapeHtml(source.title)} ↗</a>`).join("");
+    const citations = (claim.source_ids || []).map(sourceId => sourceById.get(sourceId)).filter(Boolean).map(source => source.url ? `<a href="${escapeHtml(source.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(source.id)} · ${escapeHtml(source.title)} ↗</a>` : `<span class="badge">${escapeHtml(source.id)} · ${escapeHtml(source.title)}</span>`).join("");
     return `<li><strong>${escapeHtml(claim.claim || "")}</strong><p>${escapeHtml(claim.evidence || "")}</p>${citations || `<span class="badge warn">출처 근거 미확인 · 게시 전 확인 필요</span>`}</li>`;
   }).join("");
-  const planSources = sources.length ? `<div class="source-list"><h4>기획에 사용된 원문 출처</h4>${sources.map(source => `<a href="${escapeHtml(source.url)}" target="_blank" rel="noopener noreferrer"><span>${escapeHtml(source.id)} · ${escapeHtml(source.title)}</span><small>${escapeHtml(source.domain)}${source.published_at ? ` · ${escapeHtml(source.published_at)}` : ""}</small></a>`).join("")}</div>` : `<p class="warning-banner">이 기획에는 추출된 웹 출처가 포함되지 않았습니다. 사실 주장은 게시 전에 직접 확인하세요.</p>`;
+  const planSources = sources.length ? `<div class="source-list"><h4>기획에 사용된 원문 · 첨부 출처</h4>${sources.map(source => source.url ? `<a href="${escapeHtml(source.url)}" target="_blank" rel="noopener noreferrer"><span>${escapeHtml(source.id)} · ${escapeHtml(source.title)}</span><small>${escapeHtml(source.domain)}${source.published_at ? ` · ${escapeHtml(source.published_at)}` : ""}</small></a>` : `<div class="source-static"><span>${escapeHtml(source.id)} · ${escapeHtml(source.title)}</span><small>${escapeHtml(source.domain || "로컬 첨부 자료")}</small></div>`).join("")}</div>` : `<p class="warning-banner">이 기획에는 추출된 웹·첨부 출처가 포함되지 않았습니다. 사실 주장은 게시 전에 직접 확인하세요.</p>`;
   const hookSuggestions = (item.hook_suggestions || []).length ? `<div class="hook-suggestions">${(item.hook_suggestions || []).map(h => `<button type="button" class="hook-suggestion-chip" data-hook="${escapeHtml(h)}">${escapeHtml(h)}</button>`).join("")}</div>` : "";
   const sceneEditors = (plan.scenes || []).map((scene, idx) => `<div class="scene-editor-row" data-scene-id="${escapeHtml(scene.id || `scene-${idx + 1}`)}"><div class="card-head"><strong>장면 ${idx + 1}</strong><button type="button" class="button danger remove-scene-row">삭제</button></div><label>장면 나레이션<textarea data-scene-field="narration" rows="2" maxlength="800">${escapeHtml(scene.narration || "")}</textarea></label><div class="form-row"><label>영상 검색어(영문 권장)<input data-scene-field="visual_query" maxlength="200" value="${escapeHtml(scene.visual_query || "")}"></label><label>길이(초)<input data-scene-field="duration_seconds" type="number" min="1" max="30" step="0.5" value="${escapeHtml(scene.duration_seconds ?? "")}" placeholder="자동"></label></div></div>`).join("");
-  return `<section class="card panel"><div class="card-head"><h3>① 자료 조사 · 콘텐츠 기획</h3><span class="badge">${escapeHtml(plan.generated_by || "local_template")}</span></div>${renderAnalyticsFeedback()}<form class="plan-form"><label>제목<input name="title" value="${escapeHtml(plan.title)}" maxlength="100"></label><div class="hook-row"><label>첫 문장<input name="hook" value="${escapeHtml(plan.hook)}" maxlength="240"></label><button id="suggest-hooks-button" class="button" type="button">훅 5개 추천</button></div>${hookSuggestions}<label>내레이션 대본<textarea name="script" rows="5" maxlength="6000">${escapeHtml(plan.script)}</textarea>${renderPaceMeterMarkup(plan.script, item.language, plan.duration_seconds || item.duration_seconds)}</label><label>게시 문구<textarea name="caption" rows="3" maxlength="5000">${escapeHtml(plan.caption)}</textarea></label><label>영상 생성 프롬프트<textarea name="video_prompt" rows="3" maxlength="1000">${escapeHtml(plan.video_prompt)}</textarea></label><label>해시태그<input name="hashtags" value="${escapeHtml((plan.hashtags || []).join(" "))}" placeholder="#shorts #tips"></label><div class="card-head"><strong>장면 구성 (${(plan.scenes || []).length})</strong><button id="add-scene-row" class="button" type="button">장면 추가</button></div><div class="scene-editor-list">${sceneEditors}</div><button id="save-plan-button" class="button" type="button">수정 저장</button></form>${renderPlatformCopies(item)}${renderVersionHistory(item)}${claims ? `<div class="claims-panel"><h4>사실 주장과 근거</h4><ul>${claims}</ul></div>` : ""}${planSources}${renderResearch(item)}${renderMaterials(item)}<p class="small-note">기획안을 수정하면 이전 검수·승인은 취소됩니다. 검색 요약은 근거로 취급하지 않으며, 출처의 주장과 영상 소재 권리는 사람이 최종 확인해야 합니다.</p></section>`;
+  return `<section class="card panel"><div class="card-head"><h3>① 자료 조사 · 콘텐츠 기획</h3><span class="badge">${escapeHtml(plan.generated_by || "local_template")}</span></div>${renderAnalyticsFeedback()}${renderItemStyleTemplateControl(item)}<form class="plan-form"><label>제목<input name="title" value="${escapeHtml(plan.title)}" maxlength="100"></label><div class="hook-row"><label>첫 문장<input name="hook" value="${escapeHtml(plan.hook)}" maxlength="240"></label><button id="suggest-hooks-button" class="button" type="button">훅 5개 추천</button></div>${hookSuggestions}<label>내레이션 대본<textarea name="script" rows="5" maxlength="6000">${escapeHtml(plan.script)}</textarea>${renderPaceMeterMarkup(plan.script, item.language, plan.duration_seconds || item.duration_seconds)}</label><label>게시 문구<textarea name="caption" rows="3" maxlength="5000">${escapeHtml(plan.caption)}</textarea></label><label>영상 생성 프롬프트<textarea name="video_prompt" rows="3" maxlength="1000">${escapeHtml(plan.video_prompt)}</textarea></label><label>해시태그<input name="hashtags" value="${escapeHtml((plan.hashtags || []).join(" "))}" placeholder="#shorts #tips"></label><div class="card-head"><strong>장면 구성 (${(plan.scenes || []).length})</strong><button id="add-scene-row" class="button" type="button">장면 추가</button></div><div class="scene-editor-list">${sceneEditors}</div><button id="save-plan-button" class="button" type="button">수정 저장</button></form>${renderPlatformCopies(item)}${renderVersionHistory(item)}${claims ? `<div class="claims-panel"><h4>사실 주장과 근거</h4><ul>${claims}</ul></div>` : ""}${planSources}${renderAttachmentsPanel(item)}${renderResearch(item)}${renderMaterials(item)}<p class="small-note">기획안을 수정하면 이전 검수·승인은 취소됩니다. 검색 요약은 근거로 취급하지 않으며, 출처의 주장과 영상 소재 권리는 사람이 최종 확인해야 합니다.</p></section>`;
 }
 
 /**
@@ -978,7 +1034,7 @@ function renderAssemblyAndAudioPanel(item) {
   }).join("");
   const bgmInfo = item.assets?.bgm_name ? `<span class="badge good">BGM: ${escapeHtml(item.assets.bgm_name)}</span>` : '<span class="small-note">BGM 미등록</span>';
   const postprocessBtn = item.assets?.final_video ? `<button id="postprocess-video-button" class="button" type="button" ${disabled ? "disabled" : ""}>기존 MP4에 BGM·음량·자막 후처리</button>` : "";
-  return `<details class="assembly-panel"><summary>멀티 씬 조립 · BGM 오토 덕킹 · TTS 설정</summary><div class="actions"><label class="button upload-label">장면 클립/이미지 업로드<input id="scene-clip-upload" type="file" accept=".mp4,.mov,.jpg,.jpeg,.png,.webp" ${disabled ? "disabled" : ""}></label><label class="button upload-label">BGM 오디오 업로드<input id="bgm-upload" type="file" accept=".mp3,.wav,.m4a,.aac" ${disabled ? "disabled" : ""}></label>${bgmInfo}</div><div class="form-row"><label>전환 효과<select id="assembly-transition"><option value="cut">바로 전환 (컷)</option><option value="fade">페이드 (xfade)</option></select></label><label>나레이션 TTS<select id="assembly-tts"><option value="auto">자동 (ElevenLabs/OpenAI)</option><option value="elevenlabs">ElevenLabs</option><option value="openai_tts">OpenAI TTS</option><option value="none">음성 생성 안 함</option></select></label></div><div class="form-row"><label>BGM 볼륨 (0.02~1.0)<input id="bgm-volume" type="number" min="0.02" max="1" step="0.02" value="0.18"></label><label class="check-row"><input id="bgm-ducking" type="checkbox" checked> BGM 오토 덕킹</label></div><label class="check-row"><input id="audio-loudnorm" type="checkbox" checked> 음량 자동 정규화 (loudnorm)</label>${sceneRows}<div class="actions"><button id="assemble-scenes-button" class="button primary" type="button" ${disabled || !optionItems.length || !state.settings.ffmpeg_ready ? "disabled" : ""}>멀티 씬 조립 제작</button>${postprocessBtn}</div></details>`;
+  return `<details class="assembly-panel"><summary>멀티 씬 조립 · BGM 오토 덕킹 · TTS 설정</summary><div class="actions"><label class="button upload-label">장면 클립/이미지 업로드<input id="scene-clip-upload" type="file" accept=".mp4,.mov,.jpg,.jpeg,.png,.webp" ${disabled ? "disabled" : ""}></label><label class="button upload-label">BGM 오디오 업로드<input id="bgm-upload" type="file" accept=".mp3,.wav,.m4a,.aac" ${disabled ? "disabled" : ""}></label>${bgmInfo}</div><div class="form-row"><label>전환 효과<select id="assembly-transition"><option value="cut">바로 전환 (컷)</option><option value="fade">페이드 (xfade)</option></select></label><label>나레이션 TTS<select id="assembly-tts"><option value="auto">자동 (ElevenLabs/Gemini/OpenAI)</option><option value="gemini_tts">Gemini 네이티브 한국어 TTS (Kore)</option><option value="elevenlabs">ElevenLabs</option><option value="openai_tts">OpenAI TTS</option><option value="none">음성 생성 안 함</option></select></label></div><div class="form-row"><label>BGM 볼륨 (0.02~1.0)<input id="bgm-volume" type="number" min="0.02" max="1" step="0.02" value="0.18"></label><label class="check-row"><input id="bgm-ducking" type="checkbox" checked> BGM 오토 덕킹</label></div><label class="check-row"><input id="audio-loudnorm" type="checkbox" checked> 음량 자동 정규화 (loudnorm)</label>${sceneRows}<div class="actions"><button id="assemble-scenes-button" class="button primary" type="button" ${disabled || !optionItems.length || !state.settings.ffmpeg_ready ? "disabled" : ""}>멀티 씬 조립 제작</button>${postprocessBtn}</div></details>`;
 }
 
 function renderThumbnailPanel(item) {
@@ -1193,6 +1249,37 @@ function wireItemActions(item) {
     subtitleForm.addEventListener("submit", event => saveItemSubtitles(event, item.id));
   }
   document.getElementById("research-button")?.addEventListener("click", () => runAction(`/api/items/${item.id}/research`, "POST", "웹 출처 조사를 시작했습니다."));
+  document.getElementById("workspace-attachment-upload")?.addEventListener("change", event => uploadWorkspaceAttachments(event, item.id));
+  document.querySelectorAll(".attachment-include-toggle").forEach(input => input.addEventListener("change", async event => {
+    try {
+      await api(`/api/items/${item.id}/attachments/${encodeURIComponent(event.target.dataset.attId)}`, { method: "PUT", body: JSON.stringify({ included: event.target.checked }) });
+      await refresh(item.id);
+      toast(event.target.checked ? "첨부 파일을 기획 근거에 포함했습니다." : "첨부 파일을 기획 근거에서 제외했습니다.");
+    } catch (error) { toast(error.message); await refresh(item.id); }
+  }));
+  document.querySelectorAll(".delete-item-attachment").forEach(btn => btn.addEventListener("click", async () => {
+    if (!confirm("이 첨부 파일을 삭제할까요?")) return;
+    try {
+      await api(`/api/items/${item.id}/attachments/${encodeURIComponent(btn.dataset.attId)}`, { method: "DELETE" });
+      await refresh(item.id);
+      toast("첨부 파일을 삭제했습니다.");
+    } catch (error) { toast(error.message); }
+  }));
+  document.getElementById("item-use-attached-media")?.addEventListener("change", async event => {
+    try {
+      await api(`/api/items/${item.id}/attachment-media-mode`, { method: "PUT", body: JSON.stringify({ included: event.target.checked }) });
+      await refresh(item.id);
+      toast(event.target.checked ? "첨부 사진·동영상을 장면에 우선 사용합니다." : "첨부 사진·동영상은 기획 참고용으로만 사용합니다.");
+    } catch (error) { toast(error.message); await refresh(item.id); }
+  });
+  document.getElementById("item-style-template-select")?.addEventListener("change", async event => {
+    try {
+      await api(`/api/items/${item.id}/style-template`, { method: "PUT", body: JSON.stringify({ style_template_id: event.target.value || null }) });
+      await refresh(item.id);
+      toast("영상 스타일 템플릿을 변경했습니다. 재제작 시 새 폰트·자막 스타일이 적용됩니다.");
+    } catch (error) { toast(error.message); }
+  });
+  document.querySelectorAll(".open-style-dialog-inline").forEach(btn => btn.addEventListener("click", () => openStyleTemplatesDialog()));
   document.getElementById("plan-button")?.addEventListener("click", () => runAction(`/api/items/${item.id}/plan`, "POST", "기획 작업을 시작했습니다."));
   document.getElementById("materials-button")?.addEventListener("click", () => runAction(`/api/items/${item.id}/materials`, "POST", "장면별 영상 소재 검색을 시작했습니다."));
   document.getElementById("generate-button")?.addEventListener("click", () => {
@@ -1979,24 +2066,279 @@ function initWorkflowModeSelect() {
   modeSelect.addEventListener("change", syncWorkflowModeUI);
 }
 
+function renderPendingAttachments() {
+  const list = document.getElementById("new-attachment-list");
+  if (!list) return;
+  if (!state.pendingAttachments.length) {
+    list.innerHTML = "";
+    return;
+  }
+  list.innerHTML = state.pendingAttachments.map((file, idx) => `<div class="attachment-chip"><div class="attachment-chip-meta"><span class="badge">${escapeHtml(attachmentKindLabel(file.name))}</span><strong title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</strong><small class="muted">${formatFileSize(file.size)}</small></div><button type="button" class="remove-pending-att" data-idx="${idx}" aria-label="제거">×</button></div>`).join("");
+  list.querySelectorAll(".remove-pending-att").forEach(btn => btn.addEventListener("click", () => {
+    const idx = Number(btn.dataset.idx);
+    state.pendingAttachments.splice(idx, 1);
+    renderPendingAttachments();
+  }));
+}
+
+function addPendingAttachments(fileList) {
+  const incoming = [...(fileList || [])];
+  if (!incoming.length) return;
+  let skipped = false;
+  for (const file of incoming) {
+    if (state.pendingAttachments.length >= 12) {
+      skipped = true;
+      break;
+    }
+    const exists = state.pendingAttachments.some(existing => existing.name === file.name && existing.size === file.size);
+    if (!exists) state.pendingAttachments.push(file);
+  }
+  if (skipped) toast("첨부 파일은 최대 12개까지 선택할 수 있습니다.");
+  renderPendingAttachments();
+}
+
+function initNewItemAttachments() {
+  const input = document.getElementById("new-item-attachments");
+  const dropzone = document.getElementById("new-attachment-dropzone");
+  if (!input || !dropzone) return;
+  input.addEventListener("change", event => {
+    addPendingAttachments(event.target.files);
+    input.value = "";
+  });
+  ["dragenter", "dragover"].forEach(evt => dropzone.addEventListener(evt, event => {
+    event.preventDefault();
+    dropzone.classList.add("dragover");
+  }));
+  ["dragleave", "drop"].forEach(evt => dropzone.addEventListener(evt, event => {
+    event.preventDefault();
+    dropzone.classList.remove("dragover");
+    if (evt === "drop" && event.dataTransfer?.files?.length) addPendingAttachments(event.dataTransfer.files);
+  }));
+}
+
+async function uploadAttachmentFilesToItem(itemId, files) {
+  if (!files || !files.length) return null;
+  const form = new FormData();
+  for (const file of files) form.append("files", file);
+  const response = await fetch(`/api/items/${encodeURIComponent(itemId)}/attachments`, { method: "POST", body: form });
+  if (!response.ok) {
+    let detail = "첨부 파일 업로드에 실패했습니다.";
+    try {
+      const payload = await response.json();
+      detail = payload.detail || detail;
+    } catch {}
+    throw new Error(detail);
+  }
+  return response.json();
+}
+
+async function uploadWorkspaceAttachments(event, itemId) {
+  const files = [...(event.target.files || [])];
+  if (!files.length) return;
+  try {
+    await uploadAttachmentFilesToItem(itemId, files);
+    await refresh(itemId);
+    toast(`첨부 파일 ${files.length}개를 추가했습니다.`);
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    event.target.value = "";
+  }
+}
+
+function assColorToCss(assHex, fallback = "#ffffff") {
+  const clean = String(assHex || "").trim().toUpperCase();
+  const match = clean.match(/^&H([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})([0-9A-F]{2})$/);
+  if (!match) return fallback;
+  const [, aaHex, bbHex, ggHex, rrHex] = match;
+  const r = parseInt(rrHex, 16);
+  const g = parseInt(ggHex, 16);
+  const b = parseInt(bbHex, 16);
+  const alpha = Math.round((1 - parseInt(aaHex, 16) / 255) * 100) / 100;
+  return alpha >= 0.99 ? `rgb(${r}, ${g}, ${b})` : `rgba(${r}, ${g}, ${b}, ${Math.max(0.15, alpha)})`;
+}
+
+function applyMiniPreviewStyles(container, tpl) {
+  if (!container || !tpl) return;
+  const vis = tpl.visual || {};
+  const bannerEl = container.querySelector(".style-preview-banner");
+  const subEl = container.querySelector(".style-preview-sub");
+  if (bannerEl) {
+    bannerEl.style.color = assColorToCss(vis.banner_primary_colour, "#ffe500");
+    bannerEl.style.backgroundColor = Number(vis.banner_border_style) === 3 ? assColorToCss(vis.banner_back_colour, "rgba(16,21,32,.8)") : "transparent";
+    bannerEl.style.textShadow = "0 2px 6px rgba(0,0,0,.95)";
+  }
+  if (subEl) {
+    subEl.style.color = assColorToCss(vis.primary_colour, "#ffffff");
+    subEl.style.backgroundColor = Number(vis.border_style) === 3 ? assColorToCss(vis.back_colour, "rgba(16,21,32,.8)") : "transparent";
+    subEl.style.textShadow = "0 2px 5px rgba(0,0,0,.95)";
+  }
+}
+
+function renderStylePreviewMarkup(tpl) {
+  if (!tpl) return '<span class="small-note">선택된 스타일이 없으면 학습된 레퍼런스 또는 기본 바이럴 스타일이 적용됩니다.</span>';
+  const vis = tpl.visual || {};
+  const ed = tpl.editing || {};
+  const src = tpl.source_video;
+  const srcBadge = src?.view_count
+    ? `<span class="badge good">조회수 ${escapeHtml(Math.round(src.view_count / 10000).toLocaleString())}만회 분석</span>`
+    : `<span class="badge">${escapeHtml(tpl.category || "큐레이션")}</span>`;
+  return `<div class="card-head"><strong>${escapeHtml(tpl.name)}</strong>${srcBadge}</div><div class="style-preview-stage"><div class="style-preview-banner">${vis.use_hook_banner !== false ? "상단 임팩트 제목 (예: 할머니 댁 메밀베개)" : "(상단 배너 없음)"}</div><div class="style-preview-sub">하단 자막 12시간 · 60cm × 30cm</div></div><small class="muted">제목: ${escapeHtml(vis.banner_font_name || "Black Han Sans")} ${escapeHtml(vis.banner_font_size || 72)}px · 자막: ${escapeHtml(vis.font_name || "Pretendard")} ${escapeHtml(vis.font_size || 64)}px · ${ed.transition === "fade" ? "페이드" : "컷"} 전환 · ${ed.bgm_mood === "calm" ? "잔잔한 BGM" : "경쾌한 BGM"}</small>`;
+}
+
+function populateStyleTemplateSelect() {
+  const select = document.getElementById("style-template-select");
+  if (!select) return;
+  const templates = state.styleTemplatesState?.templates || [];
+  const previous = select.value;
+  select.innerHTML = `<option value="">자동 추천 (바이럴 쇼츠 기본)</option>` + templates.map(tpl => `<option value="${escapeHtml(tpl.id)}">${escapeHtml(tpl.name)}</option>`).join("");
+  if (previous && templates.some(t => t.id === previous)) select.value = previous;
+  else if (!previous && templates[0]) select.value = templates[0].id;
+  renderNewStyleTemplatePreview();
+}
+
+function renderNewStyleTemplatePreview() {
+  const select = document.getElementById("style-template-select");
+  const preview = document.getElementById("new-style-template-preview");
+  if (!select || !preview) return;
+  const templates = state.styleTemplatesState?.templates || [];
+  const selected = templates.find(t => t.id === select.value) || templates[0] || null;
+  preview.innerHTML = renderStylePreviewMarkup(selected);
+  if (selected) applyMiniPreviewStyles(preview, selected);
+}
+
+function renderStyleTemplatesDialog() {
+  const st = state.styleTemplatesState || {};
+  const badge = document.getElementById("style-sync-status-badge");
+  const statusText = document.getElementById("style-sync-status-text");
+  const autoBox = document.getElementById("style-auto-sync-enabled");
+  const intervalInput = document.getElementById("style-sync-interval-hours");
+  if (badge) badge.textContent = st.auto_sync_enabled !== false ? "지속 자동 수집 ON" : "일시 정지";
+  if (statusText) {
+    const syncTime = st.last_sync_at ? new Date(st.last_sync_at).toLocaleString() : "대기 중";
+    statusText.textContent = `최근 업데이트: ${syncTime} · ${st.last_sync_status || "서버가 주기적으로 100만+ 한국 쇼츠를 분석합니다."}`;
+  }
+  if (autoBox) autoBox.checked = st.auto_sync_enabled !== false;
+  if (intervalInput && st.sync_interval_hours) intervalInput.value = String(st.sync_interval_hours);
+
+  const list = document.getElementById("style-templates-list");
+  if (!list) return;
+  const templates = st.templates || [];
+  list.innerHTML = templates.map(tpl => {
+    const src = tpl.source_video;
+    const rules = (tpl.editing?.script_rules || []).map(r => `<li>${escapeHtml(r)}</li>`).join("");
+    const sourceLine = src?.url
+      ? `<p class="small-note">원본 100만+ 쇼츠: <a href="${escapeHtml(src.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(src.title)} (${Math.round((src.view_count || 0) / 10000).toLocaleString()}만회) ↗</a></p>`
+      : `<p class="small-note">${escapeHtml(tpl.description || "")}</p>`;
+    const delBtn = tpl.origin !== "builtin"
+      ? `<button type="button" class="button danger delete-style-template-btn" data-tpl-id="${escapeHtml(tpl.id)}">삭제</button>`
+      : "";
+    return `<article class="style-template-card" data-tpl-card-id="${escapeHtml(tpl.id)}">${renderStylePreviewMarkup(tpl)}${sourceLine}${rules ? `<ul class="small-note" style="margin:0;padding-left:18px;">${rules}</ul>` : ""}<div class="actions"><button type="button" class="button primary use-style-template-btn" data-tpl-id="${escapeHtml(tpl.id)}">새 콘텐츠에 적용</button>${delBtn}</div></article>`;
+  }).join("");
+  templates.forEach(tpl => {
+    const card = list.querySelector(`[data-tpl-card-id="${CSS.escape(tpl.id)}"]`);
+    if (card) applyMiniPreviewStyles(card, tpl);
+  });
+  list.querySelectorAll(".use-style-template-btn").forEach(btn => btn.addEventListener("click", () => {
+    const sel = document.getElementById("style-template-select");
+    if (sel) {
+      sel.value = btn.dataset.tplId;
+      renderNewStyleTemplatePreview();
+    }
+    document.getElementById("style-templates-dialog")?.close();
+    setMobileView("new");
+    toast("새 콘텐츠 폼에 선택한 스타일 템플릿을 적용했습니다.");
+  }));
+  list.querySelectorAll(".delete-style-template-btn").forEach(btn => btn.addEventListener("click", async () => {
+    try {
+      state.styleTemplatesState = await api(`/api/style-templates/${encodeURIComponent(btn.dataset.tplId)}`, { method: "DELETE" });
+      populateStyleTemplateSelect();
+      renderStyleTemplatesDialog();
+      toast("스타일 템플릿을 삭제했습니다.");
+    } catch (error) { toast(error.message); }
+  }));
+}
+
+async function openStyleTemplatesDialog() {
+  try {
+    state.styleTemplatesState = await api("/api/style-templates");
+    populateStyleTemplateSelect();
+    renderStyleTemplatesDialog();
+    document.getElementById("style-templates-dialog").showModal();
+  } catch (error) { toast(error.message); }
+}
+
+async function saveStyleTemplateSyncSettings() {
+  const autoSync = Boolean(document.getElementById("style-auto-sync-enabled")?.checked);
+  const hours = Number(document.getElementById("style-sync-interval-hours")?.value || 6);
+  try {
+    state.styleTemplatesState = await api("/api/style-templates/settings", {
+      method: "PUT",
+      body: JSON.stringify({ auto_sync_enabled: autoSync, sync_interval_hours: hours })
+    });
+    renderStyleTemplatesDialog();
+    toast("100만+ 쇼츠 지속 자동 분석 설정을 저장했습니다.");
+  } catch (error) { toast(error.message); }
+}
+
+async function discoverStyleTemplatesNow() {
+  const btn = document.getElementById("style-discover-now-btn");
+  const query = String(document.getElementById("style-discover-query")?.value || "").trim();
+  if (btn) btn.disabled = true;
+  toast("유튜브에서 조회수 100만+ 한국 쇼츠를 찾아 폰트·스타일을 분석하는 중…");
+  try {
+    const res = await api("/api/style-templates/discover", {
+      method: "POST",
+      body: JSON.stringify({ query, max_new: 2 })
+    });
+    state.styleTemplatesState = res;
+    populateStyleTemplateSelect();
+    renderStyleTemplatesDialog();
+    toast(res.last_sync_status || "스타일 템플릿 분석을 완료했습니다.");
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function createItem(event) {
   event.preventDefault();
   const form = event.currentTarget;
   const data = new FormData(form);
   const body = Object.fromEntries(data.entries());
   const mode = body.workflow_mode === "autopilot" ? "autopilot" : "manual";
+  const visualMode = body.visual_mode || "hybrid";
+  const styleTemplateId = body.style_template_id || null;
+  const useAttachedMedia = form.querySelector('input[name="use_attached_media"]')?.checked ?? true;
+  const pendingFiles = [...state.pendingAttachments];
   body.platforms = [...form.querySelectorAll('input[name="platforms"]:checked')].map(input => input.value);
   body.synthetic_media = form.querySelector('input[name="synthetic_media"]').checked;
+  body.use_attached_media = useAttachedMedia;
+  body.style_template_id = styleTemplateId;
   body.duration_seconds = Number(body.duration_seconds);
   if (!body.platforms.length) return toast("게시 대상을 하나 이상 선택하세요.");
   try {
     const item = await api("/api/items", { method: "POST", body: JSON.stringify(body) });
+    if (pendingFiles.length) {
+      toast(`첨부 파일 ${pendingFiles.length}개 분석 및 업로드 중…`);
+      await uploadAttachmentFilesToItem(item.id, pendingFiles);
+    }
+    state.pendingAttachments = [];
+    renderPendingAttachments();
     form.reset();
     form.querySelector('input[name="audience"]').value = "일반 시청자";
     form.querySelector('input[name="tone"]').value = "쉽고 신뢰감 있게";
     form.querySelector('input[value="youtube"]').checked = true;
+    const attachMediaCheckbox = form.querySelector('input[name="use_attached_media"]');
+    if (attachMediaCheckbox) attachMediaCheckbox.checked = true;
     const modeSelect = document.getElementById("workflow-mode-select");
     if (modeSelect) modeSelect.value = mode;
+    const visualSelect = document.getElementById("visual-mode-select");
+    if (visualSelect) visualSelect.value = visualMode;
+    const styleSelect = document.getElementById("style-template-select");
+    if (styleSelect && styleTemplateId) styleSelect.value = styleTemplateId;
+    renderNewStyleTemplatePreview();
     syncWorkflowModeUI();
     state.selectedId = item.id;
     setMobileView("workspace");
@@ -2015,15 +2357,17 @@ async function createItem(event) {
 }
 
 async function refresh(selectId = state.selectedId) {
-  const [items, settings, brand, analytics, schedules, assetLibrary, experiments] = await Promise.all([api("/api/items"), api("/api/settings"), api("/api/brand"), api("/api/analytics/summary"), api("/api/schedules"), api("/api/assets/library"), api("/api/experiments")]);
+  const [items, settings, brand, styleTemplatesState, analytics, schedules, assetLibrary, experiments] = await Promise.all([api("/api/items"), api("/api/settings"), api("/api/brand"), api("/api/style-templates"), api("/api/analytics/summary"), api("/api/schedules"), api("/api/assets/library"), api("/api/experiments")]);
   state.items = items;
   state.settings = settings;
   state.brand = brand;
+  state.styleTemplatesState = styleTemplatesState;
   state.analytics = analytics;
   state.schedules = schedules;
   state.assetLibrary = assetLibrary;
   state.experiments = experiments;
   populateSeriesTemplateSelect();
+  populateStyleTemplateSelect();
   if (!state.mobileView) setMobileView(items.length ? "workspace" : "new");
   renderProviders();
   renderScheduleCalendar();
@@ -2057,6 +2401,11 @@ document.getElementById("item-search")?.addEventListener("input", event => { sta
 document.getElementById("item-stage-filter")?.addEventListener("change", event => { state.filters.stage = event.target.value; renderList(); });
 document.getElementById("item-platform-filter")?.addEventListener("change", event => { state.filters.platform = event.target.value; renderList(); });
 document.getElementById("new-item-form").addEventListener("submit", createItem);
+document.getElementById("style-template-select")?.addEventListener("change", renderNewStyleTemplatePreview);
+document.getElementById("style-templates-open")?.addEventListener("click", openStyleTemplatesDialog);
+document.getElementById("open-style-templates-inline")?.addEventListener("click", openStyleTemplatesDialog);
+document.getElementById("style-save-settings-btn")?.addEventListener("click", saveStyleTemplateSyncSettings);
+document.getElementById("style-discover-now-btn")?.addEventListener("click", discoverStyleTemplatesNow);
 document.getElementById("series-template-select").addEventListener("change", applySelectedSeriesTemplate);
 document.getElementById("refresh-button").addEventListener("click", () => refresh().catch(error => toast(error.message)));
 document.getElementById("brand-settings-open").addEventListener("click", () => {
@@ -2130,3 +2479,4 @@ document.getElementById("disconnect-chatgpt").addEventListener("click", async ()
 refresh().catch(error => toast(error.message));
 startAutoModelSync();
 initWorkflowModeSelect();
+initNewItemAttachments();

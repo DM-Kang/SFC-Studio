@@ -37,6 +37,21 @@ from .config import (
 )
 from .analytics import build_analytics_dashboard, export_analytics_csv, parse_analytics_csv, summarize_analytics, summarize_experiment
 from .ai import ai_ready, ai_status
+from .media import KOREAN_SHORTS_FONT_FAMILIES
+from .style_templates import (
+    STYLE_TEMPLATE_SETTINGS_KEY,
+    discover_and_update_style_templates,
+    find_style_template,
+    load_style_templates_state,
+)
+from .attachments import (
+    MAX_ATTACHMENTS_PER_ITEM,
+    MAX_DOC_IMAGE_BYTES,
+    MAX_VIDEO_BYTES,
+    SUPPORTED_ATTACHMENT_EXTS,
+    build_attachment_record,
+    classify_attachment_ext,
+)
 from .shorts_learner import analyze_shorts_reference, reference_to_series_template
 from .ai_config import save_ai_settings
 from .ai_providers import (
@@ -91,11 +106,13 @@ load_local_environment()
 get_projects_dir().mkdir(parents=True, exist_ok=True)
 store = Store(get_database_path())
 _worker_lock = threading.Lock()
+_style_sync_lock = threading.Lock()
 _active_job_state: dict[str, str | None] = {"item_id": None, "job_id": None, "stage": None}
 _scheduler_stop = threading.Event()
 _scheduler_thread: threading.Thread | None = None
 _MODEL_SYNC_INTERVAL_SECONDS = 300
 _last_model_sync_at = 0.0
+_last_style_sync_check_at = 0.0
 
 app = FastAPI(title="Shortform Content Studio", version="0.1.0")
 app.mount("/static", StaticFiles(directory=PROJECT_ROOT / "shortform_studio" / "static"), name="static")
@@ -113,7 +130,30 @@ class NewItem(BaseModel):
     source_notes: str = Field(default="", max_length=12000)
     synthetic_media: bool = True
     series_template_id: str | None = Field(default=None, max_length=36)
+    style_template_id: str | None = Field(default=None, max_length=64)
     workflow_mode: Literal["manual", "autopilot"] = "manual"
+    visual_mode: Literal["hybrid", "ai_images", "stock"] = "hybrid"
+    use_attached_media: bool = True
+
+
+class StyleTemplateDiscoverRequest(BaseModel):
+    """Trigger immediate discovery of 1M+ Korean YouTube Shorts style templates."""
+
+    query: str = Field(default="", max_length=120)
+    max_new: int = Field(default=2, ge=1, le=5)
+
+
+class StyleTemplateSettingsRequest(BaseModel):
+    """Configure continuous background 1M+ YouTube Shorts style discovery."""
+
+    auto_sync_enabled: bool = True
+    sync_interval_hours: int = Field(default=6, ge=1, le=72)
+
+
+class ItemStyleTemplateRequest(BaseModel):
+    """Assign or clear the style template snapshot on an existing item."""
+
+    style_template_id: str | None = Field(default=None, max_length=64)
 
 
 class SceneEditInput(BaseModel):
@@ -151,7 +191,7 @@ class SceneAssemblyRequest(BaseModel):
 
     scenes: list[SceneAssemblyClipInput] = Field(min_length=1, max_length=8)
     transition: Literal["cut", "fade"] = "cut"
-    tts_provider: Literal["auto", "elevenlabs", "openai_tts", "none"] = "auto"
+    tts_provider: Literal["auto", "gemini_tts", "elevenlabs", "openai_tts", "none"] = "auto"
     tts_voice: str = Field(default="", max_length=80)
     bgm_volume: float = Field(default=0.18, ge=0.02, le=1.0)
     ducking: bool = True
@@ -167,7 +207,7 @@ class PostprocessRequest(BaseModel):
     bgm_volume: float = Field(default=0.18, ge=0.02, le=1.0)
     ducking: bool = True
     loudnorm: bool = True
-    tts_provider: Literal["none", "auto", "elevenlabs", "openai_tts"] = "none"
+    tts_provider: Literal["none", "auto", "gemini_tts", "elevenlabs", "openai_tts"] = "none"
     tts_voice: str = Field(default="", max_length=80)
     subtitle_style: SubtitleStyleInput | None = None
 
@@ -514,9 +554,41 @@ def _validate_publish_candidate(item: dict[str, Any], platform: str) -> Path:
     return video_path
 
 
+def _maybe_run_continuous_style_discovery() -> None:
+    """@brief Periodically discover fresh 1M+ Korean Shorts style templates without blocking video jobs."""
+    try:
+        state = load_style_templates_state(store)
+        if not state.get("auto_sync_enabled", True):
+            return
+        interval_sec = max(1, int(state.get("sync_interval_hours") or 6)) * 3600
+        last_iso = state.get("last_sync_at")
+        due = True
+        if isinstance(last_iso, str) and last_iso:
+            try:
+                elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last_iso)).total_seconds()
+                due = elapsed >= interval_sec
+            except ValueError:
+                due = True
+        if not due or not _style_sync_lock.acquire(blocking=False):
+            return
+
+        def _worker() -> None:
+            try:
+                discover_and_update_style_templates(store, max_new=1)
+            except Exception:
+                pass
+            finally:
+                _style_sync_lock.release()
+
+        threading.Thread(target=_worker, daemon=True, name="shortform-style-sync").start()
+    except Exception:
+        pass
+
+
 def _scheduler_loop() -> None:
-    """@brief Dispatch due approved schedules and periodically sync ready AI provider models."""
-    global _last_model_sync_at
+    """@brief Dispatch due approved schedules, sync provider models, and continuously update viral style templates."""
+    global _last_model_sync_at, _last_style_sync_check_at
+    boot_at = time.monotonic()
     while not _scheduler_stop.is_set():
         try:
             _dispatch_due_schedules()
@@ -530,6 +602,9 @@ def _scheduler_loop() -> None:
             except Exception:
                 pass
             _last_model_sync_at = now
+        if (now - boot_at >= 15) and (now - _last_style_sync_check_at >= 300):
+            _last_style_sync_check_at = now
+            _maybe_run_continuous_style_discovery()
         _scheduler_stop.wait(10)
 
 
@@ -693,8 +768,11 @@ def healthz() -> dict[str, str]:
 
 @app.get("/", response_class=HTMLResponse)
 def index() -> FileResponse:
-    """@brief Serve the local content-studio interface."""
-    return FileResponse(PROJECT_ROOT / "shortform_studio" / "static" / "index.html")
+    """@brief Serve the local content-studio interface without stale HTML caching."""
+    return FileResponse(
+        PROJECT_ROOT / "shortform_studio" / "static" / "index.html",
+        headers={"Cache-Control": "no-cache, must-revalidate"},
+    )
 
 
 @app.get("/api/settings")
@@ -1062,7 +1140,64 @@ def create_item(request: NewItem) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail=str(error)) from None
     values["brand_profile_snapshot"] = brand_settings["profile"]
     values["series_template_snapshot"] = series_template
+    values["style_template_snapshot"] = find_style_template(store, values.get("style_template_id"))
     return store.create_item(values)
+
+
+@app.get("/api/style-templates")
+def get_style_templates() -> dict[str, Any]:
+    """@brief Return built-in and continuously learned 1M+ YouTube Shorts style templates."""
+    state = load_style_templates_state(store)
+    return {**state, "available_fonts": list(KOREAN_SHORTS_FONT_FAMILIES)}
+
+
+@app.post("/api/style-templates/discover")
+def trigger_style_template_discovery(request: StyleTemplateDiscoverRequest | None = None) -> dict[str, Any]:
+    """@brief Immediately search 1M+ Korean YouTube Shorts and extract new style templates."""
+    payload = request or StyleTemplateDiscoverRequest()
+    if not _style_sync_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="이미 100만+ 쇼츠 스타일 분석이 실행 중입니다.")
+    try:
+        result = discover_and_update_style_templates(store, max_new=payload.max_new, custom_query=payload.query)
+        return {**result, "available_fonts": list(KOREAN_SHORTS_FONT_FAMILIES)}
+    finally:
+        _style_sync_lock.release()
+
+
+@app.put("/api/style-templates/settings")
+def update_style_template_settings(request: StyleTemplateSettingsRequest) -> dict[str, Any]:
+    """@brief Enable or tune continuous background style discovery cadence."""
+    state = load_style_templates_state(store)
+    state["auto_sync_enabled"] = bool(request.auto_sync_enabled)
+    state["sync_interval_hours"] = int(request.sync_interval_hours)
+    store.set_setting(STYLE_TEMPLATE_SETTINGS_KEY, state)
+    return {**state, "available_fonts": list(KOREAN_SHORTS_FONT_FAMILIES)}
+
+
+@app.delete("/api/style-templates/{template_id}")
+def delete_style_template(template_id: str) -> dict[str, Any]:
+    """@brief Remove an auto-discovered style template while keeping curated built-ins."""
+    state = load_style_templates_state(store)
+    target = next((t for t in state["templates"] if t.get("id") == template_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Style template not found.")
+    if target.get("origin") == "builtin":
+        raise HTTPException(status_code=409, detail="기본 제공 템플릿은 삭제할 수 없습니다.")
+    state["templates"] = [t for t in state["templates"] if t.get("id") != template_id]
+    store.set_setting(STYLE_TEMPLATE_SETTINGS_KEY, state)
+    return {**state, "available_fonts": list(KOREAN_SHORTS_FONT_FAMILIES)}
+
+
+@app.put("/api/items/{item_id}/style-template")
+def update_item_style_template(item_id: str, request: ItemStyleTemplateRequest) -> dict[str, Any]:
+    """@brief Assign a new viral video style template to an editable item before regeneration."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    tpl = find_style_template(store, request.style_template_id)
+    return store.update_payload(
+        item_id,
+        {"style_template_id": request.style_template_id or None, "style_template_snapshot": tpl},
+    )
 
 
 @app.get("/api/items/{item_id}")
@@ -1448,6 +1583,158 @@ def download_material_clip(item_id: str, provider_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail=str(error)) from None
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error)) from None
+
+
+@app.post("/api/items/{item_id}/attachments", status_code=201)
+async def upload_item_attachments(item_id: str, files: list[UploadFile] = File(...)) -> dict[str, Any]:
+    """@brief Upload reference documents, spreadsheets, slides, images, or videos to guide planning and visuals."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    if not files:
+        raise HTTPException(status_code=422, detail="첨부할 파일을 하나 이상 선택하세요.")
+    attachments = list(item.get("attachments") or [])
+    if len(attachments) + len(files) > MAX_ATTACHMENTS_PER_ITEM:
+        for upload in files:
+            await upload.close()
+        raise HTTPException(status_code=422, detail=f"첨부 파일은 항목당 최대 {MAX_ATTACHMENTS_PER_ITEM}개까지 업로드할 수 있습니다.")
+
+    folder = item_directory(item_id).resolve()
+    clips_dir = folder / "clips"
+    att_dir = folder / "attachments"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    att_dir.mkdir(parents=True, exist_ok=True)
+
+    assets = dict(item.get("assets") or {})
+    uploaded_clips = list(assets.get("uploaded_clips") or [])
+    written_paths: list[Path] = []
+    try:
+        for upload in files:
+            raw_name = Path(upload.filename or "attachment").name
+            ext = Path(raw_name).suffix.lower()
+            kind = classify_attachment_ext(ext)
+            if not kind or ext not in SUPPORTED_ATTACHMENT_EXTS:
+                raise HTTPException(
+                    status_code=415,
+                    detail=f"지원하지 않는 파일 형식입니다({raw_name}). 텍스트/PDF/Word/Excel/PPT/HWPX, 사진, 동영상을 첨부하세요.",
+                )
+            ascii_stem = "".join(ch for ch in Path(raw_name).stem if ch.isascii() and (ch.isalnum() or ch in {"-", "_"}))[:32] or "att"
+            stored_name = f"{ascii_stem}_{uuid4().hex[:8]}{ext}"
+            if kind in {"image", "video"}:
+                target_dir = clips_dir
+                rel_path = f"clips/{stored_name}"
+            else:
+                target_dir = att_dir
+                rel_path = f"attachments/{stored_name}"
+            destination = (target_dir / stored_name).resolve()
+            limit = MAX_VIDEO_BYTES if kind == "video" else MAX_DOC_IMAGE_BYTES
+            total = 0
+            with destination.open("wb") as out_file:
+                while chunk := await upload.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > limit:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"파일 크기가 제한을 초과했습니다({raw_name}: 최대 {limit // 1_000_000}MB).",
+                        )
+                    out_file.write(chunk)
+            written_paths.append(destination)
+            if total == 0:
+                raise HTTPException(status_code=422, detail=f"빈 파일은 첨부할 수 없습니다({raw_name}).")
+            record = build_attachment_record(
+                original_name=raw_name,
+                stored_name=stored_name,
+                relative_path=rel_path,
+                ext=ext,
+                kind=kind,
+                size_bytes=total,
+                file_path=destination,
+            )
+            attachments.append(record)
+            if kind in {"image", "video"}:
+                uploaded_clips.append(
+                    {
+                        "filename": stored_name,
+                        "original_name": raw_name,
+                        "media_type": "image" if kind == "image" else "video",
+                    }
+                )
+        assets["uploaded_clips"] = uploaded_clips[-40:]
+        return store.update_payload(item_id, {"attachments": attachments[-MAX_ATTACHMENTS_PER_ITEM:], "assets": assets})
+    except Exception:
+        for path in written_paths:
+            path.unlink(missing_ok=True)
+        raise
+    finally:
+        for upload in files:
+            await upload.close()
+
+
+@app.put("/api/items/{item_id}/attachments/{attachment_id}")
+def update_item_attachment_inclusion(item_id: str, attachment_id: str, request: SourceInclusionRequest) -> dict[str, Any]:
+    """@brief Include or exclude an uploaded attachment from planning prompts."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    attachments = [dict(att) for att in (item.get("attachments") or []) if isinstance(att, dict)]
+    matched = False
+    for att in attachments:
+        if att.get("id") == attachment_id:
+            att["included"] = bool(request.included)
+            matched = True
+            break
+    if not matched:
+        raise HTTPException(status_code=404, detail="Attachment not found.")
+    return store.update_payload(item_id, {"attachments": attachments})
+
+
+@app.delete("/api/items/{item_id}/attachments/{attachment_id}")
+def delete_item_attachment(item_id: str, attachment_id: str) -> dict[str, Any]:
+    """@brief Remove an uploaded attachment from an editable content item."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    attachments = list(item.get("attachments") or [])
+    target = next((att for att in attachments if isinstance(att, dict) and att.get("id") == attachment_id), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="Attachment not found.")
+    folder = item_directory(item_id).resolve()
+    rel = str(target.get("relative_path") or "")
+    if rel:
+        candidate = (folder / rel).resolve()
+        if folder in candidate.parents:
+            candidate.unlink(missing_ok=True)
+    remaining = [att for att in attachments if not (isinstance(att, dict) and att.get("id") == attachment_id)]
+    assets = dict(item.get("assets") or {})
+    if target.get("stored_name"):
+        assets["uploaded_clips"] = [
+            clip
+            for clip in (assets.get("uploaded_clips") or [])
+            if isinstance(clip, dict) and clip.get("filename") != target.get("stored_name")
+        ]
+    return store.update_payload(item_id, {"attachments": remaining, "assets": assets})
+
+
+@app.put("/api/items/{item_id}/attachment-media-mode")
+def update_item_attachment_media_mode(item_id: str, request: SourceInclusionRequest) -> dict[str, Any]:
+    """@brief Toggle whether attached photos/videos are placed directly into generated video scenes."""
+    item = _get_item(item_id)
+    _ensure_mutable(item)
+    return store.update_payload(item_id, {"use_attached_media": bool(request.included)})
+
+
+@app.get("/api/items/{item_id}/attachments/{attachment_id}/preview")
+def preview_item_attachment(item_id: str, attachment_id: str) -> FileResponse:
+    """@brief Serve an uploaded image attachment preview for workspace review."""
+    item = _get_item(item_id)
+    target = next(
+        (att for att in (item.get("attachments") or []) if isinstance(att, dict) and att.get("id") == attachment_id),
+        None,
+    )
+    if target is None or target.get("kind") != "image":
+        raise HTTPException(status_code=404, detail="Image attachment preview not found.")
+    folder = item_directory(item_id).resolve()
+    file_path = (folder / str(target.get("relative_path") or "")).resolve()
+    if folder not in file_path.parents or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Attachment file is missing.")
+    return FileResponse(file_path)
 
 
 @app.post("/api/items/{item_id}/clips", status_code=201)

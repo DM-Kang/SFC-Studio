@@ -237,6 +237,10 @@ def fetch_youtube_shorts_data(url: str) -> dict[str, Any]:
 
     title = str(details.get("title") or oembed_data.get("title") or f"YouTube Shorts {video_id}").strip()[:200]
     author = str(details.get("author") or oembed_data.get("author_name") or "").strip()[:120]
+    try:
+        view_count = int(details.get("viewCount") or 0)
+    except (TypeError, ValueError):
+        view_count = 0
     duration_seconds = int(details.get("lengthSeconds") or 30)
     if duration_seconds <= 0 or duration_seconds > 180:
         duration_seconds = min(180, max(5, duration_seconds or 30))
@@ -268,6 +272,7 @@ def fetch_youtube_shorts_data(url: str) -> dict[str, Any]:
         "url": canonical_url,
         "title": title,
         "author": author,
+        "view_count": view_count,
         "duration_seconds": duration_seconds,
         "description": description,
         "keywords": keywords,
@@ -356,7 +361,7 @@ def _analyze_thumbnail_with_gemini(video_id: str) -> dict[str, Any]:
             "generationConfig": {"responseMimeType": "application/json"},
         }
         g_req = urllib.request.Request(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
             data=json.dumps(body).encode("utf-8"),
             headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
             method="POST",

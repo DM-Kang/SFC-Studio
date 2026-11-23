@@ -8,7 +8,7 @@ import urllib.request
 from typing import Any
 
 from .ai_config import load_ai_settings
-from .ai_providers import generate_text, get_provider_statuses, provider_ready
+from .ai_providers import generate_multimodal_description, generate_text, get_provider_statuses, provider_ready
 from .config import get_secret
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
@@ -104,3 +104,26 @@ def generate_json(system_prompt: str, user_prompt: str, stage: str = "planning")
     if not isinstance(parsed, dict):
         raise RuntimeError("The text model response must be a JSON object.")
     return parsed, f"{provider}:{model}"
+
+
+def describe_media_with_ai(media_parts: list[dict[str, str]], prompt_text: str, stage: str = "planning") -> str:
+    """@brief Inspect image or PDF media parts with the active multimodal model when supported."""
+    valid_parts = [p for p in media_parts if isinstance(p, dict) and p.get("mime_type") and p.get("data_b64")]
+    if not valid_parts:
+        return ""
+    provider, model = selected_model(stage)
+    if provider == "openai_api" and provider_ready(provider, model):
+        api_key = get_secret("OPENAI_API_KEY")
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt_text}]
+        for part in valid_parts[:4]:
+            if part["mime_type"].startswith("image/"):
+                content.append({"type": "input_image", "image_url": f"data:{part['mime_type']};base64,{part['data_b64']}"})
+        if len(content) > 1:
+            response = request_json(
+                OPENAI_RESPONSES_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                body={"model": model, "input": [{"role": "user", "content": content}]},
+                timeout=90,
+            )
+            return extract_response_text(response)
+    return generate_multimodal_description(provider, model, prompt_text, valid_parts)

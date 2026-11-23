@@ -117,7 +117,7 @@ class Store:
         """@brief Create a draft item and return its display representation."""
         item_id = str(uuid4())
         now = _now()
-        payload = {**values, "publications": {}, "assets": {}, "review": None, "plan": None, "research": None, "materials": [], "approved_at": None, "platform_variants": {}, "version_history": [], "approval_history": [], "archived": False}
+        payload = {**values, "publications": {}, "assets": {}, "attachments": [], "review": None, "plan": None, "research": None, "materials": [], "approved_at": None, "platform_variants": {}, "version_history": [], "approval_history": [], "archived": False}
         with self._connect() as connection:
             connection.execute(
                 "INSERT INTO content_items(id, topic, payload, stage, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?)",

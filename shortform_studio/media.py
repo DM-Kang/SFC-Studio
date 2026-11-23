@@ -18,6 +18,17 @@ from typing import Any
 
 from .ai import request_json
 from .config import get_secret
+from .korean_numbers import korean_text_to_tts_speech, normalize_korean_display_text
+
+
+def _prepare_tts_and_caption_texts(text: str) -> tuple[str, str]:
+    """@brief Return (spoken_text_for_tts, display_text_for_captions) with context-aware Korean numerals."""
+    raw = str(text or "").strip()
+    if _contains_hangul(raw):
+        display_text = normalize_korean_display_text(raw)
+        spoken_text = korean_text_to_tts_speech(display_text)
+        return spoken_text, display_text
+    return raw, raw
 
 RUNWAY_BASE_URL = "https://api.dev.runwayml.com/v1"
 RUNWAY_API_VERSION = "2024-11-06"
@@ -27,61 +38,127 @@ _FONT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9가-힣 _-]{1,64}$")
 _ASS_COLOR_PATTERN = re.compile(r"^&H[0-9A-Fa-f]{8}$")
 _SRT_TIME_PATTERN = re.compile(r"^(\d{2}):(\d{2}):(\d{2}),(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2}),(\d{3})$")
 
+KOREAN_SHORTS_FONT_FAMILIES = (
+    "Pretendard",
+    "Black Han Sans",
+    "Do Hyeon",
+    "Jua",
+    "Gothic A1",
+    "Sunflower",
+    "Noto Sans CJK KR",
+    "Noto Serif CJK KR",
+)
+
 SUBTITLE_STYLE_PRESETS: dict[str, dict[str, Any]] = {
     "clean_bottom": {
-        "label": "깔끔한 하단 자막",
+        "label": "깔끔한 모던 하단 자막 (Pretendard)",
         "font_name": "",
-        "font_size": 46,
-        "margin_v": 200,
-        "outline": 4,
-        "shadow": 2,
-        "alignment": 2,
-        "primary_colour": "&H00FFFFFF",
-        "outline_colour": "&H00000000",
-    },
-    "shorts_punch": {
-        "label": "쇼츠 볼드 강조 자막",
-        "font_name": "",
-        "font_size": 54,
-        "margin_v": 240,
+        "font_size": 58,
+        "margin_v": 310,
         "outline": 5,
         "shadow": 2,
         "alignment": 2,
         "primary_colour": "&H00FFFFFF",
         "outline_colour": "&H00000000",
+        "back_colour": "&H99000000",
+        "border_style": 1,
+        "banner_font_name": "Black Han Sans",
+        "banner_font_size": 72,
+        "banner_primary_colour": "&H0000E5FF",
+        "banner_outline_colour": "&H00000000",
+        "banner_back_colour": "&H990B0E14",
+        "banner_border_style": 1,
+        "banner_outline": 7,
+        "banner_margin_v": 165,
+        "animation": "pop",
+    },
+    "shorts_punch": {
+        "label": "바이럴 쇼츠 볼드 강조 자막",
+        "font_name": "",
+        "font_size": 66,
+        "margin_v": 325,
+        "outline": 6,
+        "shadow": 3,
+        "alignment": 2,
+        "primary_colour": "&H00FFFFFF",
+        "outline_colour": "&H00000000",
+        "back_colour": "&H99000000",
+        "border_style": 1,
+        "banner_font_name": "Black Han Sans",
+        "banner_font_size": 76,
+        "banner_primary_colour": "&H0000E5FF",
+        "banner_outline_colour": "&H00000000",
+        "banner_back_colour": "&HB00D1117",
+        "banner_border_style": 1,
+        "banner_outline": 8,
+        "banner_margin_v": 165,
+        "animation": "pop",
     },
     "bold_center": {
-        "label": "강조 중앙 자막",
-        "font_name": "",
-        "font_size": 52,
-        "margin_v": 80,
-        "outline": 4,
-        "shadow": 2,
+        "label": "임팩트 중앙 자막",
+        "font_name": "Do Hyeon",
+        "font_size": 70,
+        "margin_v": 140,
+        "outline": 7,
+        "shadow": 3,
         "alignment": 5,
         "primary_colour": "&H00FFFFFF",
         "outline_colour": "&H00000000",
+        "back_colour": "&H80000000",
+        "border_style": 1,
+        "banner_font_name": "Black Han Sans",
+        "banner_font_size": 74,
+        "banner_primary_colour": "&H0000E5FF",
+        "banner_outline_colour": "&H00000000",
+        "banner_back_colour": "&H80000000",
+        "banner_border_style": 1,
+        "banner_outline": 7,
+        "banner_margin_v": 165,
+        "animation": "pop",
     },
     "yellow_pop": {
-        "label": "노란색 포인트 자막",
-        "font_name": "",
-        "font_size": 46,
-        "margin_v": 210,
-        "outline": 4,
+        "label": "노란색 포인트 자막 (꿀팁/리뷰)",
+        "font_name": "Jua",
+        "font_size": 64,
+        "margin_v": 315,
+        "outline": 6,
         "shadow": 2,
         "alignment": 2,
         "primary_colour": "&H0000E5FF",
         "outline_colour": "&H00000000",
+        "back_colour": "&H80000000",
+        "border_style": 1,
+        "banner_font_name": "Do Hyeon",
+        "banner_font_size": 70,
+        "banner_primary_colour": "&H00FFFFFF",
+        "banner_outline_colour": "&H00000000",
+        "banner_back_colour": "&HC815202E",
+        "banner_border_style": 3,
+        "banner_outline": 12,
+        "banner_margin_v": 165,
+        "animation": "pop",
     },
     "top_news": {
-        "label": "상단 뉴스형 자막",
-        "font_name": "",
-        "font_size": 40,
-        "margin_v": 180,
-        "outline": 3,
-        "shadow": 1,
-        "alignment": 8,
+        "label": "상단 카드형 뉴스·정보 자막",
+        "font_name": "Gothic A1",
+        "font_size": 58,
+        "margin_v": 300,
+        "outline": 5,
+        "shadow": 2,
+        "alignment": 2,
         "primary_colour": "&H00FFFFFF",
         "outline_colour": "&H00000000",
+        "back_colour": "&HCC101520",
+        "border_style": 3,
+        "banner_font_name": "Do Hyeon",
+        "banner_font_size": 68,
+        "banner_primary_colour": "&H0000E5FF",
+        "banner_outline_colour": "&H00000000",
+        "banner_back_colour": "&HCC101520",
+        "banner_border_style": 3,
+        "banner_outline": 12,
+        "banner_margin_v": 165,
+        "animation": "fade",
     },
 }
 
@@ -92,18 +169,40 @@ def _contains_hangul(text: str) -> bool:
 
 
 def default_subtitle_font() -> str:
-    """@brief Choose a readable default system font name for burned-in subtitles."""
+    """@brief Choose a crisp Korean Shorts font installed in the runtime environment."""
     import sys
 
     if sys.platform == "win32":
         return "Malgun Gothic"
     if sys.platform == "darwin":
         return "Apple SD Gothic Neo"
+    if Path("/usr/share/fonts/truetype/korean-shorts/Pretendard-Bold.otf").is_file():
+        return "Pretendard"
     return "Noto Sans CJK KR"
 
 
+def _resolve_banner_font(requested: str, fallback: str) -> str:
+    """@brief Resolve banner font cleanly against installed Linux/container fonts."""
+    import sys
+
+    clean = str(requested or "").strip()
+    if sys.platform.startswith("linux") and clean == "Black Han Sans" and not Path("/usr/share/fonts/truetype/korean-shorts/BlackHanSans-Regular.ttf").is_file():
+        return fallback
+    if sys.platform.startswith("linux") and clean in {"Do Hyeon", "Jua", "Gothic A1", "Sunflower", "Pretendard"}:
+        font_files = {
+            "Do Hyeon": "DoHyeon-Regular.ttf",
+            "Jua": "Jua-Regular.ttf",
+            "Gothic A1": "GothicA1-ExtraBold.ttf",
+            "Sunflower": "Sunflower-Bold.ttf",
+            "Pretendard": "Pretendard-Bold.otf",
+        }
+        if not Path(f"/usr/share/fonts/truetype/korean-shorts/{font_files[clean]}").is_file():
+            return fallback
+    return clean or fallback
+
+
 def normalize_subtitle_style(style: dict[str, Any] | None = None) -> dict[str, Any]:
-    """@brief Validate subtitle style parameters and merge with a named preset."""
+    """@brief Validate subtitle and headline banner parameters and merge with a named preset."""
     raw = style if isinstance(style, dict) else {}
     preset_id = str(raw.get("preset") or "clean_bottom").strip()
     if preset_id not in SUBTITLE_STYLE_PRESETS:
@@ -116,7 +215,12 @@ def normalize_subtitle_style(style: dict[str, Any] | None = None) -> dict[str, A
         font_name = default_subtitle_font()
     if not _FONT_NAME_PATTERN.fullmatch(font_name):
         raise ValueError("Subtitle font name contains unsupported characters.")
-    merged["font_name"] = font_name
+    merged["font_name"] = _resolve_banner_font(font_name, default_subtitle_font())
+
+    banner_font = str(raw.get("banner_font_name") if raw.get("banner_font_name") is not None else merged.get("banner_font_name") or "").strip()
+    if banner_font and not _FONT_NAME_PATTERN.fullmatch(banner_font):
+        raise ValueError("Banner font name contains unsupported characters.")
+    merged["banner_font_name"] = _resolve_banner_font(banner_font, merged["font_name"])
 
     def _bounded_int(key: str, minimum: int, maximum: int) -> int:
         value = raw.get(key, merged[key])
@@ -124,16 +228,29 @@ def normalize_subtitle_style(style: dict[str, Any] | None = None) -> dict[str, A
             raise ValueError(f"Subtitle {key} must be an integer between {minimum} and {maximum}.")
         return value
 
-    merged["font_size"] = _bounded_int("font_size", 18, 96)
-    merged["margin_v"] = _bounded_int("margin_v", 10, 600)
-    merged["outline"] = _bounded_int("outline", 0, 10)
-    merged["shadow"] = _bounded_int("shadow", 0, 6)
+    merged["font_size"] = _bounded_int("font_size", 18, 110)
+    merged["margin_v"] = _bounded_int("margin_v", 10, 700)
+    merged["outline"] = _bounded_int("outline", 0, 14)
+    merged["shadow"] = _bounded_int("shadow", 0, 8)
+    merged["border_style"] = _bounded_int("border_style", 1, 3)
+    if merged["border_style"] not in {1, 3}:
+        merged["border_style"] = 1
+    merged["banner_font_size"] = _bounded_int("banner_font_size", 32, 116)
+    merged["banner_outline"] = _bounded_int("banner_outline", 0, 20)
+    merged["banner_margin_v"] = _bounded_int("banner_margin_v", 40, 420)
+    merged["banner_border_style"] = _bounded_int("banner_border_style", 1, 3)
+    if merged["banner_border_style"] not in {1, 3}:
+        merged["banner_border_style"] = 1
+
     alignment = raw.get("alignment", merged["alignment"])
     if alignment not in {2, 5, 8}:
         raise ValueError("Subtitle alignment must be bottom (2), center (5), or top (8).")
     merged["alignment"] = alignment
 
-    for color_key in ("primary_colour", "outline_colour"):
+    anim = str(raw.get("animation") or merged.get("animation") or "pop").strip().lower()
+    merged["animation"] = anim if anim in {"pop", "fade", "static"} else "pop"
+
+    for color_key in ("primary_colour", "outline_colour", "back_colour", "banner_primary_colour", "banner_outline_colour", "banner_back_colour"):
         color_val = str(raw.get(color_key) or merged[color_key]).strip()
         if not _ASS_COLOR_PATTERN.fullmatch(color_val):
             raise ValueError(f"Subtitle {color_key} must use ASS &HAABBGGRR format.")
@@ -238,6 +355,36 @@ def _parse_srt_cues(raw_srt: str) -> list[tuple[float, float, str]]:
     return cues
 
 
+def format_shorts_banner_text(title: str, hook: str = "", *, max_line_chars: int = 15, max_lines: int = 2) -> str:
+    """@brief Wrap a concise Shorts headline cleanly at word boundaries across up to 2 lines without mid-word truncation."""
+    raw = str(title or "").strip() or str(hook or "").strip()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"[\r\n{}]+", " ", raw).strip()
+    if len(cleaned) > max_line_chars * max_lines + 4:
+        clause = re.split(r"[!?.]\s+", cleaned)[0].strip()
+        if len(clause) >= 14:
+            cleaned = clause
+    words = cleaned.split(" ")
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if not word:
+            continue
+        candidate = f"{current} {word}".strip() if current else word
+        if len(candidate) <= max_line_chars or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+            if len(lines) >= max_lines:
+                current = ""
+                break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+    return r"\N".join(lines)
+
+
 def srt_to_shorts_ass(
     raw_srt: str,
     output_path: Path,
@@ -247,26 +394,45 @@ def srt_to_shorts_ass(
     style: dict[str, Any] | None = None,
     hook_title: str = "",
 ) -> Path:
-    """@brief Build a styled 9:16 ASS caption file with pop-in text and optional top hook banner."""
+    """@brief Build a styled 9:16 ASS caption file with pop-in text and customizable Korean Shorts headline banner."""
     normalized = normalize_subtitle_style(style)
     cues = _parse_srt_cues(raw_srt)
     font_name = normalized["font_name"] or default_subtitle_font()
-    font_size = max(48, int(normalized["font_size"]))
+    font_size = max(50, int(normalized["font_size"]))
     margin_v = int(normalized["margin_v"])
     outline = max(3, int(normalized["outline"]))
     shadow = max(1, int(normalized["shadow"]))
     alignment = int(normalized["alignment"])
     primary = normalized["primary_colour"]
     outline_col = normalized["outline_colour"]
+    back_col = normalized["back_colour"]
+    border_style = int(normalized["border_style"])
+
+    banner_font = normalized["banner_font_name"] or font_name
+    banner_size = int(normalized["banner_font_size"])
+    banner_primary = normalized["banner_primary_colour"]
+    banner_outline_col = normalized["banner_outline_colour"]
+    banner_back_col = normalized["banner_back_colour"]
+    banner_border_style = int(normalized["banner_border_style"])
+    banner_outline = int(normalized["banner_outline"])
+    banner_margin_v = int(normalized["banner_margin_v"])
+    anim_mode = normalized.get("animation", "pop")
 
     total_end = max((end for _, end, _ in cues), default=15.0)
     events: list[str] = []
-    clean_banner = re.sub(r"[\r\n{}]+", " ", str(hook_title or "")).strip()[:32]
+    clean_banner = re.sub(r"[\r\n{}]+", " ", str(hook_title or "")).strip()
+    if clean_banner and r"\N" not in clean_banner:
+        clean_banner = format_shorts_banner_text(clean_banner)
     if clean_banner:
         events.append(f"Dialogue: 1,0:00:00.00,{_ass_time(total_end)},HookBanner,,0,0,0,,{clean_banner}")
     for start_s, end_s, cue_text in cues:
         safe_text = cue_text.replace("{", "(").replace("}", ")").replace("\n", r"\N")
-        anim = r"{\fad(35,35)\fscx107\fscy107\t(0,85,\fscx100\fscy100)}"
+        if anim_mode == "pop":
+            anim = r"{\fad(30,30)\fscx108\fscy108\t(0,85,\fscx100\fscy100)}"
+        elif anim_mode == "fade":
+            anim = r"{\fad(60,60)}"
+        else:
+            anim = ""
         events.append(f"Dialogue: 0,{_ass_time(start_s)},{_ass_time(end_s)},Default,,0,0,0,,{anim}{safe_text}")
 
     ass_doc = "\n".join(
@@ -280,8 +446,8 @@ def srt_to_shorts_ass(
             "",
             "[V4+ Styles]",
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            f"Style: Default,{font_name},{font_size},{primary},&H000000FF,{outline_col},&H80000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},{alignment},64,64,{margin_v},1",
-            f"Style: HookBanner,{font_name},52,&H0000E5FF,&H000000FF,&H00000000,&HCC0E1118,-1,0,0,0,100,100,0,0,3,16,0,8,56,56,120,1",
+            f"Style: Default,{font_name},{font_size},{primary},&H000000FF,{outline_col},{back_col},-1,0,0,0,100,100,0,0,{border_style},{outline},{shadow},{alignment},64,64,{margin_v},1",
+            f"Style: HookBanner,{banner_font},{banner_size},{banner_primary},&H000000FF,{banner_outline_col},{banner_back_col},-1,0,0,0,100,100,0,0,{banner_border_style},{banner_outline},3,8,56,56,{banner_margin_v},1",
             "",
             "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -372,6 +538,8 @@ def generate_voiceover(
     if provider == "auto":
         if get_secret("ELEVENLABS_API_KEY") and get_secret("ELEVENLABS_VOICE_ID"):
             provider = "elevenlabs"
+        elif get_secret("GEMINI_API_KEY"):
+            provider = "gemini_tts"
         elif get_secret("OPENAI_API_KEY"):
             provider = "openai_tts"
         elif get_secret("ELEVENLABS_API_KEY") or get_secret("ELEVENLABS_VOICE_ID"):
@@ -379,10 +547,12 @@ def generate_voiceover(
         else:
             return None
 
+    if provider == "gemini_tts":
+        return _generate_gemini_tts(text, output_dir, voice=voice)
     if provider == "openai_tts":
         return _generate_openai_tts(text, output_dir, voice=voice)
     if provider != "elevenlabs":
-        raise ValueError("Unsupported TTS provider; choose auto, elevenlabs, openai_tts, or none.")
+        raise ValueError("Unsupported TTS provider; choose auto, gemini_tts, elevenlabs, openai_tts, or none.")
 
     api_key = get_secret("ELEVENLABS_API_KEY")
     voice_id = voice.strip() or get_secret("ELEVENLABS_VOICE_ID")
@@ -393,6 +563,7 @@ def generate_voiceover(
     encoded_voice = urllib.parse.quote(voice_id, safe="")
     model_id = get_secret("ELEVENLABS_MODEL", "eleven_multilingual_v2") or "eleven_multilingual_v2"
     url = f"{ELEVENLABS_BASE_URL}/text-to-speech/{encoded_voice}/with-timestamps"
+    spoken_text, display_text = _prepare_tts_and_caption_texts(text)
     voice_settings: dict[str, Any] = {
         "stability": 0.42,
         "similarity_boost": 0.78,
@@ -404,7 +575,7 @@ def generate_voiceover(
     for attempt_settings in (voice_settings, {k: v for k, v in voice_settings.items() if k != "speed"}):
         request = urllib.request.Request(
             url,
-            data=json.dumps({"text": text, "model_id": model_id, "voice_settings": attempt_settings}).encode("utf-8"),
+            data=json.dumps({"text": spoken_text, "model_id": model_id, "voice_settings": attempt_settings}).encode("utf-8"),
             headers={"Content-Type": "application/json", "xi-api-key": api_key},
             method="POST",
         )
@@ -443,13 +614,16 @@ def generate_voiceover(
     audio_path.write_bytes(base64.b64decode(encoded_audio, validate=True))
     captions_path = output_dir / "captions.srt"
     aligned_chars = "".join(str(ch) for ch in (alignment.get("characters") or []) if isinstance(ch, str))
-    if has_hangul and not _contains_hangul(aligned_chars):
+    if (has_hangul and not _contains_hangul(aligned_chars)) or (display_text != spoken_text):
         duration = probe_audio_duration(audio_path)
         if duration is None or duration <= 0:
+            end_times = alignment.get("character_end_times_seconds") or []
+            duration = float(end_times[-1]) if end_times and isinstance(end_times[-1], (int, float)) else 0.0
+        if duration <= 0:
             from .planning import estimate_speaking_duration
 
-            duration = max(2.0, estimate_speaking_duration(text)["estimated_seconds"])
-        srt_text = text_to_fallback_srt(text, duration, max_chars=16)
+            duration = max(2.0, estimate_speaking_duration(spoken_text)["estimated_seconds"])
+        srt_text = text_to_fallback_srt(display_text, duration, max_chars=16 if has_hangul else 24)
     else:
         srt_text = alignment_to_srt(alignment, max_chars=16 if has_hangul else 24)
     captions_path.write_text(srt_text, encoding="utf-8")
@@ -473,6 +647,10 @@ def generate_scene_synced_voiceover(
         for s in (scenes or [])
         if isinstance(s, dict) and str(s.get("narration") or "").strip()
     ]
+    if _contains_hangul(fallback_script) and any(re.search(r"[\u4e00-\u9fff]", line) or not _contains_hangul(line) for line in valid_scenes):
+        from .planning import split_script_for_scenes
+
+        valid_scenes = split_script_for_scenes(fallback_script, max(2, len(valid_scenes) or 4))
     if len(valid_scenes) < 2 or not ffmpeg or str(tts_provider or "auto").strip().lower() == "none":
         return synthesize(fallback_script, output_dir, tts_provider=tts_provider, voice=voice)
 
@@ -533,20 +711,35 @@ def generate_scene_synced_voiceover(
 
 
 def ensure_ambient_bgm(output_path: Path, duration_seconds: float, *, mood: str = "upbeat") -> Path | None:
-    """@brief Synthesize a clean, royalty-free ambient background chord pad when no custom BGM is provided."""
+    """@brief Synthesize a clean, royalty-free background track (bright rhythmic pop groove or calm pad)."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         return None
     dur = max(5.0, min(90.0, float(duration_seconds or 25.0)))
-    # Warm pentatonic ambient pad (C-G-Am-F style harmonics) + gentle lowpass so it never competes with speech.
-    expr = (
-        "0.22*sin(2*PI*130.81*t)"
-        "+0.18*sin(2*PI*196.00*t)"
-        "+0.16*sin(2*PI*261.63*t)"
-        "+0.14*sin(2*PI*329.63*t)*(0.6+0.4*sin(2*PI*0.25*t))"
-        if mood != "calm"
-        else "0.22*sin(2*PI*110.00*t)+0.18*sin(2*PI*164.81*t)+0.15*sin(2*PI*220.00*t)"
-    )
+    if mood != "calm":
+        # Bright ~128 BPM C-G-Am-F rhythmic marimba/pop arpeggio + gentle pulse for lively commerce/Shorts.
+        eighth = "0.234375"
+        beat = "0.46875"
+        chord = "mod(floor(t/2),4)"
+        step = "mod(floor(t/0.234375),4)"
+        pluck = f"exp(-7.5*mod(t,{eighth}))"
+        pulse = f"exp(-13*mod(t,{beat}))*0.18*sin(2*PI*82.41*t)"
+        root_hz = f"(eq({chord},0)*261.63+eq({chord},1)*196.00+eq({chord},2)*220.00+eq({chord},3)*174.61)"
+        arp_hz = (
+            f"(eq({chord},0)*(eq({step},0)*523.25+eq({step},1)*659.25+eq({step},2)*783.99+eq({step},3)*1046.50)"
+            f"+eq({chord},1)*(eq({step},0)*392.00+eq({step},1)*493.88+eq({step},2)*587.33+eq({step},3)*783.99)"
+            f"+eq({chord},2)*(eq({step},0)*440.00+eq({step},1)*523.25+eq({step},2)*659.25+eq({step},3)*880.00)"
+            f"+eq({chord},3)*(eq({step},0)*349.23+eq({step},1)*440.00+eq({step},2)*523.25+eq({step},3)*698.46))"
+        )
+        expr = (
+            f"{pulse}"
+            f"+0.24*sin(2*PI*{root_hz}*t)*(0.55+0.45*exp(-3.5*mod(t,{beat})))"
+            f"+0.26*{pluck}*(0.75*sin(2*PI*{arp_hz}*t)+0.25*sin(4*PI*{arp_hz}*t))"
+        )
+        af_filter_base = "lowpass=f=3600"
+    else:
+        expr = "0.22*sin(2*PI*110.00*t)+0.18*sin(2*PI*164.81*t)+0.15*sin(2*PI*220.00*t)+0.10*sin(2*PI*329.63*t)*(0.6+0.4*sin(2*PI*0.25*t))"
+        af_filter_base = "lowpass=f=1200"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     staging = output_path.with_name(f"{output_path.stem}.synth{output_path.suffix}")
     fade_out_start = max(0.5, dur - 1.2)
@@ -556,9 +749,9 @@ def ensure_ambient_bgm(output_path: Path, duration_seconds: float, *, mood: str 
         "-f",
         "lavfi",
         "-i",
-        f"aevalsrc={expr}:s=44100:d={dur:.2f}",
+        f"aevalsrc={expr.replace(',', r'\,')}:s=44100:d={dur:.2f}",
         "-af",
-        f"lowpass=f=950,afade=t=in:st=0:d=0.6,afade=t=out:st={fade_out_start:.2f}:d=1.1",
+        f"{af_filter_base},afade=t=in:st=0:d=0.45,afade=t=out:st={fade_out_start:.2f}:d=1.1",
         "-c:a",
         "libmp3lame",
         "-b:a",
@@ -584,29 +777,30 @@ def generate_ai_scene_image(prompt: str, output_path: Path) -> Path | None:
     )
     gemini_key = get_secret("GEMINI_API_KEY")
     if gemini_key:
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent"
         body = {
             "contents": [{"parts": [{"text": clean_prompt}]}],
             "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
         }
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json", "x-goog-api-key": gemini_key},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            for cand in payload.get("candidates", []):
-                for part in (cand.get("content") or {}).get("parts", []):
-                    inline = part.get("inlineData") or part.get("inline_data")
-                    if isinstance(inline, dict) and isinstance(inline.get("data"), str):
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        output_path.write_bytes(base64.b64decode(inline["data"]))
-                        return output_path
-        except Exception:
-            pass
+        for image_model in ("gemini-3-pro-image-preview", "gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"):
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{image_model}:generateContent"
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json", "x-goog-api-key": gemini_key},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                for cand in payload.get("candidates", []):
+                    for part in (cand.get("content") or {}).get("parts", []):
+                        inline = part.get("inlineData") or part.get("inline_data")
+                        if isinstance(inline, dict) and isinstance(inline.get("data"), str):
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+                            output_path.write_bytes(base64.b64decode(inline["data"]))
+                            return output_path
+            except Exception:
+                continue
 
     openai_key = get_secret("OPENAI_API_KEY")
     if openai_key:
@@ -631,6 +825,88 @@ def generate_ai_scene_image(prompt: str, output_path: Path) -> Path | None:
     return None
 
 
+def _generate_gemini_tts(text: str, output_dir: Path, *, voice: str = "") -> dict[str, Any]:
+    """@brief Synthesize native Korean/multilingual speech using Gemini TTS and produce word-aligned SRT captions."""
+    api_key = get_secret("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is required for Gemini TTS.")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("FFmpeg is required to encode Gemini TTS audio.")
+    chosen_voice = voice.strip() or get_secret("GEMINI_TTS_VOICE", "Kore") or "Kore"
+    if chosen_voice not in {"Kore", "Aoede", "Charon", "Fenrir", "Puck", "Zephyr"}:
+        chosen_voice = "Kore"
+    spoken_text, display_text = _prepare_tts_and_caption_texts(text)
+    spoken = spoken_text[:3000]
+    body = {
+        "contents": [{"parts": [{"text": spoken}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": chosen_voice}}},
+        },
+    }
+    raw_bytes: bytes | None = None
+    mime_type = ""
+    last_error: Exception | None = None
+    for tts_model in ("gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview", "gemini-2.5-pro-preview-tts"):
+        req = urllib.request.Request(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{tts_model}:generateContent",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            for cand in payload.get("candidates", []):
+                for part in (cand.get("content") or {}).get("parts", []):
+                    inline = part.get("inlineData") or part.get("inline_data")
+                    if isinstance(inline, dict) and isinstance(inline.get("data"), str):
+                        raw_bytes = base64.b64decode(inline["data"])
+                        mime_type = str(inline.get("mimeType") or "").lower()
+                        break
+                if raw_bytes:
+                    break
+            if raw_bytes:
+                break
+        except Exception as err:
+            last_error = err
+            continue
+    if not raw_bytes:
+        raise RuntimeError(f"Gemini TTS request failed: {last_error or 'no audio returned'}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = output_dir / "voiceover.mp3"
+    if "wav" in mime_type or raw_bytes[:4] == b"RIFF":
+        tmp_in = output_dir / "voiceover_raw.wav"
+        tmp_in.write_bytes(raw_bytes)
+        cmd = [ffmpeg, "-y", "-i", tmp_in.name, "-c:a", "libmp3lame", "-q:a", "3", audio_path.name]
+    else:
+        rate_match = re.search(r"rate=(\d+)", mime_type)
+        rate = rate_match.group(1) if rate_match else "24000"
+        tmp_in = output_dir / "voiceover_raw.pcm"
+        tmp_in.write_bytes(raw_bytes)
+        cmd = [ffmpeg, "-y", "-f", "s16le", "-ar", rate, "-ac", "1", "-i", tmp_in.name, "-c:a", "libmp3lame", "-q:a", "3", audio_path.name]
+    try:
+        rc, detail = _run_ffmpeg(cmd, cwd=output_dir)
+        if rc != 0 or not audio_path.is_file():
+            raise RuntimeError(f"FFmpeg could not encode Gemini TTS audio: {detail}")
+    finally:
+        tmp_in.unlink(missing_ok=True)
+
+    duration = probe_audio_duration(audio_path)
+    if duration is None or duration <= 0:
+        from .planning import estimate_speaking_duration
+
+        duration = max(1.5, estimate_speaking_duration(spoken)["estimated_seconds"])
+    captions_path = output_dir / "captions.srt"
+    captions_path.write_text(
+        text_to_fallback_srt(display_text, duration, max_chars=16 if _contains_hangul(display_text) else 24),
+        encoding="utf-8",
+    )
+    return {"audio_path": str(audio_path), "captions_path": str(captions_path), "provider": "gemini_tts", "voice_id": chosen_voice}
+
+
 def _generate_openai_tts(text: str, output_dir: Path, *, voice: str = "") -> dict[str, Any]:
     """@brief Synthesize MP3 narration with OpenAI TTS and produce proportional SRT captions."""
     api_key = get_secret("OPENAI_API_KEY")
@@ -639,9 +915,10 @@ def _generate_openai_tts(text: str, output_dir: Path, *, voice: str = "") -> dic
     chosen_voice = voice.strip() or get_secret("OPENAI_TTS_VOICE", "alloy")
     if chosen_voice not in {"alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer"}:
         chosen_voice = "alloy"
+    spoken_text, display_text = _prepare_tts_and_caption_texts(text)
     request = urllib.request.Request(
         "https://api.openai.com/v1/audio/speech",
-        data=json.dumps({"model": "tts-1", "voice": chosen_voice, "input": text[:4096], "response_format": "mp3", "speed": 1.08}).encode("utf-8"),
+        data=json.dumps({"model": "tts-1", "voice": chosen_voice, "input": spoken_text[:4096], "response_format": "mp3", "speed": 1.08}).encode("utf-8"),
         headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
         method="POST",
     )
@@ -661,9 +938,12 @@ def _generate_openai_tts(text: str, output_dir: Path, *, voice: str = "") -> dic
     if duration is None or duration <= 0:
         from .planning import estimate_speaking_duration
 
-        duration = max(2.0, estimate_speaking_duration(text)["estimated_seconds"])
+        duration = max(2.0, estimate_speaking_duration(spoken_text)["estimated_seconds"])
     captions_path = output_dir / "captions.srt"
-    captions_path.write_text(text_to_fallback_srt(text, duration, max_chars=16 if _contains_hangul(text) else 26), encoding="utf-8")
+    captions_path.write_text(
+        text_to_fallback_srt(display_text, duration, max_chars=16 if _contains_hangul(display_text) else 26),
+        encoding="utf-8",
+    )
     return {"audio_path": str(audio_path), "captions_path": str(captions_path), "provider": "openai_tts", "voice_id": chosen_voice}
 
 
@@ -692,7 +972,14 @@ def text_to_fallback_srt(text: str, total_seconds: float, max_chars: int = 26) -
             segments.append(buf)
     if not segments:
         segments = [cleaned]
-    weights = [max(1, len(seg)) for seg in segments]
+    merged_segments: list[str] = []
+    for seg in segments:
+        if merged_segments and len(seg.replace(" ", "")) <= 4 and len(merged_segments[-1]) + len(seg) <= max_chars + 6:
+            merged_segments[-1] = f"{merged_segments[-1]} {seg}".strip()
+        else:
+            merged_segments.append(seg)
+    segments = merged_segments
+    weights = [max(1, len(korean_text_to_tts_speech(seg))) if _contains_hangul(seg) else max(1, len(seg)) for seg in segments]
     total_weight = sum(weights)
     cursor = 0.0
     lines: list[str] = []
@@ -730,7 +1017,7 @@ def probe_audio_duration(audio_path: Path) -> float | None:
 
 
 def alignment_to_srt(alignment: dict[str, Any], max_chars: int = 26) -> str:
-    """@brief Convert character-level speech alignment into readable SRT cues."""
+    """@brief Convert character-level speech alignment into readable SRT cues respecting word boundaries."""
     chars = alignment.get("characters")
     starts = alignment.get("character_start_times_seconds")
     ends = alignment.get("character_end_times_seconds")
@@ -754,14 +1041,27 @@ def alignment_to_srt(alignment: dict[str, Any], max_chars: int = 26) -> str:
             cue_start = start
         buffer += char
         cue_end = end
-        if len(buffer) >= max_chars or char in {".", "?", "!", "。", "？", "！", ",", "，", "\n"}:
+        stripped_len = len(buffer.strip())
+        is_punct = char in {".", "?", "!", "。", "？", "！", ",", "，", "\n"}
+        is_space_break = char.isspace() and stripped_len >= max(8, max_chars - 3)
+        is_hard_limit = stripped_len >= max_chars + 8
+        if is_punct or is_space_break or is_hard_limit:
             clean = buffer.strip()
             if clean:
-                cues.append((cue_start, max(cue_end, cue_start + 0.2), clean))
+                if cues and len(clean.replace(" ", "")) <= 4 and len(cues[-1][2]) + len(clean) <= max_chars + 6:
+                    prev_start, _prev_end, prev_text = cues[-1]
+                    cues[-1] = (prev_start, max(cue_end, prev_start + 0.2), f"{prev_text} {clean}".strip())
+                else:
+                    cues.append((cue_start, max(cue_end, cue_start + 0.2), clean))
             buffer = ""
             cue_start = None
     if buffer.strip() and cue_start is not None:
-        cues.append((cue_start, max(cue_end, cue_start + 0.2), buffer.strip()))
+        clean = buffer.strip()
+        if cues and len(clean.replace(" ", "")) <= 4 and len(cues[-1][2]) + len(clean) <= max_chars + 6:
+            prev_start, _prev_end, prev_text = cues[-1]
+            cues[-1] = (prev_start, max(cue_end, prev_start + 0.2), f"{prev_text} {clean}".strip())
+        else:
+            cues.append((cue_start, max(cue_end, cue_start + 0.2), clean))
     if not cues:
         raise ValueError("Speech alignment did not contain any usable captions.")
     lines: list[str] = []
@@ -971,18 +1271,20 @@ def build_multiscene_ffmpeg_command(
         durations.append(dur)
         rel_path = str(clip["relative_path"]).replace("\\", "/")
         if clip.get("media_type") == "image":
-            command.extend(["-loop", "1", "-t", f"{dur:.2f}", "-i", rel_path])
-            frames = max(30, int(dur * 30))
+            # Single-frame input only: zoompan already expands 1 input frame into `d` output frames,
+            # whereas `-loop 1` causes zoompan to multiply frames (e.g. 150 * 180) and hang FFmpeg.
+            command.extend(["-i", rel_path])
+            frames = max(30, round(dur * 30))
             filter_parts.append(
                 f"[{idx}:v:0]scale={width}:{height}:force_original_aspect_ratio=increase,"
                 f"crop={width}:{height},zoompan=z='min(zoom+0.0008,1.08)':d={frames}:s={width}x{height}:fps=30,"
-                f"setsar=1,format=yuv420p[v{idx}]"
+                f"trim=duration={dur:.2f},setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{idx}]"
             )
         else:
             command.extend(["-stream_loop", "-1", "-t", f"{dur:.2f}", "-i", rel_path])
             filter_parts.append(
                 f"[{idx}:v:0]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},eq=contrast=1.04:saturation=1.08,setsar=1,fps=30,format=yuv420p[v{idx}]"
+                f"crop={width}:{height},eq=contrast=1.04:saturation=1.08,setpts=PTS-STARTPTS,setsar=1,fps=30,format=yuv420p[v{idx}]"
             )
 
     if len(clips) == 1:
@@ -1028,9 +1330,9 @@ def build_multiscene_ffmpeg_command(
     filter_parts.extend(audio_parts)
     command.extend(["-filter_complex", ";".join(filter_parts), "-map", video_label])
     if audio_label:
-        command.extend(["-map", audio_label, "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"])
+        command.extend(["-map", audio_label, "-shortest", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"])
     else:
-        command.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart"])
+        command.extend(["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart"])
     command.append(output_name)
     return command
 

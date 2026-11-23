@@ -780,7 +780,16 @@ def _request_json(url: str, *, headers: dict[str, str], body: dict[str, Any] | N
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
-        raise RuntimeError(f"AI provider request failed with HTTP {error.code}.") from None
+        detail = ""
+        try:
+            err_body = json.loads(error.read(4096).decode("utf-8", errors="replace"))
+            err_obj = err_body.get("error") if isinstance(err_body, dict) else None
+            msg = err_obj.get("message") if isinstance(err_obj, dict) else None
+            if isinstance(msg, str) and msg.strip():
+                detail = f" ({msg.strip()[:220]})"
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"AI provider request failed with HTTP {error.code}{detail}") from None
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as error:
         raise RuntimeError(f"AI provider request failed ({type(error).__name__}).") from None
     if not isinstance(payload, dict):
@@ -788,25 +797,74 @@ def _request_json(url: str, *, headers: dict[str, str], body: dict[str, Any] | N
     return payload
 
 
-def _generate_gemini(model: str, system_prompt: str, user_prompt: str, *, use_api_key: bool = False) -> str:
-    """@brief Generate JSON text through Gemini API using either API key or Google OAuth."""
+def _call_gemini_generate(model: str, body: dict[str, Any], *, use_api_key: bool = False) -> str:
+    """@brief Execute a Gemini generateContent request with 404/503 fallback and extract candidate text."""
     from urllib.parse import quote
 
-    model_path = quote(model, safe="-_.:")
-    response = _request_json(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model_path}:generateContent",
-        headers=_gemini_auth_headers(use_api_key=use_api_key, json_content=True),
-        body={"systemInstruction": {"parts": [{"text": system_prompt}]}, "contents": [{"role": "user", "parts": [{"text": user_prompt}]}], "generationConfig": {"responseMimeType": "application/json"}},
-    )
-    candidates = response.get("candidates")
-    if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+    candidates: list[str] = [model]
+    for fallback_model in (
+        "gemini-3-flash-preview",
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-flash-latest",
+        "gemini-flash-lite-latest",
+    ):
+        if fallback_model not in candidates:
+            candidates.append(fallback_model)
+
+    headers = _gemini_auth_headers(use_api_key=use_api_key, json_content=True)
+    response: dict[str, Any] | None = None
+    last_error: RuntimeError | None = None
+    for candidate_model in candidates:
+        model_path = quote(candidate_model, safe="-_.:")
+        try:
+            response = _request_json(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model_path}:generateContent",
+                headers=headers,
+                body=body,
+            )
+            break
+        except RuntimeError as error:
+            last_error = error
+            msg = str(error)
+            if "HTTP 503" in msg:
+                time.sleep(1.2)
+            if ("HTTP 404" in msg or "HTTP 503" in msg) and candidate_model != candidates[-1]:
+                continue
+            break
+
+    if response is None and use_api_key and _gemini_token_ready() and last_error and ("HTTP 503" in str(last_error) or "HTTP 404" in str(last_error)):
+        try:
+            oauth_headers = _gemini_auth_headers(use_api_key=False, json_content=True)
+            response = _request_json(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent",
+                headers=oauth_headers,
+                body=body,
+            )
+        except RuntimeError:
+            pass
+    if response is None:
+        raise last_error or RuntimeError("Gemini request failed.")
+    cand_list = response.get("candidates")
+    if not isinstance(cand_list, list) or not cand_list or not isinstance(cand_list[0], dict):
         raise RuntimeError("Gemini returned no usable candidate.")
-    content = candidates[0].get("content", {})
+    content = cand_list[0].get("content", {})
     parts = content.get("parts", []) if isinstance(content, dict) else []
     text = "\n".join(part["text"] for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str)).strip()
     if not text:
         raise RuntimeError("Gemini returned no text content.")
     return text
+
+
+def _generate_gemini(model: str, system_prompt: str, user_prompt: str, *, use_api_key: bool = False) -> str:
+    """@brief Generate JSON text through Gemini API with automatic fallback on 404/503 model deprecation or load spikes."""
+    body = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+    return _call_gemini_generate(model, body, use_api_key=use_api_key)
 
 
 def _generate_anthropic(model: str, system_prompt: str, user_prompt: str) -> str:
@@ -919,3 +977,58 @@ def generate_text(provider: str, model: str, system_prompt: str, user_prompt: st
     if provider == "ollama":
         return _generate_ollama(model, system_prompt, user_prompt)
     raise ValueError(f"Unsupported non-OpenAI provider: {provider}.")
+
+
+def generate_multimodal_description(
+    provider: str,
+    model: str,
+    prompt_text: str,
+    media_parts: list[dict[str, str]],
+) -> str:
+    """@brief Analyze attached images/PDFs with a vision-capable Gemini or Anthropic model.
+
+    @param provider Selected provider identifier.
+    @param model Selected model ID.
+    @param prompt_text Inspection prompt.
+    @param media_parts List of dicts with keys 'mime_type' and 'data_b64'.
+    @returns Concise factual visual/OCR description string.
+    """
+    from .config import get_secret
+
+    valid_parts = [p for p in media_parts if isinstance(p, dict) and p.get("mime_type") and p.get("data_b64")]
+    if not valid_parts:
+        return ""
+    if provider in {"gemini_api", "gemini_oauth"}:
+        parts: list[dict[str, Any]] = [{"text": prompt_text}]
+        for item in valid_parts[:6]:
+            parts.append({"inlineData": {"mimeType": item["mime_type"], "data": item["data_b64"]}})
+        body = {"contents": [{"role": "user", "parts": parts}]}
+        return _call_gemini_generate(model, body, use_api_key=(provider == "gemini_api"))
+    if provider == "anthropic_api":
+        api_key = get_secret("ANTHROPIC_API_KEY")
+        if not api_key:
+            return ""
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt_text}]
+        for item in valid_parts[:4]:
+            if item["mime_type"].startswith("image/"):
+                content.append(
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": item["mime_type"], "data": item["data_b64"]},
+                    }
+                )
+        if len(content) <= 1:
+            return ""
+        response = _request_json(
+            ANTHROPIC_MESSAGES_URL,
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+            body={"model": model, "max_tokens": 1200, "messages": [{"role": "user", "content": content}]},
+        )
+        blocks = response.get("content")
+        return "\n".join(b["text"] for b in blocks if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)).strip() if isinstance(blocks, list) else ""
+    if get_secret("GEMINI_API_KEY"):
+        parts = [{"text": prompt_text}]
+        for item in valid_parts[:6]:
+            parts.append({"inlineData": {"mimeType": item["mime_type"], "data": item["data_b64"]}})
+        return _call_gemini_generate("gemini-3-flash-preview", {"contents": [{"role": "user", "parts": parts}]}, use_api_key=True)
+    return ""
