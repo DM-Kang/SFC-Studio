@@ -474,8 +474,8 @@ def format_shorts_banner_text(title: str, hook: str = "", *, max_line_chars: int
 
 
 _CAPTION_HIGHLIGHT_RE = re.compile(
-    r"(?<!\\)(?<![A-Za-z0-9])\d+(?:[.,:~×x\-]\d+)*(?:\s?(?:%|cm|mm|km|ml|mL|g|kg|mg|시간|분|초|원|만|억|배속|배|가지|종|개))?"
-    r"|(?<![A-Za-z0-9가-힣\\])(?:100%|무료|특가|할인|국내산|국내 제조|국내 제작|천연|핵심|비결|주의|실수|반드시|지금 바로)(?![A-Za-z0-9가-힣])"
+    r"(?<!\\)(?<![A-Za-z0-9])\d+(?:[.,:~×x\-]\d+)*(?:\s?(?:%|cm|mm|km|ml|mL|g|kg|mg|시간|분|초|원|만|억|위|골|회|차전|라운드|배속|배|가지|종|개))?"
+    r"|(?<![A-Za-z0-9가-힣\\])(?:100%|무료|특가|할인|국내산|국내 제조|국내 제작|천연|핵심|비결|주의|실수|반드시|지금 바로|속보|충격|반전|대승|완승|완패|참패|퇴장|결승골|데뷔전|인터뷰|논란|최초|역대급|초비상|추락)(?![A-Za-z0-9가-힣])"
 )
 
 
@@ -612,161 +612,13 @@ def srt_to_shorts_ass(
     return output_path
 
 
-def _wrap_card_comment(text: str, max_chars: int = 24, max_lines: int = 2) -> str:
-    """@brief Wrap Korean fan comment text into at most max_lines readable lines for 9:16 reaction cards."""
-    cleaned = re.sub(r"[\r\n{}]+", " ", str(text or "")).strip()
-    if not cleaned:
-        return ""
-    words = cleaned.split()
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        cand = f"{current} {word}".strip() if current else word
-        if len(cand) <= max_chars or not current:
-            current = cand
-        else:
-            lines.append(current)
-            current = word
-            if len(lines) >= max_lines - 1:
-                break
-    remaining = words[sum(len(ln.split()) for ln in lines):]
-    if remaining and len(lines) < max_lines:
-        tail = " ".join(remaining)
-        if len(tail) > max_chars + 4:
-            tail = tail[: max_chars + 1].rstrip() + "..."
-        lines.append(tail)
-    elif current and len(lines) < max_lines and current not in lines:
-        lines.append(current[: max_chars + 4])
-    return r"\N".join(lines[:max_lines])
-
-
-def _build_fan_reaction_card_ass(
-    *,
-    title: str,
-    badge: str,
-    comments: list[dict[str, Any]],
-    source_footer: str = "",
-    width: int = 1080,
-    height: int = 1920,
-    font_name: str | None = None,
-) -> str:
-    """@brief Build a 9:16 ASS layout rendering 3 community comment cards inside the safe center frame."""
-    resolved_font = font_name or default_subtitle_font()
-    safe_badge = re.sub(r"[\r\n{}]+", " ", str(badge or "커뮤니티 팬 반응")).strip()[:40]
-    safe_title = re.sub(r"[\r\n{}]+", " ", str(title or "경기 후 팬 반응")).strip()[:52]
-    safe_footer = re.sub(r"[\r\n{}]+", " ", str(source_footer or "검색 기반 팬 반응 요약")).strip()[:64]
-
-    def _rect(x1: int, y1: int, x2: int, y2: int, r: int = 24) -> str:
-        k = int(round(r * 0.55))
-        return (
-            f"m {x1 + r} {y1} "
-            f"l {x2 - r} {y1} b {x2 - r + k} {y1} {x2} {y1 + r - k} {x2} {y1 + r} "
-            f"l {x2} {y2 - r} b {x2} {y2 - r + k} {x2 - r + k} {y2} {x2 - r} {y2} "
-            f"l {x1 + r} {y2} b {x1 + r - k} {y2} {x1} {y2 - r + k} {x1} {y2 - r} "
-            f"l {x1} {y1 + r} b {x1} {y1 + r - k} {x1 + r - k} {y1} {x1 + r} {y1}"
-        )
-
-    events: list[str] = [
-        # Soft radial backdrop card container inside safe center zone (y=410..1360)
-        f"Dialogue: 0,0:00:00.00,0:00:05.00,Shape,,0,0,0,,{{\\an7\\pos(0,0)\\1c&H291C14&\\1a&H10&\\bord0\\shad0\\p1}}{_rect(76, 405, 1004, 1345, 34)}{{\\p0}}",
-        f"Dialogue: 1,0:00:00.00,0:00:05.00,Shape,,0,0,0,,{{\\an7\\pos(0,0)\\1c&H523523&\\1a&H00&\\bord0\\shad0\\p1}}{_rect(108, 434, 460, 490, 24)}{{\\p0}}",
-        f"Dialogue: 2,0:00:00.00,0:00:05.00,CardBadge,,0,0,0,,{{\\an4\\pos(130,462)}}{safe_badge}",
-        f"Dialogue: 2,0:00:00.00,0:00:05.00,CardTitle,,0,0,0,,{{\\an7\\pos(108,508)}}{safe_title}",
-    ]
-
-    normalized_comments = [c for c in comments if isinstance(c, dict) and str(c.get("text") or "").strip()][:3]
-    y_cursor = 588
-    card_h = 206
-    card_gap = 22
-    for idx, cmt in enumerate(normalized_comments, 1):
-        author = re.sub(r"[\r\n{}]+", " ", str(cmt.get("author") or f"팬 {idx}")).strip()[:20]
-        likes = re.sub(r"[\r\n{}]+", " ", str(cmt.get("likes") or "추천")).strip()[:16]
-        body = _wrap_card_comment(str(cmt.get("text") or ""), max_chars=27, max_lines=2)
-        y2 = y_cursor + card_h
-        events.extend(
-            [
-                f"Dialogue: 1,0:00:00.00,0:00:05.00,Shape,,0,0,0,,{{\\an7\\pos(0,0)\\1c&H3B2A1E&\\1a&H00&\\bord2\\3c&H694B33&\\shad0\\p1}}{_rect(104, y_cursor, 976, y2, 24)}{{\\p0}}",
-                f"Dialogue: 2,0:00:00.00,0:00:05.00,CardAuthor,,0,0,0,,{{\\an7\\pos(134,{y_cursor + 24})}}{author}",
-                f"Dialogue: 2,0:00:00.00,0:00:05.00,CardLikes,,0,0,0,,{{\\an9\\pos(946,{y_cursor + 24})}}★ {likes}",
-                f"Dialogue: 2,0:00:00.00,0:00:05.00,CardBody,,0,0,0,,{{\\an7\\pos(134,{y_cursor + 74})}}{body}",
-            ]
-        )
-        y_cursor = y2 + card_gap
-
-    events.append(f"Dialogue: 2,0:00:00.00,0:00:05.00,CardFooter,,0,0,0,,{{\\an8\\pos({width // 2},1292)}}{safe_footer}")
-
-    return "\n".join(
-        [
-            "[Script Info]",
-            "ScriptType: v4.00+",
-            f"PlayResX: {width}",
-            f"PlayResY: {height}",
-            "WrapStyle: 2",
-            "ScaledBorderAndShadow: yes",
-            "",
-            "[V4+ Styles]",
-            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-            f"Style: Shape,{resolved_font},20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1",
-            f"Style: CardBadge,{resolved_font},28,&H00FFDB93,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,4,0,0,0,1",
-            f"Style: CardTitle,{resolved_font},42,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1",
-            f"Style: CardAuthor,{resolved_font},28,&H00FFD59E,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1",
-            f"Style: CardLikes,{resolved_font},26,&H0047C9FF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,9,0,0,0,1",
-            f"Style: CardBody,{resolved_font},38,&H00F8FAFC,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1",
-            f"Style: CardFooter,{resolved_font},24,&H00B8A394,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,8,0,0,0,1",
-            "",
-            "[Events]",
-            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-            *events,
-            "",
-        ]
-    )
-
-
-def render_fan_reaction_card_image(
-    output_path: Path,
-    *,
-    title: str,
-    comments: list[dict[str, Any]],
-    badge: str = "커뮤니티 · 팬 반응 TOP 3",
-    source_footer: str = "검색 기반 팬 반응 요약",
-    width: int = 1080,
-    height: int = 1920,
-) -> Path | None:
-    """@brief Render a clean 9:16 PNG card showing up to 3 summarized fan comments via FFmpeg + libass."""
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg or not comments:
-        return None
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    ass_path = output_path.with_suffix(".ass")
-    ass_doc = _build_fan_reaction_card_ass(
-        title=title,
-        badge=badge,
-        comments=comments,
-        source_footer=source_footer,
-        width=width,
-        height=height,
-    )
-    ass_path.write_text(ass_doc, encoding="utf-8")
-    command = [
-        ffmpeg,
-        "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        f"color=c=0x0E131E:s={width}x{height}:d=0.2",
-        "-vf",
-        build_subtitles_filter(ass_path.name),
-        "-frames:v",
-        "1",
-        output_path.name,
-    ]
-    try:
-        res = subprocess.run(command, cwd=output_path.parent, capture_output=True, text=True, timeout=30, check=False)
-        if res.returncode != 0 or not output_path.is_file():
-            return None
-        return output_path
-    finally:
-        ass_path.unlink(missing_ok=True)
+from .graphics.cards import (  # noqa: E402, F401
+    _build_fan_reaction_card_ass,
+    _build_headline_highlight_card_ass,
+    _wrap_card_comment,
+    render_fan_reaction_card_image,
+    render_headline_highlight_card_image,
+)
 
 
 def runway_generate_video(prompt: str, output_dir: Path, duration: int = 10) -> dict[str, Any]:
@@ -834,10 +686,10 @@ def download_https_file(url: str, destination: Path) -> int:
 
 
 def _build_tts_audio_filter(speed: float = 1.35, *, trim_silence: bool = True) -> str:
-    """@brief Build a pitch-preserving FFmpeg audio filter with dead-air trimming and atempo speedup."""
+    """@brief Build a pitch-preserving FFmpeg audio filter with tight dead-air trimming and atempo speedup."""
     filters: list[str] = []
     if trim_silence:
-        filters.append("silenceremove=start_periods=1:start_duration=0.03:start_threshold=-42dB:stop_periods=-1:stop_duration=0.14:stop_threshold=-40dB")
+        filters.append("silenceremove=start_periods=1:start_duration=0.02:start_threshold=-38dB:stop_periods=-1:stop_duration=0.09:stop_threshold=-36dB")
     clamped = max(0.75, min(2.0, float(speed or 1.35)))
     if abs(clamped - 1.0) >= 0.02:
         filters.append(f"atempo={clamped:.3f}")
@@ -1103,7 +955,9 @@ def generate_scene_synced_voiceover(
     cmd = [ffmpeg, "-y"]
     for p in part_paths:
         cmd.extend(["-i", str(p)])
-    cmd.extend(["-filter_complex", f"{concat_inputs}concat=n={len(part_paths)}:v=0:a=1[aout]", "-map", "[aout]", "-c:a", "libmp3lame", "-q:a", "3", str(staging_audio)])
+    # Apply broadcast vocal warmth & leveling (85Hz roll-off, 3.2kHz clarity, gentle compression) across concatenated scenes.
+    vocal_polish = "highpass=f=85,equalizer=f=3200:t=q:w=1.2:g=2.4,acompressor=threshold=-18dB:ratio=2.4:attack=10:release=85"
+    cmd.extend(["-filter_complex", f"{concat_inputs}concat=n={len(part_paths)}:v=0:a=1,{vocal_polish}[aout]", "-map", "[aout]", "-c:a", "libmp3lame", "-q:a", "3", str(staging_audio)])
     rc, detail = _run_ffmpeg(cmd, cwd=output_dir)
     if rc != 0 or not staging_audio.is_file():
         staging_audio.unlink(missing_ok=True)
@@ -1290,62 +1144,65 @@ def synthesize_sfx_and_mix_bgm(
     total_dur = max(5.0, min(120.0, sum(clean_durs) + 0.6 if clean_durs else 25.0))
     sfx_dir = output_path.parent / "sfx"
     sfx_dir.mkdir(parents=True, exist_ok=True)
+    impact_wav = sfx_dir / "impact.wav"
+    whoosh_wav = sfx_dir / "whoosh_air.wav"
+    shutter_wav = sfx_dir / "shutter.wav"
     pop_wav = sfx_dir / "pop.wav"
-    whoosh_wav = sfx_dir / "whoosh.wav"
 
-    # Synthesize crisp opening pop chime (90ms) and gentle transition swoop (240ms) once per item dir.
+    # Synthesize 4 distinct broadcast SFX samples (sub-bass impact, bandpass air whoosh, camera shutter, warm pop) once per item.
     try:
-        if not pop_wav.is_file():
-            rc_p, _ = _run_ffmpeg(
-                [
-                    ffmpeg,
-                    "-y",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    r"aevalsrc=0.42*exp(-26*t)*(sin(2*PI*784*t)+0.55*sin(2*PI*1175*t)):s=44100:d=0.10",
-                    str(pop_wav),
-                ],
-                cwd=sfx_dir,
-            )
-            if rc_p != 0:
-                return bgm_path
-        if not whoosh_wav.is_file():
-            rc_w, _ = _run_ffmpeg(
-                [
-                    ffmpeg,
-                    "-y",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    r"aevalsrc=0.35*exp(-14*abs(t-0.11))*(sin(2*PI*(240+520*t)*t)+0.4*sin(2*PI*(520+900*t)*t)):s=44100:d=0.24",
-                    "-af",
-                    "lowpass=f=2200,afade=t=in:st=0:d=0.04,afade=t=out:st=0.14:d=0.10",
-                    str(whoosh_wav),
-                ],
-                cwd=sfx_dir,
-            )
-            if rc_w != 0:
-                return bgm_path
+        sfx_specs = [
+            (
+                impact_wav,
+                "aevalsrc=0.52*exp(-9*t)*sin(2*PI*(95-55*min(t\\,0.18))*t)+0.25*exp(-45*t)*sin(2*PI*420*t):s=44100:d=0.35",
+                "lowpass=f=3200,afade=t=out:st=0.22:d=0.13",
+            ),
+            (
+                whoosh_wav,
+                "anoisesrc=color=pink:sample_rate=44100:d=0.26",
+                "bandpass=f=1100:w=900,volume=0.45,afade=t=in:st=0:d=0.09,afade=t=out:st=0.14:d=0.12",
+            ),
+            (
+                shutter_wav,
+                "aevalsrc=0.44*(exp(-90*t)+0.75*exp(-90*max(0\\,t-0.032)))*(sin(2*PI*1350*t)+0.6*sin(2*PI*2400*t)):s=44100:d=0.11",
+                "afade=t=out:st=0.07:d=0.04",
+            ),
+            (
+                pop_wav,
+                "aevalsrc=0.42*exp(-26*t)*(sin(2*PI*784*t)+0.55*sin(2*PI*1175*t)):s=44100:d=0.10",
+                None,
+            ),
+        ]
+        for wav_path, src_expr, af_chain in sfx_specs:
+            if not wav_path.is_file():
+                sfx_cmd = [ffmpeg, "-y", "-f", "lavfi", "-i", src_expr]
+                if af_chain:
+                    sfx_cmd.extend(["-af", af_chain])
+                sfx_cmd.append(str(wav_path))
+                rc_s, _ = _run_ffmpeg(sfx_cmd, cwd=sfx_dir)
+                if rc_s != 0:
+                    return bgm_path
     except Exception:
         return bgm_path
 
-    cues: list[tuple[int, str]] = [(40, pop_wav.name)]
+    cues: list[tuple[int, str]] = [(40, impact_wav.name)]
     cursor = 0.0
+    cycle_names = (whoosh_wav.name, shutter_wav.name, whoosh_wav.name, pop_wav.name)
     for idx, dur in enumerate(clean_durs[:-1]):
         cursor += dur
         if cursor >= 0.4 and cursor < total_dur - 0.35 and len(cues) < 8:
-            cues.append((int(round(cursor * 1000)), whoosh_wav.name if idx % 2 == 0 else pop_wav.name))
+            cues.append((int(round(cursor * 1000)), cycle_names[idx % len(cycle_names)]))
 
     # Mix BGM + delayed SFX events while preserving base BGM gain (normalize=0).
     staging = output_path.with_name(f"{output_path.stem}.mix{output_path.suffix}")
     cmd = [ffmpeg, "-y", "-stream_loop", "-1", "-t", f"{total_dur:.2f}", "-i", str(bgm_path.resolve())]
-    filter_parts: list[str] = ["[0:a:0]volume=1.0[a0]"]
+    filter_parts: list[str] = ["[0:a:0]aformat=sample_rates=44100:channel_layouts=stereo,volume=1.0[a0]"]
     mix_labels = ["[a0]"]
+    sfx_vols = {"impact.wav": 0.65, "whoosh_air.wav": 0.56, "shutter.wav": 0.62, "pop.wav": 0.64}
     for idx, (delay_ms, sfx_name) in enumerate(cues, 1):
         cmd.extend(["-i", str((sfx_dir / sfx_name).resolve())])
-        vol = 0.72 if sfx_name == "pop.wav" else 0.58
-        filter_parts.append(f"[{idx}:a:0]adelay={delay_ms}|{delay_ms},volume={vol:.2f}[s{idx}]")
+        vol = sfx_vols.get(sfx_name, 0.58)
+        filter_parts.append(f"[{idx}:a:0]aformat=sample_rates=44100:channel_layouts=stereo,adelay={delay_ms}|{delay_ms},volume={vol:.2f}[s{idx}]")
         mix_labels.append(f"[s{idx}]")
     filter_parts.append(f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=first:normalize=0[a_out]")
     cmd.extend(["-filter_complex", ";".join(filter_parts), "-map", "[a_out]", "-c:a", "libmp3lame", "-b:a", "128k", str(staging)])
@@ -2041,7 +1898,7 @@ def render_video(
     use_complex = bool(bgm_path or (loudnorm and audio_path))
     if use_complex:
         filter_parts: list[str] = []
-        v_label = "[0:v:0]"
+        v_label = "0:v:0"
         if captions_path:
             filter_parts.append(f"[0:v:0]{build_subtitles_filter(captions_path.name, subtitle_style)}[v_out]")
             v_label = "[v_out]"
@@ -2103,19 +1960,19 @@ def _probe_image_size(image_path: Path) -> tuple[int, int] | None:
 
 
 def _build_image_zoompan_expr(idx: int, frames: int, width: int, height: int, *, card_mode: bool) -> str:
-    """@brief Build varied per-scene zoompan expressions (push-in, L->R pan, pull-out, R->L pan)."""
+    """@brief Build varied per-scene zoompan expressions with snappy ease-out entry punch and directional drift."""
     span = max(1, frames - 1)
     if card_mode:
-        # Preserve card margins: alternate centered push-in and gentle pull-out so product graphics never clip.
+        # Preserve card margins while adding crisp 0.3s entry punch-in / smooth pull-out motion.
         if idx % 2 == 0:
-            z_expr = "min(zoom+0.0005,1.05)"
+            z_expr = f"if(lte(on\\,9)\\,1.07-0.05*(on/9)\\,min(1.06\\,1.02+0.04*(on-9)/{span}))"
         else:
-            z_expr = f"max(1.0,1.05-0.05*on/{span})"
+            z_expr = f"max(1.0\\,1.06-0.06*on/{span})"
         return f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps=30"
 
     mode = idx % 4
     if mode == 0:
-        return f"zoompan=z='min(zoom+0.0011,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps=30"
+        return f"zoompan=z='if(lte(on\\,10)\\,1.15-0.08*(on/10)\\,min(1.13\\,1.07+0.06*(on-10)/{span}))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps=30"
     if mode == 1:
         return f"zoompan=z='1.08':x='if(eq(on,0),0,min(iw-iw/zoom,(iw-iw/zoom)*on/{span}))':y='ih/2-(ih/zoom/2)':d={frames}:s={width}x{height}:fps=30"
     if mode == 2:
@@ -2143,20 +2000,28 @@ def build_multiscene_ffmpeg_command(
     """@brief Construct a deterministic FFmpeg filter_complex command to assemble multiple 9:16 scenes."""
     if not clips or len(clips) > 8:
         raise ValueError("Multi-scene assembly requires between 1 and 8 scene clips.")
-    if transition not in {"cut", "fade"}:
-        raise ValueError("Transition must be 'cut' or 'fade'.")
+    if transition not in {"cut", "fade", "dynamic"}:
+        raise ValueError("Transition must be 'cut', 'fade', or 'dynamic'.")
+    xfade_dur = (
+        max(0.08, min(0.20, float(transition_seconds if transition_seconds < 0.2 else 0.14)))
+        if transition == "dynamic"
+        else max(0.1, min(1.0, float(transition_seconds)))
+    )
+    use_xfade = transition in {"fade", "dynamic"} and len(clips) > 1
     command = [ffmpeg_bin, "-y"]
     filter_parts: list[str] = []
     durations: list[float] = []
+    grade_fx = "eq=contrast=1.06:saturation=1.09,unsharp=5:5:0.42:5:5:0.0,vignette=PI/6"
     for idx, clip in enumerate(clips):
         dur = max(1.0, min(30.0, float(clip.get("duration_seconds") or 5.0)))
         durations.append(dur)
+        render_dur = dur + xfade_dur if (use_xfade and idx < len(clips) - 1) else dur
         rel_path = str(clip["relative_path"]).replace("\\", "/")
         if clip.get("media_type") == "image":
             # Single-frame input only: zoompan already expands 1 input frame into `d` output frames,
             # whereas `-loop 1` causes zoompan to multiply frames (e.g. 150 * 180) and hang FFmpeg.
             command.extend(["-i", rel_path])
-            frames = max(30, round(dur * 30))
+            frames = max(30, round(render_dur * 30))
             card_mode = clip.get("aspect_fit") == "card"
             zp = _build_image_zoompan_expr(idx, frames, width, height, card_mode=card_mode)
             if card_mode:
@@ -2165,34 +2030,39 @@ def build_multiscene_ffmpeg_command(
                 filter_parts.append(
                     f"[{idx}:v:0]setsar=1,split=2[bg{idx}][fg{idx}];"
                     f"[bg{idx}]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                    f"crop={width}:{height},boxblur=24:4,eq=brightness=-0.14,format=yuv420p[bgb{idx}];"
-                    f"[fg{idx}]scale={card_w}:{card_h}:force_original_aspect_ratio=decrease,format=yuva420p[fgs{idx}];"
-                    f"[bgb{idx}][fgs{idx}]overlay=(W-w)/2:(H-h)/2,{zp},"
-                    f"trim=duration={dur:.2f},setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{idx}]"
+                    f"crop={width}:{height},boxblur=24:4,eq=brightness=-0.16,format=yuv420p[bgb{idx}];"
+                    f"[fg{idx}]scale={card_w}:{card_h}:force_original_aspect_ratio=decrease,"
+                    f"eq=contrast=1.05:saturation=1.08,unsharp=5:5:0.45:5:5:0.0,format=yuva420p[fgs{idx}];"
+                    f"[bgb{idx}][fgs{idx}]overlay=(W-w)/2:(H-h)/2,{zp},vignette=PI/6,"
+                    f"trim=duration={render_dur:.2f},setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{idx}]"
                 )
             else:
                 filter_parts.append(
                     f"[{idx}:v:0]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                    f"crop={width}:{height},{zp},"
-                    f"trim=duration={dur:.2f},setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{idx}]"
+                    f"crop={width}:{height},{zp},{grade_fx},"
+                    f"trim=duration={render_dur:.2f},setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v{idx}]"
                 )
         else:
-            command.extend(["-stream_loop", "-1", "-t", f"{dur:.2f}", "-i", rel_path])
+            command.extend(["-stream_loop", "-1", "-t", f"{render_dur:.2f}", "-i", rel_path])
             filter_parts.append(
                 f"[{idx}:v:0]scale={width}:{height}:force_original_aspect_ratio=increase,"
-                f"crop={width}:{height},eq=contrast=1.04:saturation=1.08,setpts=PTS-STARTPTS,setsar=1,fps=30,format=yuv420p[v{idx}]"
+                f"crop={width}:{height},{grade_fx},setpts=PTS-STARTPTS,setsar=1,fps=30,format=yuv420p[v{idx}]"
             )
 
     if len(clips) == 1:
         video_label = "[v0]"
-    elif transition == "fade":
-        fade = max(0.1, min(1.0, float(transition_seconds)))
+    elif transition in {"fade", "dynamic"}:
         current_label = "[v0]"
         timeline = durations[0]
+        dyn_styles = ("smoothleft", "fadewhite", "wipeleft", "dissolve")
         for idx in range(1, len(clips)):
-            offset = max(0.1, timeline - fade)
+            offset = max(0.1, timeline - xfade_dur) if transition == "fade" else max(0.1, timeline)
+            if transition == "fade" and idx < len(clips):
+                # For "fade", render_dur already includes +xfade_dur so offset stays cleanly at timeline.
+                offset = max(0.1, timeline)
             next_label = f"[vx{idx}]"
-            filter_parts.append(f"{current_label}[v{idx}]xfade=transition=fade:duration={fade:.2f}:offset={offset:.2f}{next_label}")
+            xfade_kind = dyn_styles[(idx - 1) % len(dyn_styles)] if transition == "dynamic" else "fade"
+            filter_parts.append(f"{current_label}[v{idx}]xfade=transition={xfade_kind}:duration={xfade_dur:.2f}:offset={offset:.2f}{next_label}")
             current_label = next_label
             timeline = offset + durations[idx]
         video_label = current_label

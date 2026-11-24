@@ -41,6 +41,7 @@ from .media import (
     normalize_subtitle_style,
     probe_video,
     render_fan_reaction_card_image,
+    render_headline_highlight_card_image,
     render_video,
     retime_audio_file,
     retime_video_file,
@@ -81,6 +82,25 @@ from .resources import (
     supplement_research_images,
 )
 from .store import Store
+from .pipeline.rights import (
+    _material_rights_record,
+    _merge_supporting_rights_record,
+    confirm_item_rights_for_approval,
+    final_video_rights_record,
+    replace_final_video_rights_record,
+)
+from .pipeline.visual_match import (
+    _FAN_REACTION_TOKENS,
+    _NEWS_SPORTS_KEYWORDS,
+    _auto_select_scene_clips,
+    _build_english_ai_visual_prompt,
+    _collect_reference_product_images,
+    _editorial_image_priority_score,
+    _is_fan_reaction_scene,
+    _is_news_or_sports_topic,
+    _keyword_overlap_score,
+    _score_material_for_scene,
+)
 from .usage import UsageLedger, merge_usage_stats, track_usage_scope
 
 
@@ -179,35 +199,6 @@ def _prepare_attachments_and_sources(store: Store, item_id: str, web_sources: li
             item = store.update_payload(item_id, {"attachments": updated_atts})
     att_sources = attachments_to_citable_sources(item.get("attachments"))
     return item, [*att_sources, *web_sources]
-
-
-def final_video_rights_record(source: str) -> dict[str, Any]:
-    """@brief Create an unresolved rights record for a newly replaced final video."""
-    return {
-        "id": str(uuid4()),
-        "asset_name": "Final video and all included audio, visuals, and voices",
-        "asset_type": "final_video",
-        "source_description": f"Generated or uploaded via {source}"[:300],
-        "source_url": "",
-        "license_name": "",
-        "license_url": "",
-        "rights_basis": "",
-        "attribution": "",
-        "included": True,
-        "rights_status": "unverified",
-    }
-
-
-def replace_final_video_rights_record(existing: Any, source: str) -> list[dict[str, Any]]:
-    """@brief Preserve supporting-source records while resetting the replaced final video's rights."""
-    supporting_assets = []
-    if isinstance(existing, list):
-        supporting_assets = [
-            dict(asset)
-            for asset in existing
-            if isinstance(asset, dict) and asset.get("asset_type") != "final_video"
-        ]
-    return [*supporting_assets, final_video_rights_record(source)]
 
 
 def run_planning(store: Store, item_id: str) -> str:
@@ -705,38 +696,6 @@ def run_plan_autofix(store: Store, item_id: str) -> dict[str, Any]:
     return store.get_item(item_id)
 
 
-def _merge_supporting_rights_record(existing: Any, candidate: dict[str, Any]) -> list[dict[str, Any]]:
-    """@brief Append a supporting asset rights record once based on source URL or asset name."""
-    records = [dict(entry) for entry in existing if isinstance(entry, dict)] if isinstance(existing, list) else []
-    source_url = str(candidate.get("source_url") or "")
-    name = str(candidate.get("asset_name") or "")
-    for entry in records:
-        if source_url and entry.get("source_url") == source_url:
-            return records
-        if not source_url and name and entry.get("asset_name") == name and entry.get("asset_type") == candidate.get("asset_type"):
-            return records
-    records.append({"id": str(uuid4()), **candidate})
-    return records
-
-
-def _material_rights_record(candidate: dict[str, Any], fallback_id: str) -> dict[str, Any]:
-    """@brief Build a normalized unverified rights-ledger entry for a stock material clip."""
-    provider_name = str(candidate.get("provider") or "Stock").strip() or "Stock"
-    default_license_url = "https://pixabay.com/service/license-summary/" if provider_name.lower() == "pixabay" else "https://www.pexels.com/license/"
-    return {
-        "asset_name": candidate.get("title") or f"{provider_name} {fallback_id}",
-        "asset_type": "video",
-        "source_description": f"{candidate.get('author') or 'Unknown'} · {provider_name}",
-        "source_url": candidate.get("source_url") or "",
-        "license_name": f"{provider_name} License · verify current terms",
-        "license_url": candidate.get("license_url") or default_license_url,
-        "rights_basis": "",
-        "attribution": candidate.get("author") or "",
-        "included": True,
-        "rights_status": "unverified",
-    }
-
-
 def download_stock_material_clip(store: Store, item_id: str, provider_id: str) -> dict[str, Any]:
     """@brief Download a stock candidate video locally for multi-scene assembly."""
     item = store.get_item(item_id)
@@ -1115,64 +1074,6 @@ def save_thumbnail_from_video(store: Store, item_id: str, timestamp_seconds: flo
     return store.update_payload(item_id, {"assets": assets})
 
 
-def _keyword_overlap_score(scene: dict[str, Any], material: dict[str, Any]) -> int:
-    """@brief Measure token overlap between scene visual query and candidate clip metadata."""
-    q_tokens = {tok.lower() for tok in str(scene.get("visual_query") or "").replace(",", " ").split() if len(tok) >= 2 and tok.isascii()}
-    if not q_tokens:
-        return 0
-    haystack = " ".join(
-        str(material.get(field) or "") for field in ("tags", "title")
-    ).lower().replace(",", " ").replace("·", " ")
-    m_tokens = {tok for tok in haystack.split() if len(tok) >= 2}
-    return len(q_tokens & m_tokens)
-
-
-def _score_material_for_scene(scene: dict[str, Any], material: dict[str, Any], target_dur: float) -> tuple[int, int]:
-    """@brief Return (overlap_count, total_quality_score) for ranking a stock clip candidate."""
-    overlap = _keyword_overlap_score(scene, material)
-    w = int(material.get("width") or 0)
-    h = int(material.get("height") or 0)
-    portrait = 50 if h > w > 0 else 0
-    hd = 20 if h >= 1080 else (10 if h >= 720 else 0)
-    dur_ok = 10 if int(material.get("duration_seconds") or 0) >= target_dur else 0
-    scene_match = 100 if str(material.get("scene_id") or "") == str(scene.get("id") or "") else 0
-    return overlap, (overlap * 200) + scene_match + portrait + hd + dur_ok
-
-
-def _auto_select_scene_clips(
-    scenes: list[dict[str, Any]],
-    materials: list[dict[str, Any]],
-    target_duration: int | float,
-) -> list[dict[str, Any]]:
-    """@brief Automatically match the highest-scoring unused stock video clip to each planned scene."""
-    downloadable = [m for m in materials if isinstance(m, dict) and m.get("provider_id") and m.get("download_url")]
-    if not downloadable:
-        return []
-    bounded_scenes = [s for s in scenes if isinstance(s, dict)][:8] or [{"id": "scene-1"}]
-    total = max(4.0, min(30.0, float(target_duration or 20)))
-    default_dur = round(max(2.0, min(30.0, total / len(bounded_scenes))), 1)
-
-    selected: list[dict[str, Any]] = []
-    used_ids: set[str] = set()
-    for scene in bounded_scenes:
-        sid = str(scene.get("id") or "")
-        raw_dur = scene.get("duration_seconds")
-        dur = round(max(1.0, min(30.0, float(raw_dur))), 1) if isinstance(raw_dur, (int, float)) and not isinstance(raw_dur, bool) else default_dur
-        scene_matches = [m for m in downloadable if str(m.get("scene_id") or "") == sid]
-        pool = (
-            [m for m in scene_matches if str(m["provider_id"]) not in used_ids]
-            or scene_matches
-            or [m for m in downloadable if str(m["provider_id"]) not in used_ids]
-            or downloadable
-        )
-        ranked = sorted(pool, key=lambda cand: _score_material_for_scene(scene, cand, dur)[1], reverse=True)
-        chosen = ranked[0]
-        pid = str(chosen["provider_id"])
-        used_ids.add(pid)
-        selected.append({"source_kind": "stock", "provider_id": pid, "duration_seconds": dur})
-    return selected
-
-
 def _assign_attached_media_to_scenes(
     folder: Path,
     scenes: list[dict[str, Any]],
@@ -1262,74 +1163,6 @@ def _assign_attached_media_to_scenes(
     return slots
 
 
-_NEWS_SPORTS_KEYWORDS = (
-    "뉴스",
-    "속보",
-    "시사",
-    "경기",
-    "축구",
-    "야구",
-    "농구",
-    "프리미어",
-    "챔피언스",
-    "epl",
-    "맨유",
-    "맨체스터",
-    "리버풀",
-    "아스날",
-    "토트넘",
-    "레알",
-    "바르셀로나",
-    "인터뷰",
-    "감독",
-    "선수",
-    "스코어",
-    "하이라이트",
-    "news",
-    "match",
-    "premier league",
-    "interview",
-    "manager",
-    "football",
-    "soccer",
-)
-
-
-def _is_news_or_sports_topic(item: dict[str, Any]) -> bool:
-    """@brief Detect news, current events, or sports-match topics that benefit from real editorial photos."""
-    haystack = " ".join(
-        [
-            str(item.get("topic") or ""),
-            str(item.get("audience") or ""),
-            str(item.get("tone") or ""),
-            str(item.get("source_notes") or "")[:600],
-            str((item.get("style_template_snapshot") or {}).get("category") or ""),
-        ]
-    ).lower()
-    return any(tok in haystack for tok in _NEWS_SPORTS_KEYWORDS)
-
-
-def _build_english_ai_visual_prompt(
-    scene: dict[str, Any],
-    *,
-    visual_bible: str = "",
-    fallback_topic: str = "",
-) -> str:
-    """@brief Construct a purely English AI visual prompt combining scene choreography with cross-scene continuity."""
-    raw_scene_prompt = str(scene.get("ai_visual_prompt") or scene.get("visual_query") or fallback_topic or "").strip()
-    ascii_scene = re.sub(r"\s{2,}", " ", re.sub(r"[^\x20-\x7e]+", " ", raw_scene_prompt)).strip()
-    ascii_bible = re.sub(r"\s{2,}", " ", re.sub(r"[^\x20-\x7e]+", " ", str(visual_bible or ""))).strip()
-    parts: list[str] = []
-    if ascii_bible:
-        parts.append(f"Visual continuity: {ascii_bible[:320]}")
-    if ascii_scene:
-        parts.append(f"Scene framing: {ascii_scene[:320]}")
-    else:
-        parts.append("Vertical 9:16 editorial photography with cinematic lighting")
-    parts.append("Strict exclusions: NO random unrelated league or K-League/FC Seoul crests, NO text overlays, keep kit colors uniform.")
-    return ". ".join(parts)
-
-
 def _collect_news_reference_images(
     store: Store,
     item_id: str,
@@ -1352,7 +1185,11 @@ def _collect_news_reference_images(
     rights_assets = list(item.get("rights_assets") or [])
     known_urls = {str(a.get("source_url") or "") for a in rights_assets if isinstance(a, dict)}
 
-    for idx, cand in enumerate(raw_images[:20], 1):
+    ranked_images = sorted(
+        list(enumerate(raw_images[:20], 1)),
+        key=lambda pair: (-_editorial_image_priority_score(pair[1]), pair[0]),
+    )
+    for idx, cand in ranked_images:
         if len(downloaded) >= max_images:
             break
         if isinstance(cand, dict):
@@ -1408,29 +1245,6 @@ def _collect_news_reference_images(
     if downloaded:
         store.update_payload(item_id, {"rights_assets": rights_assets})
     return downloaded
-
-
-_FAN_REACTION_TOKENS = (
-    "팬 반응",
-    "팬들 반응",
-    "커뮤니티",
-    "댓글",
-    "베스트글",
-    "베스트 댓글",
-    "에펨",
-    "fmkorea",
-    "네티즌",
-    "여론",
-    "fan reaction",
-    "comments",
-)
-
-
-def _is_fan_reaction_scene(scene: dict[str, Any] | Any) -> bool:
-    if not isinstance(scene, dict):
-        return False
-    text = f"{scene.get('narration') or ''} {scene.get('visual_query') or ''}".lower()
-    return any(tok in text for tok in _FAN_REACTION_TOKENS)
 
 
 def _enrich_research_from_feedback(
@@ -1615,6 +1429,62 @@ def _build_fan_reaction_scene_cards(
     return cards
 
 
+def _build_headline_highlight_card_for_scene(
+    folder: Path,
+    scenes: list[dict[str, Any]],
+    research_sources: list[dict[str, Any]],
+    scene_slots: list[dict[str, Any] | None],
+    item: dict[str, Any],
+    *,
+    reuse_existing: bool = False,
+) -> dict[int, dict[str, Any]]:
+    """@brief Render 1 authentic yellow-highlighter news clipping card for a key score/stat scene in news_photos mode."""
+    cards: dict[int, dict[str, Any]] = {}
+    fetched_sources = [
+        s
+        for s in (research_sources or [])
+        if isinstance(s, dict) and s.get("domain") and (s.get("title") or s.get("content")) and "reaction-summary" not in str(s.get("domain") or "")
+    ]
+    if len(scenes) < 4 or not fetched_sources:
+        return cards
+    # Pick one factual middle scene (prefer scene 2 or scene 3) to break up static photo monotony with journalism motion graphics.
+    target_idx = next(
+        (i for i in (1, 2) if i < len(scene_slots) and scene_slots[i] is None and not _is_fan_reaction_scene(scenes[i])),
+        None,
+    )
+    if target_idx is None:
+        return cards
+    sc = scenes[target_idx] if isinstance(scenes[target_idx], dict) else {}
+    quote_text = str(sc.get("narration") or "").strip()
+    if not quote_text:
+        return cards
+    best_src = fetched_sources[0]
+    src_domain = str(best_src.get("domain") or "뉴스 기사").removeprefix("www.")
+    headline = str(best_src.get("title") or item.get("topic") or "주요 경기 보도").strip()
+    per_dur = round(max(2.5, min(30.0, float((item.get("plan") or {}).get("duration_seconds") or 24) / max(1, len(scenes)))), 1)
+    sc_dur = sc.get("duration_seconds")
+    slot_dur = round(max(2.5, min(30.0, float(sc_dur))), 1) if isinstance(sc_dur, (int, float)) else per_dur
+    out_png = folder / "clips" / f"headline_card_{target_idx + 1}.png"
+    if not (reuse_existing and out_png.is_file() and out_png.stat().st_size > 4096):
+        rendered = render_headline_highlight_card_image(
+            out_png,
+            source_domain=src_domain,
+            headline=headline,
+            highlight_quote=quote_text,
+            subtitle_hint=f"출처: {src_domain} 기사 핵심 요약",
+        )
+        if not rendered or not rendered.is_file():
+            return cards
+    cards[target_idx] = {
+        "source_kind": "uploaded",
+        "filename": out_png.name,
+        "duration_seconds": slot_dur,
+        "from_attachment": True,
+        "source_credit": src_domain,
+    }
+    return cards
+
+
 def _assign_news_photos_to_scenes(
     scenes: list[dict[str, Any]],
     news_media: list[dict[str, Any]],
@@ -1699,27 +1569,6 @@ def _assign_news_photos_to_scenes(
     return assignments
 
 
-def _collect_reference_product_images(folder: Path, attachments: list[dict[str, Any]] | None) -> list[Path]:
-    """@brief Collect up to 2 included image attachment paths to anchor AI-generated scenes to the real product."""
-    if not isinstance(attachments, list):
-        return []
-    clips_dir = (folder / "clips").resolve()
-    refs: list[Path] = []
-    for att in attachments:
-        if (
-            isinstance(att, dict)
-            and att.get("included", True) is not False
-            and att.get("kind") == "image"
-            and att.get("stored_name")
-        ):
-            candidate = (clips_dir / Path(str(att["stored_name"])).name).resolve()
-            if candidate.parent == clips_dir and candidate.is_file():
-                refs.append(candidate)
-                if len(refs) >= 2:
-                    break
-    return refs
-
-
 def _ai_rerank_and_fill_visuals(
     folder: Path,
     scenes: list[dict[str, Any]],
@@ -1798,29 +1647,6 @@ def _ai_rerank_and_fill_visuals(
                         "duration_seconds": entry.get("duration_seconds") or 4.0,
                     }
     return updated
-
-
-def confirm_item_rights_for_approval(item: dict[str, Any]) -> list[dict[str, Any]]:
-    """@brief Mark included production and stock rights entries as operator-confirmed during approval."""
-    existing = item.get("rights_assets")
-    confirmed: list[dict[str, Any]] = []
-    if isinstance(existing, list):
-        for asset in existing:
-            if not isinstance(asset, dict):
-                continue
-            entry = dict(asset)
-            if entry.get("included", True) and entry.get("rights_status") != "cleared":
-                entry["rights_status"] = "cleared"
-                if not str(entry.get("rights_basis") or "").strip():
-                    basis = str(entry.get("license_name") or entry.get("source_description") or "Operator verified final production and source rights on approval").strip()
-                    entry["rights_basis"] = basis[:500]
-            confirmed.append(entry)
-    if not any(a.get("included", True) for a in confirmed):
-        record = final_video_rights_record("autopilot production")
-        record["rights_status"] = "cleared"
-        record["rights_basis"] = "Operator confirmed final production and source rights upon final approval"
-        confirmed.append(record)
-    return confirmed
 
 
 def record_rejection_feedback(store: Store, item_id: str, feedback: str) -> dict[str, Any]:
@@ -2050,6 +1876,19 @@ def _run_autopilot_pipeline_inner(
     for card_idx, card_slot in fan_cards.items():
         if card_idx < len(scene_slots) and scene_slots[card_idx] is None:
             scene_slots[card_idx] = card_slot
+
+    if visual_mode == "news_photos":
+        headline_cards = _build_headline_highlight_card_for_scene(
+            folder,
+            scenes,
+            research_sources,
+            scene_slots,
+            item,
+            reuse_existing=reuse_visuals,
+        )
+        for h_idx, h_slot in headline_cards.items():
+            if h_idx < len(scene_slots) and scene_slots[h_idx] is None:
+                scene_slots[h_idx] = h_slot
 
     if (
         (visual_mode == "news_photos" or (is_news_sports and visual_mode != "stock"))
@@ -2285,11 +2124,12 @@ def _run_autopilot_pipeline_inner(
                 pass
         elif cleaned_feedback and any(tok in cleaned_feedback for tok in ("더 빠르", "템포 빠르", "성격 급")):
             tts_speed = max(tts_speed, 1.45)
+        effective_transition = "dynamic" if (len(scene_inputs) > 1 and active_transition != "fade") else (active_transition if len(scene_inputs) > 1 else "cut")
         run_scene_assembly(
             store,
             item_id,
             scene_inputs,
-            transition=active_transition if len(scene_inputs) > 1 else "cut",
+            transition=effective_transition,
             tts_provider=tts_mode,
             tts_voice=str(item.get("tts_voice") or ""),
             tts_speed=tts_speed,

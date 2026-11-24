@@ -698,6 +698,36 @@ class KoreanNumbersTests(unittest.TestCase):
         self.assertIn("video", merged["latest_run"]["by_category"])
         self.assertIn("audio_bgm", merged["latest_run"]["by_category"])
 
+    def test_headline_highlight_card_and_dynamic_xfade_timing(self) -> None:
+        from shortform_studio.media import _build_headline_highlight_card_ass, build_multiscene_ffmpeg_command
+        from shortform_studio.workflow import _editorial_image_priority_score
+
+        ass_doc = _build_headline_highlight_card_ass(
+            source_domain="hani.co.kr",
+            headline="리버풀, 안필드서 맨유에 4-0 대승",
+            highlight_quote="전반 8분 퇴장 하나로 승부가 완전히 갈렸습니다.",
+        )
+        self.assertIn("HANI.CO.KR", ass_doc)
+        self.assertIn("7DF0FE", ass_doc)
+        self.assertIn("전반 8분 퇴장", ass_doc)
+
+        cmd = build_multiscene_ffmpeg_command(
+            "ffmpeg",
+            [
+                {"relative_path": "a.jpg", "duration_seconds": 3.0, "media_type": "image"},
+                {"relative_path": "b.jpg", "duration_seconds": 3.0, "media_type": "image"},
+            ],
+            "out.mp4",
+            transition="dynamic",
+        )
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("xfade=transition=smoothleft:duration=0.14:offset=3.00", fc)
+        self.assertIn("vignette=PI/6", fc)
+        self.assertGreater(
+            _editorial_image_priority_score({"url": "https://flexible.img.hani.co.kr/flexible/normal/1200/a.jpg"}),
+            _editorial_image_priority_score({"url": "https://menu.mt.co.kr/cdn-cgi/image/w=460,f=avif/a.jpg"}),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
