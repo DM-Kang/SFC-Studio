@@ -23,6 +23,25 @@ MAX_EXTRACTED_SOURCES = 4
 MAX_SOURCE_CONTENT_CHARS = 8_000
 MAX_SCENE_SEARCHES = 5
 MAX_VIDEOS_PER_SCENE = 3
+MAX_RESEARCH_IMAGES = 16
+MAX_NEWS_IMAGE_BYTES = 10_000_000
+_BAD_IMAGE_URL_TOKENS = (
+    "/ad/",
+    "/ads/",
+    "doubleclick",
+    "facebook.com/tr",
+    "pixel",
+    "favicon",
+    "sprite",
+    "spacer",
+    "logo_small",
+    "share.",
+    "icon",
+    "avatar",
+    "emoji",
+    ".svg",
+    ".gif",
+)
 
 
 def _request_json(url: str, *, headers: dict[str, str], body: dict[str, Any], timeout: int = 30) -> dict[str, Any]:
@@ -40,7 +59,16 @@ def _request_json(url: str, *, headers: dict[str, str], body: dict[str, Any], ti
         raise RuntimeError(f"Resource provider returned HTTP {error.code}.") from None
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         raise RuntimeError(f"Resource provider request failed: {type(error).__name__}.") from None
-    return _decode_json_response(encoded)
+    decoded = _decode_json_response(encoded)
+    from .usage import record_tavily_usage
+
+    if url == TAVILY_SEARCH_URL:
+        record_tavily_usage("search", depth=str(body.get("search_depth") or "basic"))
+    elif url == TAVILY_EXTRACT_URL:
+        res_list = decoded.get("results") if isinstance(decoded.get("results"), list) else []
+        ok_count = max(1, len(res_list)) if res_list else max(1, len(body.get("urls") or []))
+        record_tavily_usage("extract", depth=str(body.get("extract_depth") or "basic"), urls_count=ok_count)
+    return decoded
 
 
 def _get_json(url: str, *, headers: dict[str, str] | None = None, timeout: int = 30) -> dict[str, Any]:
@@ -54,7 +82,16 @@ def _get_json(url: str, *, headers: dict[str, str] | None = None, timeout: int =
         raise RuntimeError(f"Resource provider returned HTTP {error.code}.") from None
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         raise RuntimeError(f"Resource provider request failed: {type(error).__name__}.") from None
-    return _decode_json_response(encoded)
+    decoded = _decode_json_response(encoded)
+    from .usage import record_tavily_usage
+
+    if url == TAVILY_SEARCH_URL:
+        record_tavily_usage("search", depth=str(body.get("search_depth") or "basic"))
+    elif url == TAVILY_EXTRACT_URL:
+        res_list = decoded.get("results") if isinstance(decoded.get("results"), list) else []
+        ok_count = max(1, len(res_list)) if res_list else max(1, len(body.get("urls") or []))
+        record_tavily_usage("extract", depth=str(body.get("extract_depth") or "basic"), urls_count=ok_count)
+    return decoded
 
 
 def _decode_json_response(encoded: bytes) -> dict[str, Any]:
@@ -111,8 +148,18 @@ def _urls_in_notes(notes: str) -> list[str]:
     return urls
 
 
+def _is_usable_editorial_image_url(url: str | None) -> bool:
+    """@brief Reject tracker pixels, SVGs, share icons, and non-editorial thumbnail URLs."""
+    if not url:
+        return False
+    lowered = url.lower()
+    if any(tok in lowered for tok in _BAD_IMAGE_URL_TOKENS):
+        return False
+    return True
+
+
 def collect_web_research(brief: dict[str, Any], api_key: str) -> dict[str, Any]:
-    """@brief Search a topic and extract a bounded set of source pages for evidence."""
+    """@brief Search a topic and extract source pages plus editorial candidate images for visual grounding."""
     if not api_key:
         raise ValueError("Configure TAVILY_API_KEY before collecting web research.")
     topic = str(brief.get("topic", "")).strip()[:500]
@@ -132,6 +179,8 @@ def collect_web_research(brief: dict[str, Any], api_key: str) -> dict[str, Any]:
             "include_answer": False,
             "include_raw_content": False,
             "include_published_date": True,
+            "include_images": True,
+            "include_image_descriptions": True,
         },
     )
     candidates: list[dict[str, Any]] = []
@@ -178,6 +227,36 @@ def collect_web_research(brief: dict[str, Any], api_key: str) -> dict[str, Any]:
         # Search results remain visible, but snippets are intentionally not promoted to evidence.
         extraction_error = str(error)
 
+    image_candidates: list[dict[str, str]] = []
+    seen_img_urls: set[str] = set()
+    for raw_img in search.get("images", []) if isinstance(search.get("images"), list) else []:
+        if isinstance(raw_img, dict):
+            img_url = _safe_public_url(raw_img.get("url"))
+            desc = str(raw_img.get("description") or "").strip()[:240]
+        elif isinstance(raw_img, str):
+            img_url = _safe_public_url(raw_img)
+            desc = ""
+        else:
+            continue
+        if img_url and _is_usable_editorial_image_url(img_url) and img_url not in seen_img_urls:
+            seen_img_urls.add(img_url)
+            image_candidates.append({"url": img_url, "description": desc})
+            if len(image_candidates) >= MAX_RESEARCH_IMAGES:
+                break
+
+    if len(image_candidates) < MAX_RESEARCH_IMAGES:
+        for src_url, md_text in extracted_by_url.items():
+            for match in re.finditer(r"!\[([^\]]{0,140})\]\((https://[^)\s]+)\)", md_text):
+                alt, raw_link = match.group(1).strip(), match.group(2).strip()
+                img_url = _safe_public_url(raw_link)
+                if img_url and _is_usable_editorial_image_url(img_url) and img_url not in seen_img_urls:
+                    seen_img_urls.add(img_url)
+                    image_candidates.append({"url": img_url, "description": alt[:240], "source_url": src_url})
+                    if len(image_candidates) >= MAX_RESEARCH_IMAGES:
+                        break
+            if len(image_candidates) >= MAX_RESEARCH_IMAGES:
+                break
+
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     sources: list[dict[str, Any]] = []
     for index, url in enumerate(ordered_urls, 1):
@@ -205,9 +284,280 @@ def collect_web_research(brief: dict[str, Any], api_key: str) -> dict[str, Any]:
         "query": topic,
         "collected_at": now,
         "sources": sources,
+        "images": image_candidates,
         "extraction_error": extraction_error,
         "evidence_source_ids": [source["id"] for source in sources if source["status"] == "fetched"],
     }
+
+
+def supplement_research_images(brief: dict[str, Any], research: dict[str, Any] | None, api_key: str) -> dict[str, Any]:
+    """@brief Fetch additional English/international editorial news images when initial Korean search yields few photos."""
+    base = dict(research) if isinstance(research, dict) else {"sources": [], "images": []}
+    existing = list(base.get("images") or [])
+    if len(existing) >= 4 or not api_key:
+        return base
+    raw_query = f"{brief.get('topic') or ''} {brief.get('source_notes') or ''}"[:400]
+    tokens = [w for w in re.findall(r"[A-Za-z0-9\-]{2,}", raw_query) if not w.isdigit()][:6]
+    # Also include 2-word core Hangul tokens translated/kept if ASCII scarce
+    img_query = " ".join(tokens) if len(tokens) >= 2 else str(brief.get("topic") or "").strip()[:120]
+    if not img_query:
+        return base
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        search = _request_json(
+            TAVILY_SEARCH_URL,
+            headers=headers,
+            body={
+                "query": img_query,
+                "search_depth": "basic",
+                "max_results": 5,
+                "topic": "general",
+                "include_answer": False,
+                "include_images": True,
+                "include_image_descriptions": True,
+            },
+            timeout=20,
+        )
+    except Exception:
+        return base
+    seen = {str(e.get("url") or "") for e in existing if isinstance(e, dict)}
+    for raw_img in search.get("images", []) if isinstance(search.get("images"), list) else []:
+        if isinstance(raw_img, dict):
+            img_url = _safe_public_url(raw_img.get("url"))
+            desc = str(raw_img.get("description") or "").strip()[:240]
+        elif isinstance(raw_img, str):
+            img_url = _safe_public_url(raw_img)
+            desc = ""
+        else:
+            continue
+        if img_url and _is_usable_editorial_image_url(img_url) and img_url not in seen:
+            seen.add(img_url)
+            existing.append({"url": img_url, "description": desc})
+            if len(existing) >= MAX_RESEARCH_IMAGES:
+                break
+    base["images"] = existing
+    return base
+
+
+def search_targeted_editorial_images(
+    queries: list[str],
+    research: dict[str, Any] | None,
+    api_key: str,
+    *,
+    include_sources: bool = False,
+    max_total_images: int = MAX_RESEARCH_IMAGES,
+) -> dict[str, Any]:
+    """@brief Fetch targeted editorial photos and optional citable articles per missing scene entity/person."""
+    base = dict(research) if isinstance(research, dict) else {"sources": [], "images": []}
+    if not api_key or not queries:
+        return base
+    images = list(base.get("images") or [])
+    sources = list(base.get("sources") or [])
+    seen_img_urls = {str(e.get("url") or "") for e in images if isinstance(e, dict)}
+    seen_src_urls = {str(s.get("url") or "") for s in sources if isinstance(s, dict)}
+    headers = {"Authorization": f"Bearer {api_key}"}
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    cleaned_queries: list[str] = []
+    seen_q: set[str] = set()
+    for raw_q in queries:
+        q = re.sub(r"\s+", " ", str(raw_q or "")).strip()[:120]
+        if q and q.lower() not in seen_q:
+            seen_q.add(q.lower())
+            cleaned_queries.append(q)
+        if len(cleaned_queries) >= 4:
+            break
+
+    for q in cleaned_queries:
+        if len(images) >= max_total_images and not include_sources:
+            break
+        try:
+            search = _request_json(
+                TAVILY_SEARCH_URL,
+                headers=headers,
+                body={
+                    "query": q,
+                    "search_depth": "basic",
+                    "max_results": 4,
+                    "topic": "general",
+                    "include_answer": False,
+                    "include_images": True,
+                    "include_image_descriptions": True,
+                },
+                timeout=20,
+            )
+        except Exception:
+            continue
+        results = search.get("results", []) if isinstance(search.get("results"), list) else []
+        top_page_url = ""
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            cand_url = _safe_public_url(item.get("url"))
+            if not cand_url:
+                continue
+            if not top_page_url:
+                top_page_url = cand_url
+            if include_sources and cand_url not in seen_src_urls and len(sources) < 10:
+                seen_src_urls.add(cand_url)
+                hostname = urllib.parse.urlsplit(cand_url).hostname or ""
+                snippet = re.sub(r"\s+", " ", str(item.get("content") or "")).strip()[:1200]
+                sources.append(
+                    {
+                        "id": f"S{len(sources) + 1}",
+                        "title": str(item.get("title") or cand_url)[:240],
+                        "url": cand_url,
+                        "domain": hostname,
+                        "snippet": snippet[:400],
+                        "content": snippet,
+                        "published_at": str(item.get("published_date") or ""),
+                        "score": item.get("score"),
+                        "provider": "Tavily",
+                        "status": "fetched" if snippet else "snippet_only",
+                        "fetched_at": now if snippet else None,
+                    }
+                )
+        for raw_img in search.get("images", []) if isinstance(search.get("images"), list) else []:
+            if len(images) >= max_total_images:
+                break
+            if isinstance(raw_img, dict):
+                img_url = _safe_public_url(raw_img.get("url"))
+                desc = str(raw_img.get("description") or "").strip()[:240]
+            elif isinstance(raw_img, str):
+                img_url = _safe_public_url(raw_img)
+                desc = ""
+            else:
+                continue
+            if img_url and _is_usable_editorial_image_url(img_url) and img_url not in seen_img_urls:
+                seen_img_urls.add(img_url)
+                entry: dict[str, Any] = {"url": img_url, "description": desc or q}
+                if top_page_url:
+                    entry["source_url"] = top_page_url
+                images.append(entry)
+
+    base["images"] = images
+    base["sources"] = sources
+    return base
+
+
+def collect_community_reactions(
+    topic: str,
+    feedback: str,
+    research: dict[str, Any] | None,
+    api_key: str,
+) -> dict[str, Any]:
+    """@brief Search indexed community discussions and fan reaction summaries via Tavily without anti-bot bypass."""
+    base = dict(research) if isinstance(research, dict) else {"sources": [], "images": []}
+    if not api_key:
+        return base
+    sources = list(base.get("sources") or [])
+    seen_urls = {str(s.get("url") or "") for s in sources if isinstance(s, dict)}
+    clean_topic = re.sub(r"[!?,.;:]+", " ", str(topic or "")).strip()
+    core_terms = " ".join(clean_topic.split()[:6])
+    queries = [f"{core_terms} 에펨코리아 팬 반응 댓글", f"{core_terms} 팬 반응 네티즌 댓글"]
+    headers = {"Authorization": f"Bearer {api_key}"}
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    for q in queries:
+        if not core_terms:
+            break
+        try:
+            search = _request_json(
+                TAVILY_SEARCH_URL,
+                headers=headers,
+                body={
+                    "query": q,
+                    "search_depth": "basic",
+                    "max_results": 4,
+                    "topic": "general",
+                    "include_answer": True,
+                    "include_images": False,
+                },
+                timeout=20,
+            )
+        except Exception:
+            continue
+        for item in search.get("results", []) if isinstance(search.get("results"), list) else []:
+            if not isinstance(item, dict) or len(sources) >= 12:
+                break
+            cand_url = _safe_public_url(item.get("url"))
+            if not cand_url or cand_url in seen_urls:
+                continue
+            seen_urls.add(cand_url)
+            hostname = urllib.parse.urlsplit(cand_url).hostname or ""
+            snippet = re.sub(r"\s+", " ", str(item.get("content") or "")).strip()[:1200]
+            sources.append(
+                {
+                    "id": f"S{len(sources) + 1}",
+                    "title": str(item.get("title") or cand_url)[:240],
+                    "url": cand_url,
+                    "domain": hostname,
+                    "snippet": snippet[:400],
+                    "content": snippet,
+                    "published_at": str(item.get("published_date") or ""),
+                    "score": item.get("score"),
+                    "provider": "Tavily (community)",
+                    "status": "fetched" if snippet else "snippet_only",
+                    "fetched_at": now if snippet else None,
+                }
+            )
+        answer = re.sub(r"\s+", " ", str(search.get("answer") or "")).strip()[:1000]
+        if answer and not any(str(s.get("provider") or "") == "Tavily (reaction summary)" for s in sources):
+            sources.append(
+                {
+                    "id": f"S{len(sources) + 1}",
+                    "title": f"{core_terms} 커뮤니티 반응 요약",
+                    "url": "",
+                    "domain": "tavily-reaction-summary",
+                    "snippet": answer[:400],
+                    "content": answer,
+                    "published_at": "",
+                    "score": None,
+                    "provider": "Tavily (reaction summary)",
+                    "status": "fetched",
+                    "fetched_at": now,
+                }
+            )
+    base["sources"] = sources
+    return base
+
+
+def download_news_image(image_url: str, destination: Path, *, max_bytes: int = MAX_NEWS_IMAGE_BYTES) -> bool:
+    """@brief Safely download a real JPEG/PNG/WEBP editorial image via verified public HTTPS host."""
+    try:
+        safe_url = _resolve_and_verify_public_host(image_url)
+    except (ValueError, RuntimeError):
+        return False
+    request = urllib.request.Request(
+        safe_url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; ShortformContentStudio/0.1)", "Accept": "image/jpeg,image/png,image/webp,image/*;q=0.8"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            ctype = str(response.headers.get("Content-Type") or "").lower()
+            if ctype and not ctype.startswith("image/") and "octet-stream" not in ctype:
+                return False
+            raw = response.read(max_bytes + 1)
+    except Exception:
+        return False
+    if len(raw) < 5_000 or len(raw) > max_bytes:
+        return False
+    is_valid_magic = (
+        raw.startswith(b"\xff\xd8\xff")
+        or raw.startswith(b"\x89PNG\r\n\x1a\n")
+        or (raw.startswith(b"RIFF") and raw[8:12] == b"WEBP")
+    )
+    if not is_valid_magic:
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.with_name(f"{destination.stem}.tmp{destination.suffix}")
+    try:
+        staging.write_bytes(raw)
+        staging.replace(destination)
+        return True
+    except Exception:
+        staging.unlink(missing_ok=True)
+        return False
 
 
 def search_pexels_videos(scenes: list[dict[str, Any]], api_key: str) -> list[dict[str, Any]]:

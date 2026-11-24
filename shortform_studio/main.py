@@ -133,7 +133,7 @@ class NewItem(BaseModel):
     series_template_id: str | None = Field(default=None, max_length=36)
     style_template_id: str | None = Field(default=None, max_length=64)
     workflow_mode: Literal["manual", "autopilot"] = "manual"
-    visual_mode: Literal["hybrid", "ai_images", "omni_video", "stock"] = "hybrid"
+    visual_mode: Literal["hybrid", "ai_images", "omni_video", "news_photos", "stock"] = "hybrid"
     use_attached_media: bool = True
     tts_speed: float = Field(default=1.35, ge=0.75, le=2.0)
     tts_voice: str = Field(default="", max_length=64)
@@ -240,9 +240,11 @@ class RejectRequest(BaseModel):
 
     feedback: str = Field(min_length=2, max_length=2000)
     auto_reproduce: bool = True
-    visual_mode: Literal["hybrid", "ai_images", "omni_video", "stock"] | None = None
+    visual_mode: Literal["hybrid", "ai_images", "omni_video", "news_photos", "stock"] | None = None
     style_template_id: str | None = Field(default=None, max_length=64)
     tts_voice: str | None = Field(default=None, max_length=64)
+    reuse_visuals: bool = False
+    reuse_bgm: bool = False
 
 
 class PublishRequest(BaseModel):
@@ -2090,7 +2092,17 @@ def reject_item(item_id: str, request: RejectRequest) -> Any:
         updated = store.update_payload(item_id, updates)
     if not request.auto_reproduce:
         return JSONResponse(status_code=200, content=updated)
-    job_id = _schedule(item_id, "planning", lambda: run_autopilot_pipeline(store, item_id, feedback=request.feedback))
+    job_id = _schedule(
+        item_id,
+        "planning",
+        lambda: run_autopilot_pipeline(
+            store,
+            item_id,
+            feedback=request.feedback,
+            reuse_visuals=bool(request.reuse_visuals),
+            reuse_bgm=bool(request.reuse_bgm),
+        ),
+    )
     return {"job_id": job_id, "status": "planning"}
 
 

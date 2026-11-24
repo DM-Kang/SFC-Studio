@@ -816,6 +816,7 @@ def _call_gemini_generate(model: str, body: dict[str, Any], *, use_api_key: bool
     headers = _gemini_auth_headers(use_api_key=use_api_key, json_content=True)
     response: dict[str, Any] | None = None
     last_error: RuntimeError | None = None
+    used_model = model
     for candidate_model in candidates:
         model_path = quote(candidate_model, safe="-_.:")
         try:
@@ -824,6 +825,7 @@ def _call_gemini_generate(model: str, body: dict[str, Any], *, use_api_key: bool
                 headers=headers,
                 body=body,
             )
+            used_model = candidate_model
             break
         except RuntimeError as error:
             last_error = error
@@ -842,6 +844,8 @@ def _call_gemini_generate(model: str, body: dict[str, Any], *, use_api_key: bool
                 headers=oauth_headers,
                 body=body,
             )
+            used_model = "gemini-3-flash-preview"
+            use_api_key = False
         except RuntimeError:
             pass
     if response is None:
@@ -854,6 +858,9 @@ def _call_gemini_generate(model: str, body: dict[str, Any], *, use_api_key: bool
     text = "\n".join(part["text"] for part in parts if isinstance(part, dict) and isinstance(part.get("text"), str)).strip()
     if not text:
         raise RuntimeError("Gemini returned no text content.")
+    from .usage import record_gemini_response_usage
+
+    record_gemini_response_usage("gemini_api" if use_api_key else "gemini_oauth", used_model, response)
     return text
 
 
@@ -883,6 +890,9 @@ def _generate_anthropic(model: str, system_prompt: str, user_prompt: str) -> str
     text = "\n".join(part["text"] for part in content if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)) if isinstance(content, list) else ""
     if not text.strip():
         raise RuntimeError("Anthropic returned no text content.")
+    from .usage import record_anthropic_response_usage
+
+    record_anthropic_response_usage(model, response)
     return text.strip()
 
 
@@ -1025,6 +1035,9 @@ def generate_multimodal_description(
             body={"model": model, "max_tokens": 1200, "messages": [{"role": "user", "content": content}]},
         )
         blocks = response.get("content")
+        from .usage import record_anthropic_response_usage
+
+        record_anthropic_response_usage(model, response)
         return "\n".join(b["text"] for b in blocks if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)).strip() if isinstance(blocks, list) else ""
     if get_secret("GEMINI_API_KEY"):
         parts = [{"text": prompt_text}]

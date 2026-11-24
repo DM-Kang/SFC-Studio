@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from .style_templates import find_style_template, style_template_to_production_c
 from .config import get_projects_dir, get_secret
 from .media import (
     SUBTITLE_STYLE_PRESETS,
+    _probe_image_size,
     assemble_multiscene_video,
     ensure_ambient_bgm,
     extract_video_frame,
@@ -38,6 +40,7 @@ from .media import (
     generate_voiceover,
     normalize_subtitle_style,
     probe_video,
+    render_fan_reaction_card_image,
     render_video,
     retime_audio_file,
     retime_video_file,
@@ -66,14 +69,32 @@ from .publishing import (
     update_youtube_privacy,
 )
 from .resources import (
+    collect_community_reactions,
     collect_web_research,
+    download_news_image,
     download_pexels_clip,
     download_stock_clip,
     fetch_direct_url_source,
     search_pexels_videos,
     search_pixabay_videos,
+    search_targeted_editorial_images,
+    supplement_research_images,
 )
 from .store import Store
+from .usage import UsageLedger, merge_usage_stats, track_usage_scope
+
+
+def _flush_item_usage(store: Store, item_id: str, ledger: UsageLedger) -> None:
+    """@brief Persist accumulated provider calls and estimated USD cost onto item['usage_stats']."""
+    if ledger.calls <= 0 and ledger.usd <= 0:
+        return
+    try:
+        latest = store.get_item(item_id)
+        if isinstance(latest, dict):
+            merged = merge_usage_stats(latest.get("usage_stats"), ledger)
+            store.update_payload(item_id, {"usage_stats": merged})
+    except Exception:
+        pass
 
 
 def item_directory(item_id: str) -> Path:
@@ -194,28 +215,32 @@ def run_planning(store: Store, item_id: str) -> str:
     item = store.get_item(item_id)
     if item is None:
         raise KeyError(item_id)
-    use_ai = ai_ready("planning")
-    store.set_job_progress(item_id, "참고 자료 및 성과 요약 수집 중", 20)
-    research = item.get("research")
-    raw_sources = research.get("sources", []) if isinstance(research, dict) else []
-    web_sources = [src for src in raw_sources if isinstance(src, dict) and src.get("included", True) is not False]
-    item, research_sources = _prepare_attachments_and_sources(store, item_id, web_sources)
-    brief = _brief(item)
-    prior_items = [candidate for candidate in store.list_items() if candidate.get("id") != item_id]
-    brief["analytics_feedback"] = summarize_analytics(prior_items)
-    brief["shorts_references"] = summarize_shorts_references_for_planning(store.get_setting("shorts_references", []))
-    if store.is_cancel_requested(item_id):
-        raise RuntimeError("Operation cancelled by operator.")
-    store.set_job_progress(item_id, "AI 기획안 생성 중", 60)
-    plan = generate_plan(brief, use_ai, research_sources)
-    plan["revision"] = int(item.get("plan_revision", 0)) + 1
-    if isinstance(item.get("plan"), dict):
-        store.save_revision_snapshot(item_id, "AI-generated plan replaced the previous draft")
-    store.update_payload(
-        item_id,
-        {"plan": plan, "platform_variants": {}, "plan_revision": plan["revision"], "review": None, "approved_at": None, "approved_asset_sha256": None, "reviewed_asset_sha256": None, "approval_record": None},
-    )
-    return "planned"
+    with track_usage_scope("planning") as usage_ledger:
+        try:
+            use_ai = ai_ready("planning")
+            store.set_job_progress(item_id, "참고 자료 및 성과 요약 수집 중", 20)
+            research = item.get("research")
+            raw_sources = research.get("sources", []) if isinstance(research, dict) else []
+            web_sources = [src for src in raw_sources if isinstance(src, dict) and src.get("included", True) is not False]
+            item, research_sources = _prepare_attachments_and_sources(store, item_id, web_sources)
+            brief = _brief(item)
+            prior_items = [candidate for candidate in store.list_items() if candidate.get("id") != item_id]
+            brief["analytics_feedback"] = summarize_analytics(prior_items)
+            brief["shorts_references"] = summarize_shorts_references_for_planning(store.get_setting("shorts_references", []))
+            if store.is_cancel_requested(item_id):
+                raise RuntimeError("Operation cancelled by operator.")
+            store.set_job_progress(item_id, "AI 기획안 생성 중", 60)
+            plan = generate_plan(brief, use_ai, research_sources)
+            plan["revision"] = int(item.get("plan_revision", 0)) + 1
+            if isinstance(item.get("plan"), dict):
+                store.save_revision_snapshot(item_id, "AI-generated plan replaced the previous draft")
+            store.update_payload(
+                item_id,
+                {"plan": plan, "platform_variants": {}, "plan_revision": plan["revision"], "review": None, "approved_at": None, "approved_asset_sha256": None, "reviewed_asset_sha256": None, "approval_record": None},
+            )
+            return "planned"
+        finally:
+            _flush_item_usage(store, item_id, usage_ledger)
 
 
 def run_web_research(store: Store, item_id: str, return_stage: str) -> str:
@@ -756,6 +781,7 @@ def run_scene_assembly(
     auto_bgm: bool = False,
     bgm_mood: str = "upbeat",
     hook_banner: str = "",
+    reuse_bgm: bool = False,
 ) -> str:
     """@brief Assemble selected clips/images across scenes with optional narration, BGM, and captions."""
     item = store.get_item(item_id)
@@ -764,6 +790,51 @@ def run_scene_assembly(
     plan = item.get("plan")
     if not isinstance(plan, dict):
         raise RuntimeError("Create a plan before assembling scenes.")
+    with track_usage_scope("scene_assembly") as usage_ledger:
+        try:
+            return _run_scene_assembly_inner(
+                store,
+                item_id,
+                item,
+                plan,
+                scene_inputs,
+                transition=transition,
+                tts_provider=tts_provider,
+                tts_voice=tts_voice,
+                tts_speed=tts_speed,
+                bgm_volume=bgm_volume,
+                ducking=ducking,
+                loudnorm=loudnorm,
+                subtitle_style=subtitle_style,
+                auto_bgm=auto_bgm,
+                bgm_mood=bgm_mood,
+                hook_banner=hook_banner,
+                reuse_bgm=reuse_bgm,
+            )
+        finally:
+            _flush_item_usage(store, item_id, usage_ledger)
+
+
+def _run_scene_assembly_inner(
+    store: Store,
+    item_id: str,
+    item: dict[str, Any],
+    plan: dict[str, Any],
+    scene_inputs: list[dict[str, Any]],
+    *,
+    transition: str = "cut",
+    tts_provider: str = "auto",
+    tts_voice: str = "",
+    tts_speed: float = 1.35,
+    bgm_volume: float = 0.18,
+    ducking: bool = True,
+    loudnorm: bool = False,
+    subtitle_style: dict[str, Any] | None = None,
+    auto_bgm: bool = False,
+    bgm_mood: str = "upbeat",
+    hook_banner: str = "",
+    reuse_bgm: bool = False,
+) -> str:
     store.cancel_pending_schedules(item_id, "Multi-scene assembly started; review and schedule the new artifact after approval.")
     folder = item_directory(item_id)
     folder_resolved = folder.resolve()
@@ -810,7 +881,11 @@ def run_scene_assembly(
         else:
             raise ValueError(f"Scene {index + 1}: unsupported source_kind '{source_kind}'.")
         rel = local_path.resolve().relative_to(folder_resolved).as_posix()
-        resolved_clips.append({"relative_path": rel, "duration_seconds": duration, "media_type": media_type})
+        source_credit = str(scene_req.get("source_credit") or "").strip()[:80]
+        clip_entry: dict[str, Any] = {"relative_path": rel, "duration_seconds": duration, "media_type": media_type}
+        if source_credit:
+            clip_entry["source_credit"] = source_credit
+        resolved_clips.append(clip_entry)
 
     narration = generate_scene_synced_voiceover(
         plan.get("scenes") or [],
@@ -837,7 +912,9 @@ def run_scene_assembly(
             captions_path = candidate_srt
 
     base_bgm_path = Path(str(existing_assets.get("base_bgm_path") or existing_assets.get("bgm_path") or "")) if (existing_assets.get("base_bgm_path") or existing_assets.get("bgm_path")) else None
-    if base_bgm_path and (not base_bgm_path.is_file() or (auto_bgm and base_bgm_path.name == "bgm_auto.mp3") or base_bgm_path.name == "bgm_sfx.mp3"):
+    if (not base_bgm_path or not base_bgm_path.is_file()) and (folder / "bgm_auto.mp3").is_file():
+        base_bgm_path = folder / "bgm_auto.mp3"
+    if base_bgm_path and (not base_bgm_path.is_file() or (auto_bgm and base_bgm_path.name == "bgm_auto.mp3" and not reuse_bgm) or base_bgm_path.name == "bgm_sfx.mp3"):
         base_bgm_path = None
     if base_bgm_path is None and auto_bgm:
         total_scene_dur = sum(float(c.get("duration_seconds") or 4.0) for c in resolved_clips)
@@ -852,6 +929,21 @@ def run_scene_assembly(
         else None
     )
 
+    source_attributions: list[dict[str, Any]] = []
+    cursor_sec = 0.0
+    for clip_meta in resolved_clips:
+        clip_dur = float(clip_meta.get("duration_seconds") or 4.0)
+        credit = str(clip_meta.get("source_credit") or "").strip()
+        if credit:
+            source_attributions.append(
+                {
+                    "start": round(cursor_sec, 3),
+                    "end": round(cursor_sec + clip_dur, 3),
+                    "label": credit,
+                }
+            )
+        cursor_sec += clip_dur
+
     normalized_style = normalize_subtitle_style(subtitle_style or existing_assets.get("subtitle_style") or {"preset": "shorts_punch"})
     burn_captions_path = captions_path
     if captions_path and captions_path.is_file() and captions_path.suffix.lower() == ".srt":
@@ -861,6 +953,7 @@ def run_scene_assembly(
                 folder / "captions.ass",
                 style=normalized_style,
                 hook_title=hook_banner,
+                source_attributions=source_attributions or None,
             )
         except Exception:
             burn_captions_path = captions_path
@@ -905,6 +998,9 @@ def run_scene_assembly(
         "base_bgm_path": str(base_bgm_path) if base_bgm_path else existing_assets.get("base_bgm_path"),
         "bgm_path": str(bgm_path) if bgm_path else existing_assets.get("bgm_path"),
         "subtitle_style": normalized_style,
+        "source_attributions": source_attributions,
+        "has_cached_bgm": bool(base_bgm_path and base_bgm_path.is_file()),
+        "cached_visual_clips": [c["relative_path"] for c in resolved_clips],
     }
     rights_assets = replace_final_video_rights_record(rights_assets, "multi-scene FFmpeg assembly")
     store.update_payload(
@@ -1166,6 +1262,443 @@ def _assign_attached_media_to_scenes(
     return slots
 
 
+_NEWS_SPORTS_KEYWORDS = (
+    "뉴스",
+    "속보",
+    "시사",
+    "경기",
+    "축구",
+    "야구",
+    "농구",
+    "프리미어",
+    "챔피언스",
+    "epl",
+    "맨유",
+    "맨체스터",
+    "리버풀",
+    "아스날",
+    "토트넘",
+    "레알",
+    "바르셀로나",
+    "인터뷰",
+    "감독",
+    "선수",
+    "스코어",
+    "하이라이트",
+    "news",
+    "match",
+    "premier league",
+    "interview",
+    "manager",
+    "football",
+    "soccer",
+)
+
+
+def _is_news_or_sports_topic(item: dict[str, Any]) -> bool:
+    """@brief Detect news, current events, or sports-match topics that benefit from real editorial photos."""
+    haystack = " ".join(
+        [
+            str(item.get("topic") or ""),
+            str(item.get("audience") or ""),
+            str(item.get("tone") or ""),
+            str(item.get("source_notes") or "")[:600],
+            str((item.get("style_template_snapshot") or {}).get("category") or ""),
+        ]
+    ).lower()
+    return any(tok in haystack for tok in _NEWS_SPORTS_KEYWORDS)
+
+
+def _build_english_ai_visual_prompt(
+    scene: dict[str, Any],
+    *,
+    visual_bible: str = "",
+    fallback_topic: str = "",
+) -> str:
+    """@brief Construct a purely English AI visual prompt combining scene choreography with cross-scene continuity."""
+    raw_scene_prompt = str(scene.get("ai_visual_prompt") or scene.get("visual_query") or fallback_topic or "").strip()
+    ascii_scene = re.sub(r"\s{2,}", " ", re.sub(r"[^\x20-\x7e]+", " ", raw_scene_prompt)).strip()
+    ascii_bible = re.sub(r"\s{2,}", " ", re.sub(r"[^\x20-\x7e]+", " ", str(visual_bible or ""))).strip()
+    parts: list[str] = []
+    if ascii_bible:
+        parts.append(f"Visual continuity: {ascii_bible[:320]}")
+    if ascii_scene:
+        parts.append(f"Scene framing: {ascii_scene[:320]}")
+    else:
+        parts.append("Vertical 9:16 editorial photography with cinematic lighting")
+    parts.append("Strict exclusions: NO random unrelated league or K-League/FC Seoul crests, NO text overlays, keep kit colors uniform.")
+    return ". ".join(parts)
+
+
+def _collect_news_reference_images(
+    store: Store,
+    item_id: str,
+    research: dict[str, Any] | None,
+    folder: Path,
+    *,
+    max_images: int = 5,
+    reuse_existing: bool = False,
+) -> list[dict[str, Any]]:
+    """@brief Download verified public HTTPS editorial news photos from research candidates into clips/ and log rights."""
+    if not isinstance(research, dict):
+        return []
+    raw_images = research.get("images")
+    if not isinstance(raw_images, list) or not raw_images:
+        return []
+    clips_dir = (folder / "clips").resolve()
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    downloaded: list[dict[str, Any]] = []
+    item = store.get_item(item_id) or {}
+    rights_assets = list(item.get("rights_assets") or [])
+    known_urls = {str(a.get("source_url") or "") for a in rights_assets if isinstance(a, dict)}
+
+    for idx, cand in enumerate(raw_images[:20], 1):
+        if len(downloaded) >= max_images:
+            break
+        if isinstance(cand, dict):
+            img_url = str(cand.get("url") or "").strip()
+            desc = str(cand.get("description") or "").strip()[:240]
+            src_url = str(cand.get("source_url") or img_url).strip()
+        elif isinstance(cand, str):
+            img_url = cand.strip()
+            desc = ""
+            src_url = img_url
+        else:
+            continue
+        if not img_url:
+            continue
+        ext = ".png" if img_url.lower().split("?")[0].endswith(".png") else ".jpg"
+        dest = clips_dir / f"news_img_{idx}{ext}"
+        if not (reuse_existing and dest.is_file() and dest.stat().st_size > 4096):
+            if not download_news_image(img_url, dest):
+                continue
+        dims = _probe_image_size(dest)
+        if dims is not None and (dims[0] < 320 or dims[1] < 220):
+            dest.unlink(missing_ok=True)
+            continue
+        domain = (urllib.parse.urlsplit(src_url or img_url).hostname or "").removeprefix("www.")
+        downloaded.append(
+            {
+                "id": f"news-{idx}",
+                "filename": dest.name,
+                "path": dest,
+                "url": img_url,
+                "source_url": src_url,
+                "domain": domain,
+                "description": desc or f"Editorial news photo {idx}",
+            }
+        )
+        if img_url not in known_urls:
+            known_urls.add(img_url)
+            rights_assets.append(
+                {
+                    "id": str(uuid4()),
+                    "asset_name": f"News image ({dest.name})",
+                    "asset_type": "image",
+                    "source_description": desc[:260] or "Auto-fetched editorial news article image",
+                    "source_url": img_url[:2048],
+                    "license_name": "Editorial news photo — verify press/fair-use rights before commercial publish",
+                    "license_url": "",
+                    "rights_basis": "",
+                    "attribution": "",
+                    "included": True,
+                    "rights_status": "unverified",
+                }
+            )
+    if downloaded:
+        store.update_payload(item_id, {"rights_assets": rights_assets})
+    return downloaded
+
+
+_FAN_REACTION_TOKENS = (
+    "팬 반응",
+    "팬들 반응",
+    "커뮤니티",
+    "댓글",
+    "베스트글",
+    "베스트 댓글",
+    "에펨",
+    "fmkorea",
+    "네티즌",
+    "여론",
+    "fan reaction",
+    "comments",
+)
+
+
+def _is_fan_reaction_scene(scene: dict[str, Any] | Any) -> bool:
+    if not isinstance(scene, dict):
+        return False
+    text = f"{scene.get('narration') or ''} {scene.get('visual_query') or ''}".lower()
+    return any(tok in text for tok in _FAN_REACTION_TOKENS)
+
+
+def _enrich_research_from_feedback(
+    store: Store,
+    item_id: str,
+    item: dict[str, Any],
+    research: dict[str, Any] | None,
+    cleaned_feedback: str,
+    tavily_key: str,
+) -> dict[str, Any]:
+    """@brief Fetch targeted articles, interviews, and indexed community reaction snippets when feedback asks for new entities or fan reactions."""
+    updated = dict(research) if isinstance(research, dict) else {"sources": [], "images": []}
+    if not cleaned_feedback or not tavily_key:
+        return updated
+    fb_low = cleaned_feedback.lower()
+    if any(tok in fb_low for tok in _FAN_REACTION_TOKENS):
+        try:
+            updated = collect_community_reactions(str(item.get("topic") or ""), cleaned_feedback, updated, tavily_key)
+        except Exception:
+            pass
+    queries: list[str] = []
+    if ai_ready("planning"):
+        try:
+            q_resp, _ = generate_json(
+                'Generate up to 3 concise web/image search queries to find real news coverage, post-match quotes, and press photos requested in the operator feedback. Return JSON: {"queries": ["query 1", "query 2"]}. Use specific names/teams in English or Korean; omit site scraping tricks.',
+                f"Topic: {item.get('topic')}\nFeedback: {cleaned_feedback[:1000]}",
+                stage="planning",
+            )
+            if isinstance(q_resp, dict) and isinstance(q_resp.get("queries"), list):
+                queries = [str(q).strip() for q in q_resp["queries"] if str(q).strip()][:3]
+        except Exception:
+            queries = []
+    if queries:
+        try:
+            updated = search_targeted_editorial_images(queries, updated, tavily_key, include_sources=True)
+        except Exception:
+            pass
+    if updated != (research or {}):
+        store.update_payload(item_id, {"research": updated})
+    return updated
+
+
+def _ensure_scene_editorial_images(
+    store: Store,
+    item_id: str,
+    item: dict[str, Any],
+    scenes: list[dict[str, Any]],
+    tavily_key: str,
+) -> dict[str, Any]:
+    """@brief Inspect each scene against already-collected research images and fetch missing player/manager photos."""
+    research = dict(item.get("research") or {}) if isinstance(item.get("research"), dict) else {"sources": [], "images": []}
+    if not tavily_key or not scenes:
+        return research
+    existing_imgs = [
+        {"idx": i + 1, "description": str(img.get("description") or "")[:160]}
+        for i, img in enumerate(research.get("images") or [])
+        if isinstance(img, dict)
+    ]
+    non_reaction_scenes = [
+        {"scene_id": str(sc.get("id") or f"scene-{i + 1}"), "narration": str(sc.get("narration") or "")[:140]}
+        for i, sc in enumerate(scenes[:8])
+        if isinstance(sc, dict) and not _is_fan_reaction_scene(sc)
+    ]
+    if not non_reaction_scenes or not ai_ready("planning"):
+        return research
+    try:
+        gap_resp, _ = generate_json(
+            'Compare the scenes against existing photo descriptions. If any scene mentions a specific player, manager, or match moment with NO matching photo in existing_images (for example Bruno Fernandes, Liverpool manager, goal scorer), return up to 4 concise news-photo search queries including event context (year/match/teams). Return JSON: {"queries": ["query 1", ...]}.',
+            f"Topic: {item.get('topic')}\nScenes: {non_reaction_scenes}\nExisting images: {existing_imgs}",
+            stage="planning",
+        )
+        queries = [str(q).strip() for q in (gap_resp.get("queries") or []) if str(q).strip()][:4] if isinstance(gap_resp, dict) else []
+    except Exception:
+        queries = []
+    if not queries:
+        return research
+    enriched = search_targeted_editorial_images(queries, research, tavily_key, include_sources=False)
+    if len(enriched.get("images") or []) > len(research.get("images") or []):
+        store.update_payload(item_id, {"research": enriched})
+    return enriched
+
+
+def _build_fan_reaction_scene_cards(
+    folder: Path,
+    scenes: list[dict[str, Any]],
+    research_sources: list[dict[str, Any]],
+    item: dict[str, Any],
+    *,
+    feedback: str = "",
+    reuse_existing: bool = False,
+) -> dict[int, dict[str, Any]]:
+    """@brief Render grounded 3-comment fan reaction PNG cards for community/fan-reaction scenes."""
+    cards: dict[int, dict[str, Any]] = {}
+    reaction_indices = [idx for idx, sc in enumerate(scenes[:8]) if _is_fan_reaction_scene(sc)]
+    if not reaction_indices:
+        return cards
+    topic = str(item.get("topic") or "경기 반응").strip()
+    per_dur = round(max(2.5, min(30.0, float((item.get("plan") or {}).get("duration_seconds") or 24) / max(1, len(scenes)))), 1)
+    source_snippets = [
+        {
+            "id": str(s.get("id") or ""),
+            "domain": str(s.get("domain") or ""),
+            "title": str(s.get("title") or "")[:120],
+            "text": str(s.get("content") or s.get("snippet") or "")[:700],
+        }
+        for s in (research_sources or [])
+        if isinstance(s, dict) and (s.get("content") or s.get("snippet"))
+    ]
+    community_domains = [str(s.get("domain") or "") for s in source_snippets if "fmkorea" in str(s.get("domain") or "").lower() or "community" in str(s.get("id") or "").lower()]
+    source_label = "검색 기반 팬 반응 요약"
+    if any("fmkorea" in d.lower() for d in community_domains):
+        source_label = "fmkorea.com 등 검색 기반 팬 반응"
+    if reuse_existing:
+        all_cached = True
+        for idx in reaction_indices:
+            cached_png = folder / "clips" / f"fan_reaction_{idx + 1}.png"
+            if cached_png.is_file() and cached_png.stat().st_size > 4096:
+                sc = scenes[idx] if isinstance(scenes[idx], dict) else {}
+                sc_dur = sc.get("duration_seconds")
+                slot_dur = round(max(2.5, min(30.0, float(sc_dur))), 1) if isinstance(sc_dur, (int, float)) else per_dur
+                cards[idx] = {
+                    "source_kind": "uploaded",
+                    "filename": cached_png.name,
+                    "duration_seconds": slot_dur,
+                    "from_attachment": True,
+                    "source_credit": source_label,
+                }
+            else:
+                all_cached = False
+        if all_cached:
+            return cards
+    comments_data: list[dict[str, str]] = []
+    card_title = re.sub(r"[!?]+", "", topic).strip()[:32] or "경기 후 팬 반응"
+    if ai_ready("planning"):
+        try:
+            resp, _ = generate_json(
+                'Extract or summarize 3 concise, natural Korean fan reaction comments grounded in the provided web/community sources (avoid inventing real private user handles; label authors cleanly like "익명 팬 ①", "축구 팬 ②", "팬 ③", likes like "공감 1", "공감 2", "베스트", and keep each comment under 42 Korean characters reflecting the actual match events/reactions). Return JSON: {"card_title": "짧은 제목", "comments": [{"author": "익명 팬 ①", "likes": "베스트", "text": "..."}]}.',
+                f"Topic: {topic}\nFeedback: {feedback[:500]}\nSources: {source_snippets[:8]}",
+                stage="planning",
+            )
+            if isinstance(resp, dict):
+                if str(resp.get("card_title") or "").strip():
+                    card_title = str(resp["card_title"]).strip()[:36]
+                raw_cmts = resp.get("comments") if isinstance(resp.get("comments"), list) else []
+                for idx_c, c in enumerate(raw_cmts[:3], 1):
+                    if isinstance(c, dict) and str(c.get("text") or "").strip():
+                        comments_data.append(
+                            {
+                                "author": str(c.get("author") or f"팬 {idx_c}")[:18],
+                                "likes": str(c.get("likes") or "BEST")[:12],
+                                "text": str(c["text"]).strip()[:70],
+                            }
+                        )
+        except Exception:
+            comments_data = []
+    if not comments_data:
+        comments_data = [
+            {"author": "팬 ①", "likes": "베스트", "text": "경기 흐름이 초반 변수 하나로 완전히 갈렸네요"},
+            {"author": "팬 ②", "likes": "인기", "text": "스코어만큼이나 양 팀 인터뷰 온도 차가 큽니다"},
+            {"author": "팬 ③", "likes": "공감", "text": "다음 라운드까지 팬들 사이에서 계속 회자될 듯"},
+        ]
+    for idx in reaction_indices:
+        sc = scenes[idx] if isinstance(scenes[idx], dict) else {}
+        sc_dur = sc.get("duration_seconds")
+        slot_dur = round(max(2.5, min(30.0, float(sc_dur))), 1) if isinstance(sc_dur, (int, float)) else per_dur
+        out_png = folder / "clips" / f"fan_reaction_{idx + 1}.png"
+        rendered = render_fan_reaction_card_image(
+            out_png,
+            title=card_title,
+            comments=comments_data,
+            badge="커뮤니티 · 팬 반응 TOP 3",
+            source_footer=source_label,
+        )
+        if rendered and rendered.is_file():
+            cards[idx] = {
+                "source_kind": "uploaded",
+                "filename": rendered.name,
+                "duration_seconds": slot_dur,
+                "from_attachment": True,
+                "source_credit": source_label,
+            }
+    return cards
+
+
+def _assign_news_photos_to_scenes(
+    scenes: list[dict[str, Any]],
+    news_media: list[dict[str, Any]],
+    empty_indices: list[int],
+    duration_seconds: Any,
+    *,
+    allow_cycle: bool = False,
+) -> dict[int, dict[str, Any]]:
+    """@brief Semantically match downloaded editorial news photos to matching scenes via AI before cycling fallback."""
+    assignments: dict[int, dict[str, Any]] = {}
+    if not empty_indices or not news_media:
+        return assignments
+    per_dur = round(max(2.5, min(30.0, float(duration_seconds or 20) / max(1, len(scenes)))), 1)
+
+    by_news_id = {str(m["id"]): m for m in news_media if isinstance(m, dict) and m.get("id")}
+    used_news_ids: set[str] = set()
+    if ai_ready("planning") and len(news_media) > 1:
+        try:
+            target_scenes = [
+                {
+                    "scene_id": str((scenes[idx] or {}).get("id") or f"scene-{idx + 1}"),
+                    "narration": str((scenes[idx] or {}).get("narration") or "")[:150],
+                    "visual_query": str((scenes[idx] or {}).get("visual_query") or "")[:80],
+                }
+                for idx in empty_indices
+                if idx < len(scenes)
+            ]
+            photo_pool = [
+                {
+                    "id": str(m.get("id")),
+                    "description": str(m.get("description") or "")[:180],
+                    "domain": str(m.get("domain") or ""),
+                }
+                for m in news_media
+            ]
+            ai_res, _ = generate_json(
+                'Assign each scene to the best-matching editorial news photo id by matching the named person, manager, player, team action, or match moment in the narration to the photo description. CRITICAL: Do NOT assign a manager or player photo of Person A (e.g. Pochettino) to a scene explicitly about Person B (e.g. Bruno Fernandes or Liverpool manager) if a better photo exists; leave mismatched pairs unassigned if none fit. Return JSON: {"assignments": {"scene-1": "news-5", ...}}. Use each photo id at most once.',
+                f"Scenes needing photos: {target_scenes}\nDownloaded photos: {photo_pool}",
+                stage="planning",
+            )
+            raw_map = ai_res.get("assignments") if isinstance(ai_res, dict) else None
+            if isinstance(raw_map, dict):
+                for idx in empty_indices:
+                    sc = scenes[idx] if idx < len(scenes) and isinstance(scenes[idx], dict) else {}
+                    sid = str(sc.get("id") or f"scene-{idx + 1}")
+                    chosen_id = str(raw_map.get(sid) or "")
+                    if chosen_id in by_news_id and chosen_id not in used_news_ids:
+                        chosen = by_news_id[chosen_id]
+                        used_news_ids.add(chosen_id)
+                        assignments[idx] = {
+                            "source_kind": "uploaded",
+                            "filename": chosen["filename"],
+                            "duration_seconds": per_dur,
+                            "from_attachment": True,
+                            "from_news_photo": True,
+                            "source_credit": chosen.get("domain", ""),
+                        }
+        except Exception:
+            assignments.clear()
+            used_news_ids.clear()
+
+    unused_media = [m for m in news_media if str(m.get("id")) not in used_news_ids]
+    unused_cursor = 0
+    for idx in empty_indices:
+        if idx in assignments:
+            continue
+        if unused_cursor < len(unused_media):
+            chosen = unused_media[unused_cursor]
+            unused_cursor += 1
+        elif allow_cycle:
+            chosen = news_media[idx % len(news_media)]
+        else:
+            continue
+        assignments[idx] = {
+            "source_kind": "uploaded",
+            "filename": chosen["filename"],
+            "duration_seconds": per_dur,
+            "from_attachment": True,
+            "from_news_photo": True,
+            "source_credit": chosen.get("domain", ""),
+        }
+    return assignments
+
+
 def _collect_reference_product_images(folder: Path, attachments: list[dict[str, Any]] | None) -> list[Path]:
     """@brief Collect up to 2 included image attachment paths to anchor AI-generated scenes to the real product."""
     if not isinstance(attachments, list):
@@ -1195,12 +1728,13 @@ def _ai_rerank_and_fill_visuals(
     *,
     visual_mode: str = "hybrid",
     attachments: list[dict[str, Any]] | None = None,
+    visual_bible: str = "",
 ) -> list[dict[str, Any]]:
     """@brief Let planning AI pick the best clip per scene and synthesize 9:16 AI images for off-topic or AI-visual slots."""
     if not scenes or not scene_inputs:
         return scene_inputs
     updated = [dict(entry) for entry in scene_inputs]
-    if visual_mode not in {"ai_images", "omni_video"} and ai_ready("planning") and len(materials) > len(scenes):
+    if visual_mode not in {"ai_images", "omni_video", "news_photos"} and ai_ready("planning") and len(materials) > len(scenes):
         try:
             candidates_by_scene = []
             for idx, scene in enumerate(scenes[: len(updated)]):
@@ -1237,9 +1771,9 @@ def _ai_rerank_and_fill_visuals(
         except Exception:
             pass
 
-    if visual_mode != "stock" and (get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY")):
+    if visual_mode not in {"stock", "omni_video", "news_photos"} and (get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY")):
         by_id = {str(m.get("provider_id")): m for m in materials if isinstance(m, dict) and m.get("provider_id")}
-        ref_images = _collect_reference_product_images(folder, attachments)
+        chain_refs = _collect_reference_product_images(folder, attachments)
         for idx, entry in enumerate(updated):
             if entry.get("from_attachment"):
                 continue
@@ -1248,14 +1782,16 @@ def _ai_rerank_and_fill_visuals(
             overlap = _keyword_overlap_score(scene, mat) if mat else 0
             should_generate = (visual_mode == "ai_images") or (overlap == 0)
             if should_generate and isinstance(scene, dict):
-                prompt_text = f"{scene.get('visual_query') or ''} — mood and subject: {scene.get('narration') or ''}"
+                prompt_text = _build_english_ai_visual_prompt(scene, visual_bible=visual_bible)
                 out_path = folder / "clips" / f"ai_scene_{idx + 1}.png"
                 ai_img = (
-                    generate_ai_scene_image(prompt_text, out_path, reference_image_paths=ref_images)
-                    if ref_images
+                    generate_ai_scene_image(prompt_text, out_path, reference_image_paths=chain_refs)
+                    if chain_refs
                     else generate_ai_scene_image(prompt_text, out_path)
                 )
                 if ai_img and ai_img.is_file():
+                    if not chain_refs:
+                        chain_refs = [ai_img]
                     updated[idx] = {
                         "source_kind": "uploaded",
                         "filename": ai_img.name,
@@ -1319,11 +1855,42 @@ def record_rejection_feedback(store: Store, item_id: str, feedback: str) -> dict
     )
 
 
-def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") -> str:
+def run_autopilot_pipeline(
+    store: Store,
+    item_id: str,
+    *,
+    feedback: str = "",
+    reuse_visuals: bool = False,
+    reuse_bgm: bool = False,
+) -> str:
     """@brief Run web research, AI planning/revision, clip matching, TTS/FFmpeg assembly, and review end-to-end."""
     item = store.get_item(item_id)
     if item is None:
         raise KeyError(item_id)
+    vis_label = str(item.get("visual_mode") or "hybrid")
+    with track_usage_scope(f"autopilot ({vis_label})") as usage_ledger:
+        try:
+            return _run_autopilot_pipeline_inner(
+                store,
+                item_id,
+                item,
+                feedback=feedback,
+                reuse_visuals=reuse_visuals,
+                reuse_bgm=reuse_bgm,
+            )
+        finally:
+            _flush_item_usage(store, item_id, usage_ledger)
+
+
+def _run_autopilot_pipeline_inner(
+    store: Store,
+    item_id: str,
+    item: dict[str, Any],
+    *,
+    feedback: str = "",
+    reuse_visuals: bool = False,
+    reuse_bgm: bool = False,
+) -> str:
 
     note_yt_urls = extract_youtube_urls(str(item.get("source_notes") or ""), limit=2)
     if note_yt_urls:
@@ -1344,14 +1911,41 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
 
     tavily_key = get_secret("TAVILY_API_KEY")
     existing_research = item.get("research") if isinstance(item.get("research"), dict) else {}
-    if tavily_key and not existing_research.get("sources"):
-        store.set_job_progress(item_id, "1/4 웹 출처 조사 중 (Tavily)", 12)
+    requested_visual_mode = str(item.get("visual_mode") or "hybrid").strip().lower()
+    if tavily_key and (not existing_research.get("sources") or "images" not in existing_research):
+        store.set_job_progress(item_id, "1/4 웹 출처·기사 이미지 조사 중 (Tavily)", 12)
         try:
             research = collect_web_research(_brief(item), tavily_key)
             store.update_payload(item_id, {"research": research})
+            existing_research = research
         except Exception:
             # Non-fatal when operator source notes or topic guidance already exist.
             pass
+    if tavily_key and (requested_visual_mode == "news_photos" or _is_news_or_sports_topic(item)):
+        current_imgs = existing_research.get("images") if isinstance(existing_research, dict) else None
+        if not isinstance(current_imgs, list) or len(current_imgs) < 4:
+            store.set_job_progress(item_id, "1/4 실제 기사 사진 추가 수집 중 (Tavily)", 15)
+            try:
+                supplemented = supplement_research_images(_brief(item), existing_research, tavily_key)
+                if supplemented and supplemented is not existing_research:
+                    store.update_payload(item_id, {"research": supplemented})
+            except Exception:
+                pass
+    cleaned_feedback = str(feedback or "").strip()
+    wants_new_search = any(
+        tok in cleaned_feedback.lower()
+        for tok in ("사진", "기사", "댓글", "반응", "fmkorea", "에펨", "검색", "인터뷰")
+    )
+    if tavily_key and cleaned_feedback and (not reuse_visuals or wants_new_search or not (existing_research or {}).get("sources")):
+        store.set_job_progress(item_id, "1/4 반려 의견 기반 추가 기사·반응·사진 조사 중 (Tavily)", 16)
+        existing_research = _enrich_research_from_feedback(
+            store,
+            item_id,
+            item,
+            existing_research,
+            cleaned_feedback,
+            tavily_key,
+        )
     if store.is_cancel_requested(item_id):
         raise RuntimeError("Operation cancelled by operator.")
 
@@ -1363,7 +1957,6 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
         store.set_job_progress(item_id, "1/4 첨부 파일 텍스트·시각 자료 분석 중", 18)
     item, research_sources = _prepare_attachments_and_sources(store, item_id, web_sources)
 
-    cleaned_feedback = str(feedback or "").strip()
     if cleaned_feedback and isinstance(item.get("plan"), dict):
         store.set_job_progress(item_id, "2/4 반려 의견 반영해 기획안 재작성 중", 28)
         store.save_revision_snapshot(item_id, f"Operator rejection feedback: {cleaned_feedback[:120]}")
@@ -1445,8 +2038,68 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
         if item.get("use_attached_media", True)
         else [None] * len(scenes)
     )
+    is_news_sports = _is_news_or_sports_topic(item)
+    fan_cards = _build_fan_reaction_scene_cards(
+        folder,
+        scenes,
+        research_sources,
+        item,
+        feedback=cleaned_feedback,
+        reuse_existing=reuse_visuals,
+    )
+    for card_idx, card_slot in fan_cards.items():
+        if card_idx < len(scene_slots) and scene_slots[card_idx] is None:
+            scene_slots[card_idx] = card_slot
+
+    if (
+        (visual_mode == "news_photos" or (is_news_sports and visual_mode != "stock"))
+        and tavily_key
+        and not reuse_visuals
+        and any(slot is None for slot in scene_slots)
+    ):
+        store.set_job_progress(item_id, "3/4 씬별 인물·장면 기사 사진 추가 탐색 중", 44)
+        enriched_research = _ensure_scene_editorial_images(store, item_id, item, scenes, tavily_key)
+        item = {**item, "research": enriched_research}
+
+    news_media = (
+        _collect_news_reference_images(
+            store,
+            item_id,
+            item.get("research"),
+            folder,
+            max_images=12 if visual_mode == "news_photos" else 6,
+            reuse_existing=reuse_visuals,
+        )
+        if (visual_mode == "news_photos" or (is_news_sports and visual_mode != "stock"))
+        else []
+    )
+    if news_media and scenes and any(slot is None for slot in scene_slots):
+        empty_indices = [idx for idx, slot in enumerate(scene_slots) if slot is None]
+        matched_slots = _assign_news_photos_to_scenes(
+            scenes,
+            news_media,
+            empty_indices,
+            plan.get("duration_seconds") or 20,
+            allow_cycle=(visual_mode == "news_photos"),
+        )
+        for idx, slot in matched_slots.items():
+            if idx < len(scene_slots) and scene_slots[idx] is None:
+                scene_slots[idx] = slot
+    if visual_mode == "news_photos" and any(slot is None for slot in scene_slots):
+        uploaded_clips = ((item.get("assets") or {}).get("uploaded_clips")) or []
+        if uploaded_clips:
+            per_dur = round(max(2.5, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, len(scenes)))), 1)
+            for idx, slot in enumerate(scene_slots):
+                if slot is None:
+                    scene_slots[idx] = {
+                        "source_kind": "uploaded",
+                        "filename": str(uploaded_clips[idx % len(uploaded_clips)]["filename"]),
+                        "duration_seconds": per_dur,
+                        "from_attachment": True,
+                    }
+
     has_missing_slots = any(slot is None for slot in scene_slots) or not scene_slots
-    if has_missing_slots and visual_mode not in {"ai_images", "omni_video"}:
+    if has_missing_slots and visual_mode not in {"ai_images", "omni_video", "news_photos"}:
         store.set_job_progress(item_id, "3/4 스톡 영상 검색 · 음성·자막 · 영상 제작 중", 55)
         if pixabay_key:
             materials.extend(search_pixabay_videos(scenes, pixabay_key))
@@ -1466,15 +2119,26 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
                     scene_slots[idx] = stock_selected[idx]
 
     ref_images = _collect_reference_product_images(folder, item.get("attachments"))
+    for nm in news_media:
+        if len(ref_images) >= 2:
+            break
+        if nm["path"] not in ref_images:
+            ref_images.append(nm["path"])
+    visual_bible = str(plan.get("visual_bible") or "").strip()
+
     if visual_mode == "omni_video" and get_secret("GEMINI_API_KEY") and scenes:
         bounded_scenes = scenes[:8]
         per_dur = round(max(2.5, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, len(bounded_scenes)))), 1)
+        chain_anchor: Path | None = None
         for idx, sc in enumerate(bounded_scenes):
             if store.is_cancel_requested(item_id):
                 raise RuntimeError("Operation cancelled by operator.")
             if not isinstance(sc, dict):
                 continue
             existing_slot = scene_slots[idx] if idx < len(scene_slots) else None
+            # For news/sports with verified article photos, preserve authentic editorial photos so AI does not invent faces/crests.
+            if isinstance(existing_slot, dict) and existing_slot.get("from_news_photo"):
+                continue
             # Preserve operator-uploaded MP4/video clips directly; animate static photos or empty slots via Gemini Omni.
             if (
                 isinstance(existing_slot, dict)
@@ -1482,6 +2146,21 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
                 and existing_slot.get("filename")
                 and Path(str(existing_slot["filename"])).suffix.lower() not in IMAGE_EXTS
             ):
+                continue
+            cached_omni = folder / "clips" / f"omni_scene_{idx + 1}.mp4"
+            if reuse_visuals and cached_omni.is_file() and cached_omni.stat().st_size > 16384:
+                if chain_anchor is None:
+                    try:
+                        chain_anchor = extract_video_frame(cached_omni, folder / "clips" / "omni_anchor_1.jpg", timestamp_seconds=0.3)
+                    except Exception:
+                        chain_anchor = None
+                if idx < len(scene_slots):
+                    scene_slots[idx] = {
+                        "source_kind": "uploaded",
+                        "filename": cached_omni.name,
+                        "duration_seconds": per_dur,
+                        "from_attachment": True,
+                    }
                 continue
             store.set_job_progress(
                 item_id,
@@ -1493,12 +2172,14 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
                 matched_img = (folder / "clips" / Path(str(existing_slot["filename"])).name).resolve()
                 if matched_img.is_file() and matched_img.suffix.lower() in IMAGE_EXTS:
                     scene_refs.append(matched_img)
+            if chain_anchor is not None and chain_anchor.is_file() and chain_anchor not in scene_refs and len(scene_refs) < 2:
+                scene_refs.append(chain_anchor)
             for fallback_ref in ref_images:
                 if fallback_ref not in scene_refs:
                     scene_refs.append(fallback_ref)
                     if len(scene_refs) >= 2:
                         break
-            prompt_text = f"{sc.get('visual_query') or ''} — mood and action: {sc.get('narration') or ''}"
+            prompt_text = _build_english_ai_visual_prompt(sc, visual_bible=visual_bible, fallback_topic=str(item.get("topic") or ""))
             omni_vid = generate_ai_scene_video_omni(
                 prompt_text,
                 folder / "clips" / f"omni_scene_{idx + 1}.mp4",
@@ -1506,6 +2187,11 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
                 duration_seconds=per_dur,
             )
             if omni_vid and omni_vid.is_file():
+                if chain_anchor is None:
+                    try:
+                        chain_anchor = extract_video_frame(omni_vid, folder / "clips" / "omni_anchor_1.jpg", timestamp_seconds=0.3)
+                    except Exception:
+                        chain_anchor = None
                 if idx < len(scene_slots):
                     scene_slots[idx] = {
                         "source_kind": "uploaded",
@@ -1513,19 +2199,27 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
                         "duration_seconds": per_dur,
                         "from_attachment": True,
                     }
-    if any(slot is None for slot in scene_slots) and visual_mode != "stock" and (get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY")) and scenes:
+    if any(slot is None for slot in scene_slots) and visual_mode != "stock" and (visual_mode != "news_photos" or not any(slot is not None for slot in scene_slots)) and (get_secret("GEMINI_API_KEY") or get_secret("OPENAI_API_KEY")) and scenes:
         store.set_job_progress(item_id, "3/4 AI 아트워크 장면 생성 중 (Gemini/OpenAI)", 58)
         per_dur = round(max(2.5, min(30.0, float(plan.get("duration_seconds") or 20) / max(1, len(scenes)))), 1)
+        chain_img_refs = list(ref_images)
         for idx, sc in enumerate(scenes[:8]):
             if idx < len(scene_slots) and scene_slots[idx] is None and isinstance(sc, dict):
-                prompt_text = f"{sc.get('visual_query') or ''} — mood and subject: {sc.get('narration') or ''}"
                 out_path = folder / "clips" / f"ai_scene_{idx + 1}.png"
+                if reuse_visuals and out_path.is_file() and out_path.stat().st_size > 4096:
+                    if not chain_img_refs:
+                        chain_img_refs = [out_path]
+                    scene_slots[idx] = {"source_kind": "uploaded", "filename": out_path.name, "duration_seconds": per_dur, "from_attachment": True}
+                    continue
+                prompt_text = _build_english_ai_visual_prompt(sc, visual_bible=visual_bible, fallback_topic=str(item.get("topic") or ""))
                 img = (
-                    generate_ai_scene_image(prompt_text, out_path, reference_image_paths=ref_images)
-                    if ref_images
+                    generate_ai_scene_image(prompt_text, out_path, reference_image_paths=chain_img_refs)
+                    if chain_img_refs
                     else generate_ai_scene_image(prompt_text, out_path)
                 )
                 if img and img.is_file():
+                    if not chain_img_refs:
+                        chain_img_refs = [img]
                     scene_slots[idx] = {"source_kind": "uploaded", "filename": img.name, "duration_seconds": per_dur, "from_attachment": True}
 
     if any(slot is None for slot in scene_slots) and visual_mode not in {"ai_images", "omni_video"}:
@@ -1574,6 +2268,7 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
             scene_inputs,
             visual_mode=visual_mode,
             attachments=item.get("attachments"),
+            visual_bible=visual_bible,
         )
         store.set_job_progress(item_id, "3/4 클립 저장 · 씬별 음성·ASS 자막 · BGM 합성 중", 72)
         tts_mode = (
@@ -1603,6 +2298,7 @@ def run_autopilot_pipeline(store: Store, item_id: str, *, feedback: str = "") ->
             auto_bgm=True,
             bgm_mood=resolved_bgm_mood,
             hook_banner=format_shorts_banner_text(str(plan.get("title") or ""), str(plan.get("hook") or "")) if active_use_banner else "",
+            reuse_bgm=reuse_bgm,
         )
     elif runway_key:
         run_video_generation(store, item_id)
@@ -1673,6 +2369,17 @@ def retime_item_video(store: Store, item_id: str, speed_multiplier: float = 1.5)
     use_banner = tpl_cfg.get("use_hook_banner", True) if tpl_cfg else True
     hook_banner = format_shorts_banner_text(str(plan.get("title") or ""), str(plan.get("hook") or "")) if use_banner else ""
 
+    raw_attrs = assets.get("source_attributions") if isinstance(assets.get("source_attributions"), list) else []
+    scaled_attributions = [
+        {
+            "start": round(float(attr.get("start") or 0.0) / factor, 3),
+            "end": round(float(attr.get("end") or 0.0) / factor, 3),
+            "label": str(attr.get("label") or "").strip(),
+        }
+        for attr in raw_attrs
+        if isinstance(attr, dict) and str(attr.get("label") or "").strip()
+    ]
+
     captions_path: Path | None = None
     burn_captions: Path | None = None
     if base_srt.is_file():
@@ -1685,6 +2392,7 @@ def retime_item_video(store: Store, item_id: str, speed_multiplier: float = 1.5)
                 folder / "captions.ass",
                 style=normalized_style,
                 hook_title=hook_banner,
+                source_attributions=scaled_attributions or None,
             )
         except Exception:
             burn_captions = captions_path

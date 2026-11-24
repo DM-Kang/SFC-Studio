@@ -522,8 +522,9 @@ def srt_to_shorts_ass(
     height: int = 1920,
     style: dict[str, Any] | None = None,
     hook_title: str = "",
+    source_attributions: list[dict[str, Any]] | None = None,
 ) -> Path:
-    """@brief Build a styled 9:16 ASS caption file with pop-in text and customizable Korean Shorts headline banner."""
+    """@brief Build a styled 9:16 ASS caption file with pop-in text, headline banner, and optional per-scene source credits."""
     normalized = normalize_subtitle_style(style)
     cues = _parse_srt_cues(raw_srt)
     font_name = normalized["font_name"] or default_subtitle_font()
@@ -566,6 +567,25 @@ def srt_to_shorts_ass(
             anim = ""
         events.append(f"Dialogue: 0,{_ass_time(start_s)},{_ass_time(end_s)},Default,,0,0,0,,{anim}{safe_text}")
 
+    extra_styles: list[str] = []
+    if source_attributions:
+        extra_styles.append(
+            f"Style: SourceCredit,{font_name},26,&H18FFFFFF,&H000000FF,&H00000000,&H60000000,-1,0,0,0,100,100,0,0,1,3,1,3,56,56,210,1"
+        )
+        for attr in source_attributions:
+            if not isinstance(attr, dict):
+                continue
+            label = re.sub(r"[\r\n{}]+", " ", str(attr.get("label") or "")).strip()
+            if not label:
+                continue
+            try:
+                st = max(0.0, float(attr.get("start") or 0.0))
+                en = max(st + 0.3, float(attr.get("end") or (st + 3.0)))
+            except (TypeError, ValueError):
+                continue
+            credit_line = label if label.startswith("출처") else f"출처: {label}"
+            events.append(f"Dialogue: 2,{_ass_time(st)},{_ass_time(en)},SourceCredit,,0,0,0,,{credit_line}")
+
     ass_doc = "\n".join(
         [
             "[Script Info]",
@@ -579,6 +599,7 @@ def srt_to_shorts_ass(
             "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
             f"Style: Default,{font_name},{font_size},{primary},&H000000FF,{outline_col},{back_col},-1,0,0,0,100,100,0,0,{border_style},{outline},{shadow},{alignment},64,64,{margin_v},1",
             f"Style: HookBanner,{banner_font},{banner_size},{banner_primary},&H000000FF,{banner_outline_col},{banner_back_col},-1,0,0,0,100,100,0,0,{banner_border_style},{banner_outline},3,8,56,56,{banner_margin_v},1",
+            *extra_styles,
             "",
             "[Events]",
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -589,6 +610,163 @@ def srt_to_shorts_ass(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(ass_doc, encoding="utf-8")
     return output_path
+
+
+def _wrap_card_comment(text: str, max_chars: int = 24, max_lines: int = 2) -> str:
+    """@brief Wrap Korean fan comment text into at most max_lines readable lines for 9:16 reaction cards."""
+    cleaned = re.sub(r"[\r\n{}]+", " ", str(text or "")).strip()
+    if not cleaned:
+        return ""
+    words = cleaned.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        cand = f"{current} {word}".strip() if current else word
+        if len(cand) <= max_chars or not current:
+            current = cand
+        else:
+            lines.append(current)
+            current = word
+            if len(lines) >= max_lines - 1:
+                break
+    remaining = words[sum(len(ln.split()) for ln in lines):]
+    if remaining and len(lines) < max_lines:
+        tail = " ".join(remaining)
+        if len(tail) > max_chars + 4:
+            tail = tail[: max_chars + 1].rstrip() + "..."
+        lines.append(tail)
+    elif current and len(lines) < max_lines and current not in lines:
+        lines.append(current[: max_chars + 4])
+    return r"\N".join(lines[:max_lines])
+
+
+def _build_fan_reaction_card_ass(
+    *,
+    title: str,
+    badge: str,
+    comments: list[dict[str, Any]],
+    source_footer: str = "",
+    width: int = 1080,
+    height: int = 1920,
+    font_name: str | None = None,
+) -> str:
+    """@brief Build a 9:16 ASS layout rendering 3 community comment cards inside the safe center frame."""
+    resolved_font = font_name or default_subtitle_font()
+    safe_badge = re.sub(r"[\r\n{}]+", " ", str(badge or "커뮤니티 팬 반응")).strip()[:40]
+    safe_title = re.sub(r"[\r\n{}]+", " ", str(title or "경기 후 팬 반응")).strip()[:52]
+    safe_footer = re.sub(r"[\r\n{}]+", " ", str(source_footer or "검색 기반 팬 반응 요약")).strip()[:64]
+
+    def _rect(x1: int, y1: int, x2: int, y2: int, r: int = 24) -> str:
+        k = int(round(r * 0.55))
+        return (
+            f"m {x1 + r} {y1} "
+            f"l {x2 - r} {y1} b {x2 - r + k} {y1} {x2} {y1 + r - k} {x2} {y1 + r} "
+            f"l {x2} {y2 - r} b {x2} {y2 - r + k} {x2 - r + k} {y2} {x2 - r} {y2} "
+            f"l {x1 + r} {y2} b {x1 + r - k} {y2} {x1} {y2 - r + k} {x1} {y2 - r} "
+            f"l {x1} {y1 + r} b {x1} {y1 + r - k} {x1 + r - k} {y1} {x1 + r} {y1}"
+        )
+
+    events: list[str] = [
+        # Soft radial backdrop card container inside safe center zone (y=410..1360)
+        f"Dialogue: 0,0:00:00.00,0:00:05.00,Shape,,0,0,0,,{{\\an7\\pos(0,0)\\1c&H291C14&\\1a&H10&\\bord0\\shad0\\p1}}{_rect(76, 405, 1004, 1345, 34)}{{\\p0}}",
+        f"Dialogue: 1,0:00:00.00,0:00:05.00,Shape,,0,0,0,,{{\\an7\\pos(0,0)\\1c&H523523&\\1a&H00&\\bord0\\shad0\\p1}}{_rect(108, 434, 460, 490, 24)}{{\\p0}}",
+        f"Dialogue: 2,0:00:00.00,0:00:05.00,CardBadge,,0,0,0,,{{\\an4\\pos(130,462)}}{safe_badge}",
+        f"Dialogue: 2,0:00:00.00,0:00:05.00,CardTitle,,0,0,0,,{{\\an7\\pos(108,508)}}{safe_title}",
+    ]
+
+    normalized_comments = [c for c in comments if isinstance(c, dict) and str(c.get("text") or "").strip()][:3]
+    y_cursor = 588
+    card_h = 206
+    card_gap = 22
+    for idx, cmt in enumerate(normalized_comments, 1):
+        author = re.sub(r"[\r\n{}]+", " ", str(cmt.get("author") or f"팬 {idx}")).strip()[:20]
+        likes = re.sub(r"[\r\n{}]+", " ", str(cmt.get("likes") or "추천")).strip()[:16]
+        body = _wrap_card_comment(str(cmt.get("text") or ""), max_chars=27, max_lines=2)
+        y2 = y_cursor + card_h
+        events.extend(
+            [
+                f"Dialogue: 1,0:00:00.00,0:00:05.00,Shape,,0,0,0,,{{\\an7\\pos(0,0)\\1c&H3B2A1E&\\1a&H00&\\bord2\\3c&H694B33&\\shad0\\p1}}{_rect(104, y_cursor, 976, y2, 24)}{{\\p0}}",
+                f"Dialogue: 2,0:00:00.00,0:00:05.00,CardAuthor,,0,0,0,,{{\\an7\\pos(134,{y_cursor + 24})}}{author}",
+                f"Dialogue: 2,0:00:00.00,0:00:05.00,CardLikes,,0,0,0,,{{\\an9\\pos(946,{y_cursor + 24})}}★ {likes}",
+                f"Dialogue: 2,0:00:00.00,0:00:05.00,CardBody,,0,0,0,,{{\\an7\\pos(134,{y_cursor + 74})}}{body}",
+            ]
+        )
+        y_cursor = y2 + card_gap
+
+    events.append(f"Dialogue: 2,0:00:00.00,0:00:05.00,CardFooter,,0,0,0,,{{\\an8\\pos({width // 2},1292)}}{safe_footer}")
+
+    return "\n".join(
+        [
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            f"PlayResX: {width}",
+            f"PlayResY: {height}",
+            "WrapStyle: 2",
+            "ScaledBorderAndShadow: yes",
+            "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+            f"Style: Shape,{resolved_font},20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1",
+            f"Style: CardBadge,{resolved_font},28,&H00FFDB93,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,4,0,0,0,1",
+            f"Style: CardTitle,{resolved_font},42,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1",
+            f"Style: CardAuthor,{resolved_font},28,&H00FFD59E,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1",
+            f"Style: CardLikes,{resolved_font},26,&H0047C9FF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,9,0,0,0,1",
+            f"Style: CardBody,{resolved_font},38,&H00F8FAFC,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1",
+            f"Style: CardFooter,{resolved_font},24,&H00B8A394,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,8,0,0,0,1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+            *events,
+            "",
+        ]
+    )
+
+
+def render_fan_reaction_card_image(
+    output_path: Path,
+    *,
+    title: str,
+    comments: list[dict[str, Any]],
+    badge: str = "커뮤니티 · 팬 반응 TOP 3",
+    source_footer: str = "검색 기반 팬 반응 요약",
+    width: int = 1080,
+    height: int = 1920,
+) -> Path | None:
+    """@brief Render a clean 9:16 PNG card showing up to 3 summarized fan comments via FFmpeg + libass."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not comments:
+        return None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ass_path = output_path.with_suffix(".ass")
+    ass_doc = _build_fan_reaction_card_ass(
+        title=title,
+        badge=badge,
+        comments=comments,
+        source_footer=source_footer,
+        width=width,
+        height=height,
+    )
+    ass_path.write_text(ass_doc, encoding="utf-8")
+    command = [
+        ffmpeg,
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c=0x0E131E:s={width}x{height}:d=0.2",
+        "-vf",
+        build_subtitles_filter(ass_path.name),
+        "-frames:v",
+        "1",
+        output_path.name,
+    ]
+    try:
+        res = subprocess.run(command, cwd=output_path.parent, capture_output=True, text=True, timeout=30, check=False)
+        if res.returncode != 0 or not output_path.is_file():
+            return None
+        return output_path
+    finally:
+        ass_path.unlink(missing_ok=True)
 
 
 def runway_generate_video(prompt: str, output_dir: Path, duration: int = 10) -> dict[str, Any]:
@@ -849,6 +1027,9 @@ def generate_voiceover(
     else:
         srt_text = alignment_to_srt(alignment, max_chars=16 if has_hangul else 24)
     captions_path.write_text(srt_text, encoding="utf-8")
+    from .usage import record_tts_usage
+
+    record_tts_usage("elevenlabs", model_id, char_count=len(spoken_text))
     return {"audio_path": str(audio_path), "captions_path": str(captions_path), "provider": "elevenlabs", "voice_id": voice_id}
 
 
@@ -963,6 +1144,7 @@ def _generate_lyria_bgm(output_path: Path, dur: float, *, mood: str, ffmpeg: str
         "generationConfig": {"responseModalities": ["AUDIO"]},
     }
     audio_bytes: bytes | None = None
+    used_lyria_model = "lyria-3-clip-preview"
     ext = ".mp3"
     for lyria_model in ("lyria-3-clip-preview", "lyria-3.5"):
         req = urllib.request.Request(
@@ -981,6 +1163,7 @@ def _generate_lyria_bgm(output_path: Path, dur: float, *, mood: str, ffmpeg: str
                         raw = base64.b64decode(inline["data"])
                         if len(raw) > 8192:
                             audio_bytes = raw
+                            used_lyria_model = lyria_model
                             mime = str(inline.get("mimeType") or "").lower()
                             ext = ".wav" if "wav" in mime else ".mp3"
                             break
@@ -992,6 +1175,9 @@ def _generate_lyria_bgm(output_path: Path, dur: float, *, mood: str, ffmpeg: str
             continue
     if not audio_bytes:
         return None
+    from .usage import record_bgm_usage
+
+    record_bgm_usage(used_lyria_model)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     raw_path = output_path.with_name(f"{output_path.stem}.lyria_raw{ext}")
@@ -1271,6 +1457,11 @@ def generate_ai_scene_video_omni(
                 staging = output_path.with_name(f"{output_path.stem}.omni{output_path.suffix}")
                 staging.write_bytes(video_bytes)
                 staging.replace(output_path)
+                probed = probe_video(output_path)
+                actual_dur = float(probed.get("duration_seconds") or clip_hint)
+                from .usage import record_omni_video_usage
+
+                record_omni_video_usage(omni_model, payload, duration_seconds=actual_dur)
                 return output_path
         except Exception:
             continue
@@ -1356,6 +1547,9 @@ def generate_ai_scene_image(
                         if isinstance(inline, dict) and isinstance(inline.get("data"), str):
                             output_path.parent.mkdir(parents=True, exist_ok=True)
                             output_path.write_bytes(base64.b64decode(inline["data"]))
+                            from .usage import record_image_usage
+
+                            record_image_usage(image_model, 1, payload)
                             return output_path
             except Exception:
                 continue
@@ -1377,6 +1571,9 @@ def generate_ai_scene_image(
                 if isinstance(b64, str) and b64:
                     output_path.parent.mkdir(parents=True, exist_ok=True)
                     output_path.write_bytes(base64.b64decode(b64))
+                    from .usage import record_image_usage
+
+                    record_image_usage("gpt-image-1", 1, payload)
                     return output_path
         except Exception:
             pass
@@ -1475,6 +1672,8 @@ def _generate_gemini_tts(text: str, output_dir: Path, *, voice: str = "", speed:
     }
     raw_bytes: bytes | None = None
     mime_type = ""
+    used_tts_model = "gemini-3.8-flash-tts"
+    tts_payload: dict[str, Any] | None = None
     last_error: Exception | None = None
     for tts_model in ("gemini-3.8-flash-tts", "gemini-3.1-flash-tts-preview", "gemini-2.5-pro-preview-tts"):
         req = urllib.request.Request(
@@ -1492,6 +1691,8 @@ def _generate_gemini_tts(text: str, output_dir: Path, *, voice: str = "", speed:
                     if isinstance(inline, dict) and isinstance(inline.get("data"), str):
                         raw_bytes = base64.b64decode(inline["data"])
                         mime_type = str(inline.get("mimeType") or "").lower()
+                        used_tts_model = tts_model
+                        tts_payload = payload
                         break
                 if raw_bytes:
                     break
@@ -1534,6 +1735,9 @@ def _generate_gemini_tts(text: str, output_dir: Path, *, voice: str = "", speed:
         text_to_fallback_srt(display_text, duration, max_chars=12 if _contains_hangul(display_text) else 22),
         encoding="utf-8",
     )
+    from .usage import record_tts_usage
+
+    record_tts_usage("gemini_tts", used_tts_model, payload=tts_payload, duration_seconds=float(duration), char_count=len(spoken))
     return {"audio_path": str(audio_path), "captions_path": str(captions_path), "provider": "gemini_tts", "voice_id": chosen_voice}
 
 

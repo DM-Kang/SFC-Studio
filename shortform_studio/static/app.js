@@ -779,6 +779,38 @@ function filterItems(items) {
   });
 }
 
+function formatUsdCost(usd) {
+  const val = Number(usd || 0);
+  if (!Number.isFinite(val) || val <= 0) return "$0.00";
+  if (val < 0.01) return `$${val.toFixed(4)}`;
+  return `$${val.toFixed(2)}`;
+}
+
+function renderUsageSummary(item) {
+  const stats = item.usage_stats;
+  if (!stats || (!stats.total_calls && !stats.total_usd)) {
+    return '<div class="usage-summary-box"><div class="usage-summary-head"><strong>예상 API 사용량·비용</strong><span class="small-note">다음 실행부터 호출·토큰·예상 비용이 자동 기록됩니다.</span></div></div>';
+  }
+  const latest = stats.latest_run || {};
+  const totalUsd = Number(stats.total_usd || 0);
+  const latestUsd = Number(latest.usd || 0);
+  const krwApprox = Math.round(totalUsd * 1400).toLocaleString("ko-KR");
+  const catNames = { llm: "LLM", video: "AI 동영상", image: "AI 이미지", audio_bgm: "BGM", audio_tts: "음성 TTS", search: "웹검색" };
+  const byCat = latest.by_category || {};
+  const pills = Object.entries(byCat)
+    .filter(([, v]) => (v.calls || 0) > 0 || (v.usd || 0) > 0)
+    .map(([k, v]) => {
+      const label = catNames[k] || k;
+      let extra = `${v.calls || 0}회`;
+      if (k === "video" && v.seconds) extra = `${v.seconds}초`;
+      else if (k === "image" && v.count) extra = `${v.count}장`;
+      else if (k === "search" && v.credits) extra = `${v.credits}크레딧`;
+      return `<span class="usage-pill">${escapeHtml(label)}: ${escapeHtml(extra)} · ${formatUsdCost(v.usd)}</span>`;
+    })
+    .join("");
+  return `<div class="usage-summary-box"><div class="usage-summary-head"><strong>💰 예상 API 비용: 누적 ${formatUsdCost(totalUsd)} (약 ${krwApprox}원)</strong><span class="badge">이번 실행 ${formatUsdCost(latestUsd)} · 호출 ${escapeHtml(latest.calls ?? 0)}회 · 토큰 ${escapeHtml(((latest.input_tokens || 0) + (latest.output_tokens || 0)).toLocaleString("ko-KR"))}</span></div>${pills ? `<div class="usage-pills">${pills}</div>` : ""}<small class="muted">요율 기준 예상치이며 실제 청구액은 Google AI Studio / Tavily 콘솔 기준입니다.</small></div>`;
+}
+
 function renderList() {
   const list = document.getElementById("item-list");
   const visible = filterItems(state.items);
@@ -790,7 +822,11 @@ function renderList() {
     list.innerHTML = '<p class="muted">조건에 맞는 작업이 없습니다.</p>';
     return;
   }
-  list.innerHTML = visible.map(item => `<button class="item-card ${item.id === state.selectedId ? "selected" : ""}" data-item-id="${escapeHtml(item.id)}"><strong>${escapeHtml(item.plan?.title || item.topic)}</strong><small>${escapeHtml(stageLabels[item.stage] || item.stage)}${item.archived ? " · 보관됨" : ""} · ${new Date(item.created_at).toLocaleString()}</small></button>`).join("");
+  list.innerHTML = visible.map(item => {
+    const uUsd = Number(item.usage_stats?.total_usd || 0);
+    const uTag = uUsd > 0 ? ` · ${formatUsdCost(uUsd)}` : "";
+    return `<button class="item-card ${item.id === state.selectedId ? "selected" : ""}" data-item-id="${escapeHtml(item.id)}"><strong>${escapeHtml(item.plan?.title || item.topic)}</strong><small>${escapeHtml(stageLabels[item.stage] || item.stage)}${item.archived ? " · 보관됨" : ""}${escapeHtml(uTag)} · ${new Date(item.created_at).toLocaleString()}</small></button>`;
+  }).join("");
   list.querySelectorAll("[data-item-id]").forEach(button => button.addEventListener("click", () => selectItem(button.dataset.itemId)));
 }
 
@@ -1195,6 +1231,7 @@ function renderDecisionCard(item) {
         <div class="source-excerpt">${escapeHtml(plan?.script || "")}</div>
         <p class="small-note">검수 요약: ${escapeHtml(editorial?.summary || review.technical?.message || "자동 검수 완료")}</p>
         ${usedSources ? `<p class="small-note">포함된 소재 출처: ${usedSources}</p>` : ""}
+        ${renderUsageSummary(item)}
         ${issuesHtml}${blockerHtml}${rejectionHtml}
         <div class="decision-actions">
           <div class="form-row">
@@ -1215,10 +1252,14 @@ function renderDecisionCard(item) {
               ${rejectUseMediaHtml}
             </div>
             <div class="form-row">
-              <label>재제작 화면 방식<select id="reject-visual-mode-select"><option value="hybrid" ${curVisMode === "hybrid" ? "selected" : ""}>하이브리드 (스톡 + AI 이미지)</option><option value="omni_video" ${curVisMode === "omni_video" ? "selected" : ""}>Google Omni AI 실제 동영상 (Flow급 · 유료 API)</option><option value="ai_images" ${curVisMode === "ai_images" ? "selected" : ""}>전 장면 Gemini AI 이미지 + 모션</option><option value="stock" ${curVisMode === "stock" ? "selected" : ""}>스톡 영상만 사용</option></select></label>
+              <label>재제작 화면 방식<select id="reject-visual-mode-select"><option value="hybrid" ${curVisMode === "hybrid" ? "selected" : ""}>하이브리드 (스톡 + AI 이미지)</option><option value="news_photos" ${curVisMode === "news_photos" ? "selected" : ""}>실제 기사 사진 + 모션 + 출처 표기 (뉴스·스포츠)</option><option value="omni_video" ${curVisMode === "omni_video" ? "selected" : ""}>Google Omni AI 실제 동영상 (Flow급 · 유료 API)</option><option value="ai_images" ${curVisMode === "ai_images" ? "selected" : ""}>전 장면 Gemini AI 이미지 + 모션</option><option value="stock" ${curVisMode === "stock" ? "selected" : ""}>스톡 영상만 사용</option></select></label>
               <label>자막·편집 스타일 템플릿<select id="reject-style-template-select">${rejectTplOpts}</select></label>
             </div>
             <label>나레이션 목소리<select id="reject-tts-voice-select">${voiceOpts}</select></label>
+            <div class="reuse-options">
+              <label class="check-row"><input id="reject-reuse-visuals" type="checkbox" ${item.assets?.source_video || item.assets?.cached_visual_clips?.length ? "" : "disabled"}> 기존 생성 영상·이미지 클립 재사용 (대본·자막·음성만 수정 시 크레딧 절약)</label>
+              <label class="check-row"><input id="reject-reuse-bgm" type="checkbox" ${item.assets?.has_cached_bgm || item.assets?.base_bgm_path ? "checked" : "disabled"}> 기존 생성 BGM(배경음악) 재사용 ($0.04 절약)</label>
+            </div>
             <label>반려 의견 (수정·재제작 방향 입력)<textarea id="reject-feedback-input" rows="3" maxlength="2000" placeholder="예: 첫 문장이 너무 평범해요. 새로 추가한 사진을 첫 장면에 쓰고, 배경 음악을 더 밝게 바꿔서 다시 만들어 주세요.">${escapeHtml(rejectDraft)}</textarea></label>
             <div class="actions"><button id="decision-reject-submit" class="button danger" type="button">반려 의견 반영해 다시 제작</button></div>
           </div>
@@ -1889,7 +1930,9 @@ async function rejectAutopilotItem(itemId) {
   const visualMode = document.getElementById("reject-visual-mode-select")?.value || null;
   const styleTplRaw = document.getElementById("reject-style-template-select")?.value;
   const ttsVoiceRaw = document.getElementById("reject-tts-voice-select")?.value;
-  const payload = { feedback, auto_reproduce: true };
+  const reuseVisuals = Boolean(document.getElementById("reject-reuse-visuals")?.checked);
+  const reuseBgm = Boolean(document.getElementById("reject-reuse-bgm")?.checked);
+  const payload = { feedback, auto_reproduce: true, reuse_visuals: reuseVisuals, reuse_bgm: reuseBgm };
   if (visualMode) payload.visual_mode = visualMode;
   if (styleTplRaw !== undefined) payload.style_template_id = styleTplRaw || null;
   if (ttsVoiceRaw !== undefined) payload.tts_voice = ttsVoiceRaw;

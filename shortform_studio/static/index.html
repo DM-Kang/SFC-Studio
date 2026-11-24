@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Shortform Content Studio</title>
-  <link rel="stylesheet" href="/static/styles.css?v=20261123i">
-  <link rel="stylesheet" href="/static/management.css?v=20261123i">
-  <script src="/static/app.js?v=20261123i" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=20261123k">
+  <link rel="stylesheet" href="/static/management.css?v=20261123k">
+  <script src="/static/app.js?v=20261123k" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -60,7 +60,7 @@
             <label class="check-row"><input type="checkbox" name="use_attached_media" checked> 첨부 사진·동영상을 영상 장면에 우선 사용</label>
           </div>
           <label>제작 방식<select name="workflow_mode" id="workflow-mode-select"><option value="manual">수동 단계별 모드 (기존)</option><option value="autopilot">완전 자동화 모드 (원클릭 기획→제작→검수)</option></select></label>
-          <label>화면 비주얼 방식<select name="visual_mode" id="visual-mode-select"><option value="hybrid">하이브리드 (스톡 + 불일치 시 AI 이미지)</option><option value="omni_video">Google Omni AI 실제 동영상 (Flow급 움직임 · 유료 API)</option><option value="ai_images">전 장면 Gemini/AI 아트워크 + 모션 (고일관성)</option><option value="stock">스톡 영상만 사용</option></select></label>
+          <label>화면 비주얼 방식<select name="visual_mode" id="visual-mode-select"><option value="hybrid">하이브리드 (스톡 + 불일치 시 AI 이미지)</option><option value="news_photos">실제 기사 사진 + 모션 + 출처 표기 (뉴스·스포츠 추천)</option><option value="omni_video">Google Omni AI 실제 동영상 (Flow급 움직임 · 유료 API)</option><option value="ai_images">전 장면 Gemini/AI 아트워크 + 모션 (고일관성)</option><option value="stock">스톡 영상만 사용</option></select></label>
           <label>나레이션·템포 배속<select name="tts_speed" id="tts-speed-select"><option value="1.0">1.0x (차분한 기본)</option><option value="1.25">1.25x (조금 빠르게)</option><option value="1.35" selected>1.35x (한국 쇼츠 추천)</option><option value="1.5">1.5x (빠른 텐션·홈쇼핑)</option><option value="1.65">1.65x (초고속 쇼츠)</option></select></label>
           <label>나레이션 목소리<select name="tts_voice" id="tts-voice-select"><optgroup label="여성 목소리"><option value="" selected>여성 · 밝고 또렷한 표준 (기본)</option><option value="female_warm">여성 · 따뜻하고 차분한 감성</option><option value="female_energetic">여성 · 활기찬 쇼호스트·리뷰</option></optgroup><optgroup label="남성 목소리"><option value="male_announcer">남성 · 힘 있는 스포츠·뉴스 해설</option><option value="male_calm">남성 · 중저음 신뢰감 나레이션</option><option value="male_young">남성 · 친근하고 밝은 청년</option></optgroup><optgroup label="아이 · 어르신"><option value="child_bright">아이 · 맑고 명랑한 어린이</option><option value="elder_grandfather">어르신 · 푸근한 할아버지</option><option value="elder_grandmother">어르신 · 다정한 할머니</option></optgroup></select></label>
           <div class="style-template-picker">

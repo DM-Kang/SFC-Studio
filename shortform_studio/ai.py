@@ -94,6 +94,9 @@ def generate_json(system_prompt: str, user_prompt: str, stage: str = "planning")
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             body={"model": model, "instructions": system_prompt, "input": user_prompt},
         )
+        from .usage import record_openai_response_usage
+
+        record_openai_response_usage("openai_api", model, response)
         text = extract_response_text(response)
     else:
         text = generate_text(provider, model, system_prompt, user_prompt)
@@ -125,5 +128,8 @@ def describe_media_with_ai(media_parts: list[dict[str, str]], prompt_text: str, 
                 body={"model": model, "input": [{"role": "user", "content": content}]},
                 timeout=90,
             )
+            from .usage import record_openai_response_usage
+
+            record_openai_response_usage("openai_api", model, response)
             return extract_response_text(response)
     return generate_multimodal_description(provider, model, prompt_text, valid_parts)

@@ -488,6 +488,216 @@ class KoreanNumbersTests(unittest.TestCase):
         self.assertIn("# AUDIO PROFILE", req_body["contents"][0]["parts"][0]["text"])
         self.assertIn("리버풀 사 대 영 맨유 대승!", req_body["contents"][0]["parts"][0]["text"])
 
+    def test_sports_counters_and_news_photo_pipeline_and_visual_bible(self) -> None:
+        from shortform_studio.planning import _build_plan_payload
+        from shortform_studio.resources import collect_web_research, download_news_image
+        from shortform_studio.store import Store
+        from shortform_studio.workflow import (
+            _build_english_ai_visual_prompt,
+            _collect_news_reference_images,
+            _is_news_or_sports_topic,
+        )
+
+        # 1. Native Korean reading for sports counters ("4골" -> "네 골", never "사골")
+        self.assertEqual(korean_text_to_tts_speech("리버풀 4:0 승리, 4골 폭발!"), "리버풀 사 대 영 승리, 네 골 폭발!")
+        self.assertEqual(korean_text_to_tts_speech("전반 1골 포함 3경기 연속골"), "전반 한 골 포함 세 경기 연속골")
+
+        # 2. Tavily image collection filters junk trackers & preserves valid editorial photos
+        fake_search = {
+            "results": [{"url": "https://news.example.com/epl-match", "title": "Liverpool 4-0 Man Utd", "content": "Match report"}],
+            "images": [
+                {"url": "https://cdn.example.com/images/ad/banner.jpg", "description": "Ad"},
+                {"url": "https://cdn.example.com/match-anfield.jpg", "description": "Liverpool celebrates at Anfield"},
+            ],
+        }
+        fake_extract = {"results": [{"url": "https://news.example.com/epl-match", "raw_content": "Liverpool beat Man Utd 4-0."}]}
+
+        def _fake_req(url, **_kw):
+            return fake_search if "search" in url else fake_extract
+
+        with patch("shortform_studio.resources._request_json", side_effect=_fake_req):
+            res = collect_web_research({"topic": "리버풀 4:0 맨유 경기 결과", "language": "Korean"}, "tvly-key")
+        self.assertEqual(len(res["images"]), 1)
+        self.assertEqual(res["images"][0]["url"], "https://cdn.example.com/match-anfield.jpg")
+
+        # 3. visual_bible and English-only AI visual prompt exclude Korean narration hallucinations
+        raw_plan = {
+            "title": "리버풀 4:0 대승",
+            "hook": "8분 만에 무너졌다!",
+            "script": "리버풀 4:0 승리!",
+            "caption": "경기 요약",
+            "hashtags": ["#EPL"],
+            "video_prompt": "Vertical stadium highlights",
+            "visual_bible": "Home team in solid red 2026-27 Adidas kit, away team in white jersey black shorts, European Anfield stadium",
+            "duration_seconds": 30,
+            "claims": [],
+            "scenes": [
+                {
+                    "narration": "고통스러운 패배 후 인터뷰입니다.",
+                    "visual_query": "soccer manager press conference",
+                    "ai_visual_prompt": "European Premier League press conference room with English microphones, disappointed white-away-kit manager speaking",
+                }
+            ],
+        }
+        built = _build_plan_payload(raw_plan, "gemini_api:gemini-4-hydrogen", {"topic": "리버풀 맨유", "language": "Korean", "duration_seconds": 30}, [])
+        self.assertIn("Anfield", built["visual_bible"])
+        self.assertIn("European Premier League press conference", built["scenes"][0]["ai_visual_prompt"])
+
+        prompt_str = _build_english_ai_visual_prompt(built["scenes"][0], visual_bible=built["visual_bible"])
+        self.assertIn("Anfield", prompt_str)
+        self.assertIn("NO random unrelated league or K-League/FC Seoul crests", prompt_str)
+        self.assertNotIn("고통스러운", prompt_str)
+
+        # 4. News/sports detection and safe editorial photo ingestion with unverified rights entry
+        self.assertTrue(_is_news_or_sports_topic({"topic": "맨유 리버풀 최근 경기 결과 인터뷰"}))
+        self.assertFalse(_is_news_or_sports_topic({"topic": "전통 메밀 경추베개 사용법"}))
+
+        fake_jpeg = b"\xff\xd8\xff\xe0" + b"JFIF" + b"0" * 6000
+
+        class _FakeImgResp:
+            headers = {"Content-Type": "image/jpeg"}
+
+            def read(self, _n=-1):
+                return fake_jpeg
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = Store(root / "studio.sqlite3")
+            item = store.create_item({"topic": "리버풀 맨유 경기 결과", "audience": "축구 팬", "tone": "뉴스", "language": "Korean", "platforms": ["youtube"], "duration_seconds": 30})
+            with patch("shortform_studio.resources._resolve_and_verify_public_host", side_effect=lambda u: u), patch(
+                "shortform_studio.resources.urllib.request.urlopen", return_value=_FakeImgResp()
+            ):
+                self.assertTrue(download_news_image("https://cdn.example.com/match-anfield.jpg", root / "check.jpg"))
+                media_list = _collect_news_reference_images(store, item["id"], res, root / "proj")
+            self.assertEqual(len(media_list), 1)
+            self.assertEqual(media_list[0]["filename"], "news_img_1.jpg")
+            self.assertEqual(media_list[0]["domain"], "cdn.example.com")
+            updated_item = store.get_item(item["id"])
+            self.assertTrue(any(r.get("rights_status") == "unverified" and "match-anfield.jpg" in (r.get("source_url") or "") for r in updated_item["rights_assets"]))
+
+    def test_srt_to_shorts_ass_renders_source_credit_attributions(self) -> None:
+        from shortform_studio.media import srt_to_shorts_ass
+
+        srt_text = "1\n00:00:00,000 --> 00:00:03,000\n리버풀이 극적인 역전승을 거뒀습니다\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            ass_path = Path(tmp) / "captions.ass"
+            out = srt_to_shorts_ass(
+                srt_text,
+                ass_path,
+                style={"preset": "clean_pill"},
+                hook_title="리버풀 대 맨유",
+                source_attributions=[{"start": 0.0, "end": 3.5, "label": "reuters.com"}],
+            )
+            ass_content = out.read_text(encoding="utf-8")
+        self.assertIn("Style: SourceCredit,", ass_content)
+        self.assertIn("SourceCredit,,0,0,0,,출처: reuters.com", ass_content)
+
+    def test_supplement_research_images_enriches_sparse_results(self) -> None:
+        import json
+        from shortform_studio.resources import supplement_research_images
+
+        class _FakeResp:
+            def __init__(self, payload: dict) -> None:
+                self._raw = json.dumps(payload).encode("utf-8")
+
+            def read(self, _n=-1):
+                return self._raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+        initial = {
+            "query": "리버풀 맨유",
+            "sources": [],
+            "images": [{"url": "https://www.bbc.com/one.jpg", "description": "Match action", "source_url": "https://www.bbc.com/sport/1"}],
+        }
+        tavily_payload = {
+            "images": [
+                {"url": "https://www.reuters.com/two.jpg", "description": "Anfield celebration"},
+                {"url": "https://www.bbc.com/one.jpg", "description": "Duplicate"},
+            ],
+            "results": [{"url": "https://www.reuters.com/sports/2"}],
+        }
+        with patch("shortform_studio.resources.urllib.request.urlopen", return_value=_FakeResp(tavily_payload)):
+            updated = supplement_research_images({"topic": "리버풀 맨유 2대1"}, initial, "tvly-test")
+        self.assertEqual(len(updated["images"]), 2)
+        self.assertEqual(updated["images"][1]["url"], "https://www.reuters.com/two.jpg")
+
+    def test_fan_reaction_card_ass_and_news_photo_matching(self) -> None:
+        from shortform_studio.media import _build_fan_reaction_card_ass
+        from shortform_studio.workflow import _assign_news_photos_to_scenes
+
+        ass_doc = _build_fan_reaction_card_ass(
+            title="리버풀 4:0 맨유 팬 반응",
+            badge="커뮤니티 · 팬 반응 TOP 3",
+            comments=[
+                {"author": "팬 ①", "likes": "베스트", "text": "전반 8분 퇴장이 승부를 완전히 갈랐네요"},
+                {"author": "팬 ②", "likes": "공감", "text": "포체티노 데뷔전이 너무 가혹했습니다"},
+                {"author": "팬 ③", "likes": "인기", "text": "유망주 득점력이 엄청나네요"},
+            ],
+            source_footer="검색 기반 팬 반응 요약",
+        )
+        self.assertIn("리버풀 4:0 맨유 팬 반응", ass_doc)
+        self.assertIn("전반 8분 퇴장이 승부를 완전히 갈랐네요", ass_doc)
+        self.assertIn("검색 기반 팬 반응 요약", ass_doc)
+
+        scenes = [
+            {"id": "scene-1", "narration": "포체티노 감독이 머리를 감쌌습니다.", "visual_query": "pochettino"},
+            {"id": "scene-2", "narration": "브루노 페르난데스 인터뷰입니다.", "visual_query": "bruno fernandes"},
+        ]
+        news_media = [
+            {"id": "news-1", "filename": "poch.jpg", "description": "Pochettino looks shocked", "domain": "chosun.com"},
+            {"id": "news-2", "filename": "bruno.jpg", "description": "Bruno Fernandes speaking", "domain": "bbc.com"},
+        ]
+        with patch("shortform_studio.workflow.ai_ready", return_value=True), patch(
+            "shortform_studio.workflow.generate_json",
+            return_value=({"assignments": {"scene-1": "news-1", "scene-2": "news-2"}}, "mock-model"),
+        ):
+            assigned = _assign_news_photos_to_scenes(scenes, news_media, [0, 1], 12, allow_cycle=True)
+        self.assertEqual(assigned[0]["filename"], "poch.jpg")
+        self.assertEqual(assigned[1]["filename"], "bruno.jpg")
+        self.assertEqual(assigned[1]["source_credit"], "bbc.com")
+
+    def test_usage_ledger_and_merge_stats(self) -> None:
+        from shortform_studio.usage import (
+            merge_usage_stats,
+            record_bgm_usage,
+            record_gemini_response_usage,
+            record_image_usage,
+            record_omni_video_usage,
+            record_tavily_usage,
+            record_tts_usage,
+            track_usage_scope,
+        )
+
+        with track_usage_scope("autopilot (omni_video)") as ledger:
+            record_gemini_response_usage(
+                "gemini_api",
+                "gemini-4-hydrogen",
+                {"usageMetadata": {"promptTokenCount": 10000, "candidatesTokenCount": 1000, "thoughtsTokenCount": 500}},
+            )
+            record_omni_video_usage("gemini-omni-1.2-flash", {}, duration_seconds=4.0)
+            record_image_usage("gemini-3-pro-image-preview", 1)
+            record_bgm_usage("lyria-3-clip-preview")
+            record_tts_usage("gemini_tts", "gemini-3.8-flash-tts", duration_seconds=4.0, char_count=20)
+            record_tavily_usage("search", depth="basic")
+
+        merged = merge_usage_stats(None, ledger)
+        self.assertEqual(merged["total_calls"], 6)
+        self.assertGreater(merged["total_usd"], 0.45)
+        self.assertEqual(merged["tavily_credits"], 1.0)
+        self.assertIn("video", merged["latest_run"]["by_category"])
+        self.assertIn("audio_bgm", merged["latest_run"]["by_category"])
+
 
 if __name__ == "__main__":
     unittest.main()
